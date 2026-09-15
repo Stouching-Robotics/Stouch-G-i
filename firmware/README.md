@@ -15,23 +15,26 @@
 > v1.2.0 变更: 降低开机时间、工作状态绿灯改为呼吸灯。bootloader 内容与版本未修改。
 > v1.1.1 变更: 消除偶发性大范围 IMU 丢包(BNO055 BUS_OVER_RUN 重试时序)、移除蓝牙 BLE/SPP 模块以降低 RAM 占用。
 
-固件为 OTA 双区设计,分两个 .hex 独立烧录:
+固件为 OTA 双区设计,分两个镜像独立烧录:
+
+> 本仓库只分发原始 `.bin` 镜像,不分发 Intel HEX。用 STM32CubeProgrammer 等工具烧录 `.bin` 时,
+> 手动填写下表中的起始地址即可,与 `.hex` 烧录等效。
 
 | 文件 | 烧录地址 | 说明 |
 |---|---|---|
-| `bootloader.hex` | `0x08000000` (32KB) | Bootloader,出厂烧一次、运行期不擦,负责 OTA 升级 APP |
-| `stm32_demostm32_imu_usb_left.hex` | `0x08008000` (96KB) | APP 固件（左手序）,特征字符串 `IMU_USB` |
-| `stm32_demostm32_imu_usb_right.hex` | `0x08008000` (96KB) | APP 固件（右手序）,特征字符串 `IMU_USB` |
+| `bootloader.bin` | `0x08000000` (32KB) | Bootloader,出厂烧一次、运行期不擦,负责 OTA 升级 APP |
+| `stm32_demostm32_imu_usb_left.bin` | `0x08008000` (96KB) | APP 固件（左手序）,特征字符串 `IMU_USB` |
+| `stm32_demostm32_imu_usb_right.bin` | `0x08008000` (96KB) | APP 固件（右手序）,特征字符串 `IMU_USB` |
 
 ## 烧录顺序
 
-1. 先烧 `bootloader.hex`(地址 `0x08000000`)
-2. 再烧对应手的 APP：`stm32_demostm32_imu_usb_left.hex` 或 `stm32_demostm32_imu_usb_right.hex`(地址 `0x08008000`)
+1. 先烧 `bootloader.bin`(地址 `0x08000000`)
+2. 再烧对应手的 APP：`stm32_demostm32_imu_usb_left.bin` 或 `stm32_demostm32_imu_usb_right.bin`(地址 `0x08008000`)
 
 > 若设备出厂已烧好 bootloader,只需烧 APP 即可。
 > 本 SDK 的 `glove_io/usb_protocol.py` 按 VID `0483` / PID `5740` 对接 APP 固件。
 
 ## 归档
 
-- **`archive/stm32_demostm32_matrix_ble.hex`** — 同一硬件平台的 BLE 无线传输变体
-  (特征字符串 `MATRIX_BLE`)。SDK 代码只对接 USB CDC,不使用该版本。保留备查,可删除。
+- **BLE 无线传输变体**(特征字符串 `MATRIX_BLE`) — 同一硬件平台的变体。SDK 代码只对接 USB CDC,
+  不使用该版本,故未随包分发。如需请联系技术支持。
