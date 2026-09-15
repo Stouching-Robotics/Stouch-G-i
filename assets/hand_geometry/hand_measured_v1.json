@@ -1,0 +1,61 @@
+{
+  "schema": "stm32-imu-usb-measured-hand-geometry",
+  "schema_version": 1,
+  "units": "metres",
+  "coordinate_frame": {
+    "origin": "wrist",
+    "x": "little MCP toward index/thumb side",
+    "y": "wrist toward fingers",
+    "z": "palm normal"
+  },
+  "measurement_record": "数据手套手部尺寸记录_2026-08-21.txt",
+  "mcp_adjustment": {
+    "radial_extension_mm": 1.0,
+    "direction_offset_deg": 0.1,
+    "direction_offset_axis": "positive local X",
+    "four_finger_initial_z_mm": 0.0,
+    "thumb_z": "fit_from_contact_poses"
+  },
+  "profiles": {
+    "left": {
+      "mcp_anchors_m": {
+        "thumb": [0.0288596, 0.0212266, 0.0],
+        "index": [0.0345638, 0.0848275, 0.0],
+        "middle": [0.0120196, 0.0949155, 0.0],
+        "ring": [-0.0134826, 0.0859873, 0.0],
+        "little": [-0.0325560, 0.0761197, 0.0]
+      },
+      "segment_lengths_m": {
+        "thumb": [0.0308, 0.0271, 0.0343],
+        "index": [0.0330, 0.0222, 0.0238],
+        "middle": [0.0317, 0.0233, 0.0251],
+        "ring": [0.0288, 0.0248, 0.0243],
+        "little": [0.0218, 0.0196, 0.0192]
+      }
+    },
+    "right": {
+      "mcp_anchors_m": {
+        "thumb": [0.0288596, 0.0212266, 0.0],
+        "index": [0.0345638, 0.0848275, 0.0],
+        "middle": [0.0120196, 0.0949155, 0.0],
+        "ring": [-0.0134826, 0.0859873, 0.0],
+        "little": [-0.0325560, 0.0761197, 0.0]
+      },
+      "segment_lengths_m": {
+        "thumb": [0.0308, 0.0271, 0.0347],
+        "index": [0.0330, 0.0222, 0.0236],
+        "middle": [0.0317, 0.0233, 0.0264],
+        "ring": [0.0288, 0.0248, 0.0243],
+        "little": [0.0218, 0.0196, 0.0197]
+      }
+    }
+  },
+  "fit_parameters": {
+    "neutral_segment_directions": "pending_capture",
+    "sensor_to_bone_rotations": "pending_capture",
+    "flexion_axes": "pending_capture",
+    "abduction_axes": "pending_capture",
+    "thumb_mcp_z": "pending_contact_fit",
+    "soft_joint_ranges": "pending_validation"
+  }
+}

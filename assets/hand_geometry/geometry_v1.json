@@ -1,0 +1,42 @@
+{
+  "schema": "stm32-imu-usb-hand-geometry",
+  "schema_version": 1,
+  "license_origin": "project-authored-no-mano-data",
+  "profile_name": "generic-medium-v1",
+  "measurement_source": "project-defined initial engineering dimensions; replace with glove CAD measurements before production",
+  "coordinate_frame": {
+    "origin": "wrist",
+    "x": "right-hand thumb side",
+    "y": "wrist toward fingers",
+    "z": "palm normal"
+  },
+  "profiles": {
+    "right": {
+      "mcp_anchors_m": {
+        "thumb": [0.034, 0.031, -0.002],
+        "index": [0.028, 0.083, 0.0],
+        "middle": [0.009, 0.089, 0.0],
+        "ring": [-0.011, 0.085, 0.0],
+        "little": [-0.030, 0.073, -0.001]
+      },
+      "segment_lengths_m": {
+        "thumb": [0.044, 0.034, 0.027],
+        "index": [0.045, 0.027, 0.023],
+        "middle": [0.050, 0.032, 0.025],
+        "ring": [0.047, 0.030, 0.024],
+        "little": [0.037, 0.022, 0.020]
+      },
+      "segment_directions": {
+        "thumb": [[0.72, 0.69, 0.0], [0.70, 0.71, 0.0], [0.68, 0.73, 0.0]],
+        "index": [[0.08, 0.997, 0.0], [0.04, 0.999, 0.0], [0.02, 1.0, 0.0]],
+        "middle": [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        "ring": [[-0.06, 0.998, 0.0], [-0.04, 0.999, 0.0], [-0.03, 1.0, 0.0]],
+        "little": [[-0.14, 0.990, 0.0], [-0.10, 0.995, 0.0], [-0.08, 0.997, 0.0]]
+      }
+    },
+    "left": {
+      "mirror_of": "right",
+      "mirror_axis": "x"
+    }
+  }
+}

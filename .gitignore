@@ -1,0 +1,12 @@
+# Python 字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 固件只分发原始 .bin 镜像，不分发 Intel HEX（.hex）
+*.hex
+
+# MANO 手部模型（Max-Planck 许可：禁止再分发）
+# 请用 download_mano.py 自行下载并重建（见 README「手部模型（MANO）」）
+assets/hand/models/MANO_*.pkl
+assets/hand/HAND_*_PINKY_PLUS_2MM.npz

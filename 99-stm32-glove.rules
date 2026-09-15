@@ -1,0 +1,13 @@
+# STM32 灵巧手 (16×BNO055 → CH9438 → USB CDC) 串口权限规则
+# VID 0x0483  PID 0x5740
+#
+# 安装（一次性，目标机上执行）:
+#   sudo cp 99-stm32-glove.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#   （重新插拔一次手套 USB）
+#
+# 效果: 插上手套即自动获得读写权限, 无需加入 dialout 组、无需 sudo。
+# 同时阻止 ModemManager 把 STM32 CDC 当作调制解调器探测并短暂占用串口。
+# 若机器多人共用、不希望"任何用户都可写", 把 MODE="0666" 改回 MODE="0660"。
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", MODE="0666", GROUP="dialout", ENV{ID_MM_DEVICE_IGNORE}="1"

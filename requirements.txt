@@ -1,0 +1,34 @@
+# Python 3.10 (Windows x86_64 and Linux x86_64); CPU torch + manotorch.
+# Single environment: calibration (live), real-time, and replay all share the same venv.
+# manotorch has no stable PyPI wheel, so it is pinned to an upstream commit that passed clean-room testing.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Numeric / scientific
+numpy==1.22.4
+scipy==1.11.4
+scikit-learn==1.5.2
+
+# Calibration models (CPU torch + manotorch)
+torch==2.3.0+cpu
+manotorch @ git+https://github.com/lixiny/manotorch.git@a2a70c591f91551078b7bb2af9b5d9f275b626e0
+chumpy==0.70
+deprecation==2.1.0
+polyscope==2.6.1
+
+# GUI / display
+# - PySide6 6.8.3: live 3D window, calibration selector, and calibration GUI
+#   (replaces OpenCV HighGUI / DearPyGui).
+# - opencv-python (non-headless): cv2 drawing on the live canvas; tactile_live still uses HighGUI.
+opencv-python==4.10.0.84
+PySide6==6.8.3
+
+# Data / recording / serial port
+polars==1.43.2
+pyserial==3.5
+
+# Base libraries
+loguru==0.7.3
+pydantic==2.13.4
+protobuf==5.29.6
+python-statemachine==3.2.1
+tqdm==4.70.0

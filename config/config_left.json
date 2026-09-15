@@ -1,0 +1,17 @@
+{
+  "use_cuda": false,
+  "left_hand_config": {
+    "transport": "usb_cdc",
+    "serial_port": null,
+    "usb_vid": 1155,
+    "usb_pid": 22336,
+    "channel_to_hand": [0, 13, 14, 15, 1, 2, 3, 4, 5, 6, 10, 11, 12, 7, 8, 9],
+    "fps": 80,
+    "hardware_id": "stm32-glove-left",
+    "param_inst_calib": null,
+    "param_shape_calib": null,
+    "param_wrist_calib": null
+  },
+  "right_hand_config": null,
+  "data_store": "./data"
+}

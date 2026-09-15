@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "left": {
+    "usb_vid": 1155,
+    "usb_pid": 22336,
+    "hardware_id": "stm32-glove-left",
+    "channel_to_hand": [
+      0,
+      13,
+      14,
+      15,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      10,
+      11,
+      12,
+      7,
+      8,
+      9
+    ],
+    "mapping_status": "user_specified_finger_reversal_requires_3d_validation",
+    "usb_serials": []
+  },
+  "right": {
+    "usb_vid": 1155,
+    "usb_pid": 22336,
+    "hardware_id": "stm32-glove-right",
+    "channel_to_hand": [
+      0,
+      13,
+      14,
+      15,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      10,
+      11,
+      12,
+      7,
+      8,
+      9
+    ],
+    "mapping_status": "validated",
+    "usb_serials": []
+  }
+}

@@ -22,6 +22,7 @@
 SDK/
 ├── main.py                       # Windows/Linux 统一入口
 ├── requirements.txt             # Python 3.10 依赖
+├── download_mano.py             # 下载并安装 MANO 手部模型
 ├── 99-stm32-glove.rules         # Linux udev 串口权限规则
 ├── runtime/                     # 对外 Python SDK 接口
 ├── glove_io/                    # 串口、协议、录制与回放
@@ -82,6 +83,22 @@ sudo udevadm trigger
 ```
 
 安装 udev 规则后请重新插拔手套。Linux 与 Windows 使用相同的 `python main.py ...` 命令。
+
+## 手部模型（MANO）
+
+21 关键点求解与 3D 显示依赖 MANO 手部模型。MANO 由 Max-Planck 提供，仅授权**非商业**科研/教育用途，且**禁止再分发**，因此本仓库不包含模型文件，需每位使用者自行注册下载。
+
+1. 访问 <https://mano.is.tue.mpg.de/>，注册账号并接受许可协议。
+2. 下载 **Models & Code（MANO v1.2）**，解压后得到 `MANO_LEFT.pkl` 与 `MANO_RIGHT.pkl`。
+3. 在本（`SDK`）目录运行安装脚本：
+
+   ```powershell
+   python download_mano.py --install MANO_LEFT.pkl MANO_RIGHT.pkl
+   ```
+
+   也可以把解压后的整个目录直接传给 `--install`，脚本会自动识别左右手文件。
+
+脚本会把两个 PKL 复制到 `assets/hand/models/`，并据此重建 `assets/hand/HAND_*_PINKY_PLUS_2MM.npz`（求解与 3D 显示实际加载的是后者）。运行 `python download_mano.py` 可随时查看安装状态，`--open` 可直接打开下载页面。许可全文见 `assets/hand/LICENSE.txt`；商业用途请单独联系 Max-Planck（ps-license@tue.mpg.de）。
 
 ## 设备绑定
 
