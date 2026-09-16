@@ -84,13 +84,21 @@ from glove_io.recording import (  # noqa: E402
 from glove_io.session import (  # noqa: E402
     session_metadata_path, update_session_metadata,
     view_state_metadata, write_session_metadata)
+from glove_io.bluetooth_dongle import reboot_bluetooth_dongle  # noqa: E402
+from glove_io.device_registry import (  # noqa: E402
+    detect_unbound_glove_links, link_kind_for_device, set_glove_serial,
+)
 from glove_io.tactile_processing import TactilePreprocessor  # noqa: E402
+from glove_io.usb_protocol import (  # noqa: E402
+    MAGNETOMETER_NOT_READY_BIT,
+)
 from runtime import (  # noqa: E402
     DeviceManager, DeviceNotFoundError, HandSolver, RawImuStream,
     get_version)
 from common.i18n import L, set_lang  # noqa: E402
 from common.usb_cdc import (  # noqa: E402
-    DEFAULT_CHANNEL_TO_HAND, channel_to_hand_for_firmware)
+    DEFAULT_CHANNEL_TO_HAND, channel_to_hand_for_firmware,
+    display_firmware_version, firmware_real_version)
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
 DEFAULT_GEOMETRY_PATH = (
@@ -710,8 +718,10 @@ class _AbsentHandRuntime:
     warmup_timed_out = False
     latest_host_s = 0.0
     fps = 0.0
+    device_fps = 0.0
     tactile_version = 0
     firmware_version = None
+    latency = None
 
 
 class PublishedHandState:
@@ -746,9 +756,11 @@ class PublishedHandState:
         self.warmup_completed = False
         self.warmup_timed_out = False
         self.fps = 0.0
+        self.device_fps = 0.0
         self.latest_host_s = 0.0
         self.tactile_version = 0
         self.firmware_version = None
+        self.latency = None
 
 
 # render_hand draws ~256 cell texts per panel; the tactile stream only updates
@@ -906,14 +918,17 @@ class BimanualViewer(Live3DViewer):
         self.recording_state = str(recording_state)
         self._record_action_requested: str | None = None
         self.side_status = {
-            "left": {"fps": 0.0, "missing": [], "safety": False, "contact": None,
-                     "firmware_version": None,
+            "left": {"fps": 0.0, "device_fps": 0.0, "missing": [], "safety": False,
+                     "contact": None, "firmware_version": None, "latency": None,
                      "connected": "left" in self.present_sides},
-            "right": {"fps": 0.0, "missing": [], "safety": False, "contact": None,
-                      "firmware_version": None,
+            "right": {"fps": 0.0, "device_fps": 0.0, "missing": [], "safety": False,
+                      "contact": None, "firmware_version": None, "latency": None,
                       "connected": "right" in self.present_sides},
         }
         self.tactile_frames = {"left": None, "right": None}
+        # Bluetooth-dongle reboot feedback shown in the HUD (set from the
+        # background worker spawned by the on-canvas "Reboot Dongle" button).
+        self._dongle_reboot_status = ""
         self.tactile_calibrating_sides = {"left": True, "right": True}
         # Pressure-matrix baseline control (glove-test v1.4 style): a toggle
         # switches between the raw ADC map and the baseline-corrected map, and
@@ -998,7 +1013,8 @@ class BimanualViewer(Live3DViewer):
                          tactile_panel_mode=self.tactile_panel_mode,
                          show_tactile_toggle=False,
                          show_orientation_button=True,
-                         show_selector_button=True, **kwargs)
+                         show_selector_button=True,
+                         show_dongle_reboot_button=True, **kwargs)
         if self._mesh_faces is not None:
             for side in self.present_sides:
                 try:
@@ -1025,86 +1041,120 @@ class BimanualViewer(Live3DViewer):
             "saved": L("已保存 - 准备下一次", "SAVED - ready for next take"),
         }
         fw_parts = []
+        latency_parts = []
         for side in ("left", "right"):
-            version = self.side_status[side].get("firmware_version")
-            fw_parts.append(
-                f"V{version}" if version is not None else "V?")
-        lines = [
-            L("固件版本: ", "Firmware: ") + " / ".join(fw_parts),
+            status = self.side_status[side]
+            # Only a glove that is actually here has a version or a round trip
+            # to report.  An absent side would contribute a placeholder that
+            # reads like a fault, and a hand that has not answered yet has
+            # nothing to say either, so both are simply left out.
+            if not status.get("connected"):
+                continue
+            side_tag = L("左 ", "left ") if side == "left" else L("右 ", "right ")
+            version = status.get("firmware_version")
+            if version is not None:
+                fw_parts.append(
+                    side_tag + f"V{display_firmware_version(version)}")
+            latency = status.get("latency")
+            # A missing measurement is normal on firmware older than v1.2.11,
+            # which does not answer the probe; show a dash rather than 0 ms.
+            latency_parts.append(
+                side_tag + (f"{latency.rtt_ms:.2f} ms"
+                            if latency is not None else "—"))
+        lines = []
+        if fw_parts:
+            lines.append(L("固件版本: ", "Firmware: ") + " / ".join(fw_parts))
+        if latency_parts:
+            lines.append(L("延迟: ", "Latency: ") + " / ".join(latency_parts))
+        lines.extend([
             L(f"界面: {self._display_fps:5.1f} FPS",
               f"GUI: {self._display_fps:5.1f} FPS"),
             L(f"录制: {state_labels.get(self.recording_state, self.recording_state)}",
               f"Recording: {state_labels.get(self.recording_state, self.recording_state)}"),
             L(f"双手已录制帧数: {self.frame_count}",
               f"Bimanual recorded frames: {self.frame_count}"),
-        ]
-        if self._startup_alignment_completed:
-            lines.append(L("方向校正: 已完成 ✓",
-                           "Orientation alignment: READY ✓"))
+        ])
         both_connected = (
             self.side_status["left"].get("connected")
             and self.side_status["right"].get("connected"))
-        if both_connected:
+        if both_connected and self._relative_reference_slots is not None:
             metrics = bimanual_relative_metrics(
                 self._display_slots(), self._relative_reference_slots)
-            lines.extend([
-                L("相对 腕距={:.1f}cm  高度(前向/掌面)={:.1f}/{:.1f}mm".format(
-                    metrics["wrist_distance_m"] * 100.0,
-                    metrics["forward_height_error_m"] * 1000.0,
-                    metrics["palm_height_error_m"] * 1000.0),
-                  "REL wrist={:.1f}cm  height(fwd/palm)={:.1f}/{:.1f}mm".format(
-                    metrics["wrist_distance_m"] * 100.0,
-                    metrics["forward_height_error_m"] * 1000.0,
-                    metrics["palm_height_error_m"] * 1000.0)),
-                L("相对 手指={:.2f}deg  掌面={:.2f}deg".format(
-                    metrics["forward_angle_deg"], metrics["palm_angle_deg"]),
-                  "REL fingers={:.2f}deg  palms={:.2f}deg".format(
-                    metrics["forward_angle_deg"], metrics["palm_angle_deg"])),
-            ])
-            if self._relative_reference_slots is not None:
-                lines.append(
-                    L("移动 拇指/非拇指 mm  L={:.1f}/{:.1f}  R={:.1f}/{:.1f}".format(
-                        metrics["left_thumb_motion_m"] * 1000.0,
-                        metrics["left_nonthumb_motion_m"] * 1000.0,
-                        metrics["right_thumb_motion_m"] * 1000.0,
-                        metrics["right_nonthumb_motion_m"] * 1000.0),
-                      "MOVE thumb/nonthumb mm  L={:.1f}/{:.1f}  R={:.1f}/{:.1f}".format(
-                        metrics["left_thumb_motion_m"] * 1000.0,
-                        metrics["left_nonthumb_motion_m"] * 1000.0,
-                        metrics["right_thumb_motion_m"] * 1000.0,
-                        metrics["right_nonthumb_motion_m"] * 1000.0)))
-        else:
-            lines.append(L("相对: 不可用 — 一只手未连接",
-                           "REL: n/a — one hand not connected"))
+            lines.append(
+                L("移动 拇指/非拇指 mm  左={:.1f}/{:.1f}  右={:.1f}/{:.1f}".format(
+                    metrics["left_thumb_motion_m"] * 1000.0,
+                    metrics["left_nonthumb_motion_m"] * 1000.0,
+                    metrics["right_thumb_motion_m"] * 1000.0,
+                    metrics["right_nonthumb_motion_m"] * 1000.0),
+                  "MOVE thumb/nonthumb mm  left={:.1f}/{:.1f}  right={:.1f}/{:.1f}".format(
+                    metrics["left_thumb_motion_m"] * 1000.0,
+                    metrics["left_nonthumb_motion_m"] * 1000.0,
+                    metrics["right_thumb_motion_m"] * 1000.0,
+                    metrics["right_nonthumb_motion_m"] * 1000.0)))
         for side in ("left", "right"):
             status = self.side_status[side]
             side_name = L("左手", "LEFT") if side == "left" else L("右手", "RIGHT")
             if not status.get("connected"):
                 lines.append(f"{side_name}: {L('未连接', 'NOT CONNECTED')}")
                 continue
+            # Only the countdown is worth the space; a finished warm-up is the
+            # normal state and needs no announcement.
+            warmup_text = ""
             if status.get("warming_up"):
                 warmup_text = (
                     L("  预热", "  WARM-UP")
                     + f" {status.get('warmup_remaining_s', 0.0):.1f}s")
-            elif status.get("warmup_completed"):
-                warmup_text = (
-                    L("  就绪", "  READY") + " ✓"
-                    + (L(" (超时)", " (timed out)") if status.get("warmup_timed_out") else ""))
-            else:
-                warmup_text = ""
+            # Solve rate first, device arrival rate right behind it: when they
+            # differ, the gap is the host dropping frames, not the glove
+            # withholding them, and that is the whole point of showing both.
+            device_fps = float(status.get("device_fps") or 0.0)
             lines.append(
                 f"{side_name}: {status['fps']:5.1f} FPS  "
-                f"IMU {16-len(status['missing'])}/16"
+                + L(f"设备 {device_fps:5.1f} Hz  ", f"DEV {device_fps:5.1f} Hz  ")
+                + f"IMU {16-len(status['missing'])}/16"
+                + (L("  蓝牙", "  BT")
+                   if status.get("link") == "bluetooth" else "")
                 + warmup_text
-                + (L("  安全", "  SAFETY") if status["safety"] else "")
-                + (L(f"  接触={status['contact']}", f"  contact={status['contact']}")
-                   if status["contact"] else ""))
+                + (L("  安全", "  SAFETY") if status["safety"] else ""))
             broken = [int(channel) for channel in (status.get("broken") or [])]
             if broken:
                 channels = "、".join(
                     f"{L('第', 'CH')}{channel}{L('路', '')}" for channel in broken)
                 lines.append(f"{side_name}: {channels} {L('坏掉了', 'BROKEN')}")
+        if self._dongle_reboot_status:
+            lines.append(
+                L("Dongle: ", "Dongle: ") + self._dongle_reboot_status)
         return lines
+
+    def _dongle_reboot_button_label(self):
+        return L("重启 dongle", "Reboot Dongle")
+
+    def _on_reboot_dongle(self):
+        """Send ``AT+REBOOT`` to the Bluetooth dongle from a worker thread.
+
+        Runs off the GUI thread so the 3-D view keeps updating while the
+        dongle replies and drops its CDC link; the outcome is echoed back to
+        the HUD via ``self._dongle_reboot_status``.
+        """
+
+        self._dongle_reboot_status = L("正在发送 AT+REBOOT…", "sending AT+REBOOT…")
+        self._redraw_requested = True
+
+        def _worker():
+            try:
+                reply = reboot_bluetooth_dongle()
+            except Exception as exc:  # surfaced to the user, not fatal
+                self._dongle_reboot_status = (
+                    L("重启失败: ", "reboot failed: ") + str(exc))
+                print(f"[Dongle] AT+REBOOT failed: {exc}", file=sys.stderr)
+            else:
+                reply_text = reply or L("(无回复)", "(no reply)")
+                self._dongle_reboot_status = (
+                    L("重启成功 — 回复: ", "reboot ok — reply: ") + reply_text)
+                print(f"[Dongle] AT+REBOOT reply: {reply!r}")
+            self._redraw_requested = True
+
+        threading.Thread(target=_worker, daemon=True, name="dongle-reboot").start()
 
     def update_both(self, left, right, frame_count, statuses,
                     mesh_slots: list[np.ndarray | None] | None = None):
@@ -1130,7 +1180,7 @@ class BimanualViewer(Live3DViewer):
             for side in ("left", "right")
         }
         fw_parts = [
-            f"{side[0].upper()} V{version}"
+            f"{side[0].upper()} V{display_firmware_version(version)}"
             for side, version in fw_versions.items()
             if version is not None
         ]
@@ -1142,15 +1192,21 @@ class BimanualViewer(Live3DViewer):
             self._window_title_shown = title
             self._qcanvas.setWindowTitle(title)
         # Terminal warning when both hands are connected but their firmware
-        # versions differ; printed once per (left, right) version pair.
+        # versions differ; printed once per (left, right) real-version pair.
+        # The hand-side digit in the patch (``1.2.101`` vs ``1.2.102``) is not a
+        # version mismatch, so compare the real version with that digit removed.
         left_fw, right_fw = fw_versions["left"], fw_versions["right"]
-        if (left_fw is not None and right_fw is not None
-                and left_fw != right_fw
-                and (left_fw, right_fw) != self._fw_mismatch_reported):
+        left_real = firmware_real_version(left_fw) if left_fw is not None else None
+        right_real = firmware_real_version(right_fw) if right_fw is not None else None
+        if (left_real is not None and right_real is not None
+                and left_real != right_real
+                and (left_real, right_real) != self._fw_mismatch_reported):
             print(
-                f"[WARN] 左右手固件版本不一致: 左手 V{left_fw} / 右手 V{right_fw}")
-            self._fw_mismatch_reported = (left_fw, right_fw)
-        elif left_fw is not None and right_fw is not None and left_fw == right_fw:
+                f"[WARN] 左右手固件版本不一致: "
+                f"左手 V{display_firmware_version(left_fw)} / "
+                f"右手 V{display_firmware_version(right_fw)}")
+            self._fw_mismatch_reported = (left_real, right_real)
+        elif left_real is not None and right_real is not None and left_real == right_real:
             self._fw_mismatch_reported = None
         self._bimanual_slots_cache = None
         self._bimanual_mesh_slots_cache = None
@@ -1829,6 +1885,7 @@ def _snapshot(runtimes, present_sides, state_lock):
                 "warmup_timed_out": bool(
                     getattr(runtime, "warmup_timed_out", False)),
                 "fps": float(getattr(runtime, "fps", 0.0)),
+                "device_fps": float(getattr(runtime, "device_fps", 0.0)),
                 "host_s": float(runtime.latest_host_s),
                 "tactile_version": int(
                     getattr(runtime, "tactile_version", 0)),
@@ -1838,6 +1895,7 @@ def _snapshot(runtimes, present_sides, state_lock):
                 "mag_ready": getattr(runtime, "latest_mag_ready", None),
                 "firmware_version": getattr(
                     runtime, "firmware_version", None),
+                "latency": getattr(runtime, "latency", None),
             }
     return snap
 
@@ -1931,6 +1989,20 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
     solve_credit = 0.0
     last_device_us: int | None = None
     solve_times: list[float] = []
+    # Device arrival rate, tracked separately from the solve rate.  The two
+    # diverge whenever a solve cannot keep up with the USB rate, and showing
+    # only the solve rate makes a busy host look like a slow glove.
+    device_frame_total = 0
+    device_samples: list[tuple[float, int]] = []
+    # The "magnetometer not ready" card is a direct mirror of bit 15 in the
+    # sequence word, which the parser masks away to publish a 15-bit counter.
+    # If a firmware's counter were really 16 bits wide, that very bit would
+    # rise every 32768 frames and the card would look identical to a
+    # magnetometer that never finishes initialising.  Logging the counter
+    # beside every transition separates the two on sight: a genuine flag is
+    # raised once and stays raised, while a counter bit tracks the rollover.
+    mag_ready_last: bool | None = None
+    mag_ready_logged_at = 0.0
     fault_detector = ImuFaultDetector(
         channel_to_hand=channel_to_hand_for_firmware(
             runtime.config.channel_to_hand))
@@ -1959,6 +2031,14 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
                 })
             raw_frames = runtime.stream.poll()
             if raw_frames:
+                # Count arrivals before the backlog is discarded below; past
+                # this point the device rate is unobservable.
+                arrival = time.perf_counter()
+                device_frame_total += len(raw_frames)
+                device_samples.append((arrival, device_frame_total))
+                device_samples = [
+                    sample for sample in device_samples
+                    if arrival - sample[0] <= 1.0]
                 # Real-time: drop the buffered backlog and keep only the newest
                 # frame, so solved output never lags behind the USB rate.
                 raw_frames = raw_frames[-1:]
@@ -1967,6 +2047,30 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
                     continue
                 saw_data = True
                 runtime.last_seq = raw_frame.sequence
+                # Reconstruct the untruncated 16-bit word the firmware sent;
+                # the parser has already stripped bit 15 out of ``sequence``.
+                mag_ready = bool(raw_frame.mag_ready)
+                word = raw_frame.sequence | (
+                    0 if mag_ready else MAGNETOMETER_NOT_READY_BIT)
+                if mag_ready != mag_ready_last:
+                    mag_ready_last = mag_ready
+                    mag_ready_logged_at = time.perf_counter()
+                    print(
+                        f"[{side}] mag_ready -> {int(mag_ready)}  "
+                        f"sequence=0x{raw_frame.sequence:04X}  "
+                        f"word=0x{word:04X}  "
+                        f"device_t={int(raw_frame.device_timestamp_us)}us",
+                        flush=True)
+                elif not mag_ready and (
+                        time.perf_counter() - mag_ready_logged_at >= 5.0):
+                    # Held down: keep a slow heartbeat so the counter can be
+                    # watched across a 0x7FFF -> 0x0000 rollover.
+                    mag_ready_logged_at = time.perf_counter()
+                    print(
+                        f"[{side}] mag_ready held 0  "
+                        f"sequence=0x{raw_frame.sequence:04X}  "
+                        f"word=0x{word:04X}",
+                        flush=True)
                 if runtime.stream.firmware_version is not None:
                     runtime.firmware_version = runtime.stream.firmware_version
                 broken_channels = fault_detector.update(
@@ -2018,6 +2122,18 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
                         if solve_window_s > 0.0 else 0.0)
                 else:
                     measured_fps = 0.0
+                # Frames delivered over the same one-second window.  Counted
+                # rather than timed because the transport hands over a burst
+                # per poll, so a per-batch timestamp would read as a stall.
+                if len(device_samples) >= 2:
+                    device_window_s = (
+                        device_samples[-1][0] - device_samples[0][0])
+                    device_fps = (
+                        (device_samples[-1][1] - device_samples[0][1])
+                        / device_window_s
+                        if device_window_s > 0.0 else 0.0)
+                else:
+                    device_fps = 0.0
                 _publish_latest(state_queue, {
                     "type": "solve",
                     "joints": joints,
@@ -2043,8 +2159,13 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
                     "warmup_timed_out": bool(
                         keypoints.status.details.get("warmup_timed_out", False)),
                     "fps": measured_fps,
+                    "device_fps": device_fps,
                     "host_s": now,
                     "firmware_version": getattr(runtime, "firmware_version", None),
+                    # Refreshed by the transport's own reader thread every ~2 s;
+                    # ``None`` until the device answers, and permanently
+                    # ``None`` on firmware older than v1.2.11.
+                    "latency": getattr(runtime.stream, "latency", None),
                 })
             if not saw_data:
                 stop_event.wait(0.001)
@@ -2108,8 +2229,10 @@ def _drain_hand_queue(state_queue, state) -> dict | None:
         state.warmup_completed = message["warmup_completed"]
         state.warmup_timed_out = message["warmup_timed_out"]
         state.fps = message["fps"]
+        state.device_fps = float(message.get("device_fps") or 0.0)
         state.latest_host_s = message["host_s"]
         state.firmware_version = message["firmware_version"]
+        state.latency = message.get("latency")
     return fatal
 
 
@@ -2268,16 +2391,34 @@ def _run_live_session(args) -> int | str:
     # Resolve each bound hand independently: a missing glove is skipped, not
     # fatal.  Only when no glove at all is detected do we abort.
     device_manager = DeviceManager(args.registry)
+    # A glove link that no registry entry claims is probed once for the hand
+    # side its firmware reports.  This is what makes a freshly plugged Bluetooth
+    # dongle usable on the first launch: the dongle hides the glove's STM32
+    # serial, so there is no other way to tell which hand is behind it.
+    try:
+        unbound_links = detect_unbound_glove_links(args.registry)
+    except Exception as exc:  # probing is best-effort, never fatal
+        print(f"[WARN] unbound glove probe failed: {exc}", file=sys.stderr)
+        unbound_links = {}
     present_sides: list[str] = []
     ports: dict[str, str] = {}
     serials: dict[str, str] = {}
+    links: dict[str, str] = {}
+    auto_detected: dict[str, str] = {}
     used_ports: set[str] = set()
     for side in ("left", "right"):
         try:
             port, serial = device_manager.resolve_port(side)
         except DeviceNotFoundError:
-            print(f"{side} device: NOT CONNECTED (skipped)")
-            continue
+            discovered = unbound_links.get(side)
+            if discovered is None:
+                print(f"{side} device: NOT CONNECTED (skipped)")
+                continue
+            port, serial = discovered
+            auto_detected[side] = serial
+            print(
+                f"{side} device: firmware reports this hand; unbound "
+                f"link={link_kind_for_device(port) or 'usb'}  port={port}")
         # A bimanual runtime must never open one physical CDC port twice.  This
         # is a defensive guard for stale registries, unusual USB drivers, or a
         # future resolver fallback: the second logical side is absent rather
@@ -2291,11 +2432,26 @@ def _run_live_session(args) -> int | str:
         present_sides.append(side)
         ports[side] = port
         serials[side] = serial
-        print(f"{side} device: serial={serial}  port={port}")
+        link = link_kind_for_device(port) or "usb"
+        links[side] = link
+        # A "bluetooth" link means the serial below is the dongle's, not the
+        # glove's: the glove behind it is not a USB device, so the dongle is
+        # what the registry and the calibration bindings key on.
+        print(
+            f"{side} device: link={link}  serial={serial}  port={port}")
     if not present_sides:
         print("No STM32 glove connected; opening the calibration selector.", file=sys.stderr)
     else:
         print(f"Connected gloves: {', '.join(present_sides)}")
+    # Persist what the probe just worked out, so the next launch resolves the
+    # link by serial and skips the (up to two-second) port probe entirely.
+    for side, serial in auto_detected.items():
+        try:
+            set_glove_serial(side, serial, args.registry)
+        except Exception as exc:  # a read-only registry must not stop the run
+            print(f"[WARN] could not remember {side} link: {exc}", file=sys.stderr)
+        else:
+            print(f"{side} device: remembered {side} -> serial {serial}")
 
     # Apply remembered calibration bindings first (serial -> calibration file),
     # so a previously-bound glove reuses its file on the next launch without a
@@ -2695,6 +2851,7 @@ def _run_live_session(args) -> int | str:
                         if side in present_sides:
                             statuses[side] = {
                                 "fps": snap[side]["fps"],
+                                "device_fps": snap[side]["device_fps"],
                                 "missing": snap[side]["missing"],
                                 "broken": snap[side]["broken"],
                                 "safety": snap[side]["safety"],
@@ -2706,11 +2863,14 @@ def _run_live_session(args) -> int | str:
                                 "raw_present": snap[side]["raw_present"],
                                 "mag_ready": snap[side]["mag_ready"],
                                 "firmware_version": snap[side]["firmware_version"],
+                                "latency": snap[side]["latency"],
+                                "link": links.get(side, "usb"),
                                 "connected": True,
                             }
                         else:
                             statuses[side] = {
-                                "fps": 0.0, "missing": snap[side]["missing"],
+                                "fps": 0.0, "device_fps": 0.0,
+                                "missing": snap[side]["missing"],
                                 "broken": [],
                                 "safety": False, "contact": None,
                                 "warming_up": False,
@@ -2720,6 +2880,8 @@ def _run_live_session(args) -> int | str:
                                 "raw_present": None,
                                 "mag_ready": None,
                                 "firmware_version": None,
+                                "latency": None,
+                                "link": "usb",
                                 "connected": False,
                             }
                     frame_count = 0

@@ -496,7 +496,8 @@ class QtCanvas(QWidget):
                  tactile_panel_mode: str | None = None,
                  show_tactile_toggle: bool = True,
                  show_orientation_button: bool = False,
-                 show_selector_button: bool = False):
+                 show_selector_button: bool = False,
+                 show_dongle_reboot_button: bool = False):
         super().__init__()
         # Dark navy-blue chrome to match the in-canvas palette.
         self.setStyleSheet(
@@ -540,12 +541,14 @@ class QtCanvas(QWidget):
         self._baseline_status: QLabel | None = None
         self._orientation_button: QPushButton | None = None
         self._selector_button: QPushButton | None = None
+        self._dongle_reboot_button: QPushButton | None = None
 
         # Top bar: the optional tactile-panel selector stays at the left edge;
         # display, language and pressure controls remain right-aligned.
         if (self._display_modes or lang_button or show_baseline
                 or show_surface_color or self._tactile_panel_modes
-                or show_orientation_button or show_selector_button):
+                or show_orientation_button or show_selector_button
+                or show_dongle_reboot_button):
             top = QWidget()
             top_layout = QHBoxLayout(top)
             top_layout.setContentsMargins(10, 6, 10, 6)
@@ -608,6 +611,18 @@ class QtCanvas(QWidget):
                 self._selector_button.clicked.connect(self._on_selector_button)
                 self._retranslate_selector_button()
                 top_layout.addWidget(self._selector_button)
+            if show_dongle_reboot_button:
+                self._dongle_reboot_button = QPushButton()
+                self._dongle_reboot_button.setFocusPolicy(Qt.NoFocus)
+                btn_font = self._dongle_reboot_button.font()
+                btn_font.setPointSize(13)
+                btn_font.setBold(True)
+                self._dongle_reboot_button.setFont(btn_font)
+                self._dongle_reboot_button.setMinimumHeight(36)
+                self._dongle_reboot_button.clicked.connect(
+                    self._on_dongle_reboot)
+                self._retranslate_dongle_reboot_button()
+                top_layout.addWidget(self._dongle_reboot_button)
             if show_baseline:
                 if show_tactile_toggle:
                     self._tactile_toggle = QCheckBox()
@@ -678,7 +693,8 @@ class QtCanvas(QWidget):
         extra = 28 if show_slider else 0
         if (self._display_modes or lang_button or show_baseline
                 or show_surface_color or self._tactile_panel_modes
-                or show_orientation_button or show_selector_button):
+                or show_orientation_button or show_selector_button
+                or show_dongle_reboot_button):
             extra += 48
         self.resize(w, h + extra)
         self.show()
@@ -727,6 +743,13 @@ class QtCanvas(QWidget):
         fn = getattr(self._controller, "_selector_button_label", None)
         self._selector_button.setText(fn() if fn is not None else "Calibration")
 
+    def _retranslate_dongle_reboot_button(self) -> None:
+        if self._dongle_reboot_button is None:
+            return
+        fn = getattr(self._controller, "_dongle_reboot_button_label", None)
+        self._dongle_reboot_button.setText(
+            fn() if fn is not None else "Reboot Dongle")
+
     def retranslate(self) -> None:
         """Refresh combo items + language button text after a language change."""
         if self._display_combo is not None:
@@ -740,6 +763,7 @@ class QtCanvas(QWidget):
         self._retranslate_pressure_mode()
         self._retranslate_orientation_button()
         self._retranslate_selector_button()
+        self._retranslate_dongle_reboot_button()
 
     def _on_lang_toggle(self) -> None:
         fn = getattr(self._controller, "_toggle_language", None)
@@ -751,6 +775,11 @@ class QtCanvas(QWidget):
         # calibration-file selector.
         if hasattr(self._controller, "request_selector"):
             self._controller.request_selector = True
+
+    def _on_dongle_reboot(self) -> None:
+        callback = getattr(self._controller, "_on_reboot_dongle", None)
+        if callback is not None:
+            callback()
 
     def _on_slider(self, value: int) -> None:
         callback = getattr(self._controller, "_on_tactile_thr", None)

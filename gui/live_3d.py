@@ -614,7 +614,8 @@ class Live3DViewer:
                  tactile_panel_mode: str | None = None,
                  show_tactile_toggle: bool = True,
                  show_orientation_button: bool = False,
-                 show_selector_button: bool = False):
+                 show_selector_button: bool = False,
+                 show_dongle_reboot_button: bool = False):
         self.view = view_state
         # The reset target is the state with which this particular window was
         # opened (including values loaded from its view JSON), not hard-coded
@@ -692,7 +693,8 @@ class Live3DViewer:
             tactile_panel_mode=tactile_panel_mode,
             show_tactile_toggle=show_tactile_toggle,
             show_orientation_button=show_orientation_button,
-            show_selector_button=show_selector_button)
+            show_selector_button=show_selector_button,
+            show_dongle_reboot_button=show_dongle_reboot_button)
         self._canvas = self._draw()
         self._qcanvas.set_canvas(self._canvas)
 

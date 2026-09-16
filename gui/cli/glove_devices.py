@@ -23,6 +23,7 @@ from glove_io.device_registry import (  # noqa: E402
     DEFAULT_REGISTRY,
     GloveDeviceError,
     clear_glove_bindings,
+    link_kind_of,
     list_matching_ports,
     load_device_registry,
     resolve_both_ports,
@@ -56,8 +57,10 @@ def main(argv=None) -> int:
             for port in list_matching_ports():
                 serial_number = str(port.serial_number or "").upper()
                 side = serial_to_side.get(serial_number, "unbound")
+                link = link_kind_of(port) or "unknown"
                 print(
-                    f"{side:7s} {port.device:12s} serial={serial_number or '-'} "
+                    f"{side:7s} {port.device:12s} link={link:9s} "
+                    f"serial={serial_number or '-'} "
                     f"location={port.location or '-'}")
             return 0
         if args.resolve:

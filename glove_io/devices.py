@@ -10,6 +10,7 @@ from glove_io.device_registry import (
     DEFAULT_REGISTRY,
     GloveDeviceError,
     clear_glove_bindings,
+    link_kind_of,
     list_matching_ports,
     load_device_registry,
     resolve_both_ports,
@@ -42,6 +43,7 @@ class DeviceManagerEngine:
                 location=str(port.location or ""),
                 bound_side=serial_to_side.get(
                     str(port.serial_number or "").upper()),
+                link_kind=link_kind_of(port) or "usb",
             )
             for port in list_matching_ports()
         ]

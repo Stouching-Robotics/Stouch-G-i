@@ -61,13 +61,14 @@ from common.enums import (  # noqa: E402
 from glove_io.device_registry import (  # noqa: E402
     GloveDeviceError,
     clear_glove_bindings as _clear_registry_bindings,
+    link_kind_of,
     list_matching_ports,
     load_device_registry,
     resolve_glove,
     set_glove_serial,
-    swap_glove_serials,
 )
 from common.usb_cdc import (  # noqa: E402
+    display_firmware_version,
     firmware_hand_side,
 )
 from common.i18n import (  # noqa: E402
@@ -389,14 +390,29 @@ def validate_hand2mm_runtime(path: Path | None = None) -> dict:
     }
 
 
+def glove_link_label(port) -> str:
+    """Return the user-facing transport tag for one connected glove port."""
+
+    return (L("蓝牙", "BT") if link_kind_of(port) == "bluetooth"
+            else L("USB", "USB"))
+
+
 def detected_glove_options() -> list[tuple[str, str]]:
-    """Return display labels and USB serials for connected STM32 gloves."""
+    """Return display labels and USB serials for connected STM32 gloves.
+
+    Bluetooth dongle ports are listed alongside wired gloves, tagged so the
+    user can tell which transport a device will be opened over.  The serial
+    reported for a dongle is the dongle's own, which is what the registry and
+    the calibration bindings persist for that side.
+    """
     options = []
     for port in list_matching_ports():
         serial_number = str(port.serial_number or "").strip().upper()
         if not serial_number:
             continue
-        label = f"{serial_number} | {port.device} | {port.location or 'unknown location'}"
+        label = (
+            f"[{glove_link_label(port)}] {serial_number} | {port.device} | "
+            f"{port.location or 'unknown location'}")
         options.append((label, serial_number))
     return options
 
@@ -438,17 +454,9 @@ def detect_hand_pair(registry: Path) -> dict[str, str] | None:
     return ports
 
 
-def bind_glove_serial(side: str, serial_number: str, registry: Path) -> Path:
-    return set_glove_serial(side, serial_number, registry)
-
-
 def glove_serial_bindings(registry: Path) -> dict[str, list[str]]:
     payload = load_device_registry(registry)
     return {side: payload[side]["usb_serials"] for side in ("left", "right")}
-
-
-def swap_glove_bindings(registry: Path) -> Path:
-    return swap_glove_serials(registry)
 
 
 def clear_glove_bindings(registry: Path) -> Path:
@@ -771,6 +779,31 @@ class CalibrationController:
             self._error = (str(message), str(message))
             self._status = ("操作失败。", "Operation failed.")
 
+    def _auto_bind_connected_glove(self, backend) -> None:
+        """Persist the USB serial of a newly-connected glove to its hand side.
+
+        Single-hand connect already opens a brand-new glove's COM port through
+        the live detection combo, but the serial stays out of
+        ``glove_devices.json`` unless the user presses a Bind button.  Persisting
+        it here makes calibrating a new glove a complete one-step onboarding:
+        afterwards the live viewer resolves the glove by its serial (and a
+        second new glove can then be calibrated for dual-hand mode).
+        """
+        serial = str(getattr(backend, "bound_serial", "") or "").strip().upper()
+        if not serial:
+            return
+        registry_path = Path(self.args.registry)
+        try:
+            registry = load_device_registry(registry_path)
+        except GloveDeviceError:
+            return
+        if serial in registry[self.side]["usb_serials"]:
+            return
+        try:
+            set_glove_serial(self.side, serial, registry_path)
+        except GloveDeviceError:
+            return
+
     def connect(self, serial_port: str | None = None) -> bool:
         def work():
             with self._lock:
@@ -778,6 +811,7 @@ class CalibrationController:
                     "正在连接并等待全部 16 个 IMU…",
                     "Connecting and waiting for all 16 IMUs...")
             backend = self._boot_backend(serial_port)
+            self._auto_bind_connected_glove(backend)
             with self._lock:
                 self.backend = backend
                 self.connected = True
@@ -1652,6 +1686,10 @@ class CalibrationWindow(QWidget):
         self._side_combo.currentIndexChanged.connect(self._choose_side)
         left_layout.addWidget(self._side_combo)
 
+        self._detected_side_label = QLabel()
+        self._detected_side_label.setWordWrap(True)
+        left_layout.addWidget(self._detected_side_label)
+
         self._detected_label = QLabel()
         left_layout.addWidget(self._detected_label)
         self._detected_combo = QComboBox()
@@ -1660,18 +1698,8 @@ class CalibrationWindow(QWidget):
         row = QHBoxLayout()
         self._refresh_btn = QPushButton()
         self._refresh_btn.clicked.connect(self.refresh_devices)
-        self._bind_left_btn = QPushButton()
-        self._bind_left_btn.clicked.connect(lambda: self._bind_selected("left"))
-        self._bind_right_btn = QPushButton()
-        self._bind_right_btn.clicked.connect(lambda: self._bind_selected("right"))
         row.addWidget(self._refresh_btn)
-        row.addWidget(self._bind_left_btn)
-        row.addWidget(self._bind_right_btn)
         left_layout.addLayout(row)
-
-        self._swap_btn = QPushButton()
-        self._swap_btn.clicked.connect(self._swap_bindings)
-        left_layout.addWidget(self._swap_btn)
 
         self._clear_btn = QPushButton()
         self._clear_btn.clicked.connect(self._clear_bindings)
@@ -1869,9 +1897,6 @@ class CalibrationWindow(QWidget):
         self._side_combo.setItemText(1, L("右手", "Right"))
         self._detected_label.setText(L("检测到的设备", "Detected Device"))
         self._refresh_btn.setText(L("刷新设备", "Refresh Devices"))
-        self._bind_left_btn.setText(L("绑定为左手", "Bind as Left"))
-        self._bind_right_btn.setText(L("绑定为右手", "Bind as Right"))
-        self._swap_btn.setText(L("交换左右绑定", "Swap Left / Right Bindings"))
         self._clear_btn.setText(L("清除所有绑定", "Clear All Bindings"))
         self._mode_label.setText(L("标定模式", "Calibration Mode"))
         self._mode_combo.setItemText(0, L("单手标定", "Single Hand"))
@@ -2001,15 +2026,12 @@ class CalibrationWindow(QWidget):
             self._detected_combo.clear()
             for label in labels:
                 self._detected_combo.addItem(label)
-            bindings = glove_serial_bindings(Path(self._args.registry))
             intro = (
                 L("检测到 {n} 个 STM32 手套。", "Detected {n} STM32 glove(s).")
                 .format(n=len(options))
                 if options else
                 L("未检测到 STM32 手套。", "No STM32 gloves detected."))
-            self._binding_status.setText(
-                intro + " " + L("绑定：", "Bindings: ")
-                + format_glove_bindings(bindings))
+            self._binding_status.setText(intro)
         except Exception as exc:
             self._detected_serials = {}
             self._detected_combo.clear()
@@ -2037,57 +2059,6 @@ class CalibrationWindow(QWidget):
             L("未检测到成对左右手；仅可单手标定。",
               "No matched left+right pair detected; single-hand calibration "
               "only."))
-
-    def _bind_selected(self, side: str) -> None:
-        label = self._detected_combo.currentText()
-        serial_number = self._detected_serials.get(label)
-        if serial_number is None:
-            self._binding_status.setText(
-                L("请先选择一个检测到的 STM32 手套。",
-                  "Select a detected STM32 glove first."))
-            return
-        locked_side = getattr(self._controller, "locked_side", None)
-        if locked_side is not None and side != locked_side:
-            locked_zh = "左" if locked_side == "left" else "右"
-            side_zh = "左" if side == "left" else "右"
-            self._binding_status.setText(L(
-                "该手套固件已识别为{locked}手，不能绑定为{side}手。",
-                "This glove's firmware is identified as the {locked} hand; "
-                "it cannot be bound as the {side} hand.").format(
-                    locked=locked_zh, side=side_zh))
-            return
-        try:
-            path = bind_glove_serial(side, serial_number, Path(self._args.registry))
-            bindings = glove_serial_bindings(Path(self._args.registry))
-            side_label = L("左", "Left") if side == "left" else L("右", "Right")
-            self._binding_status.setText(
-                L("已将序列号 {serial} 绑定到{side}手，保存在 {path}。",
-                  "Bound serial {serial} to the {side} hand in {path}.").format(
-                      serial=serial_number, side=side_label, path=path)
-                + " " + format_glove_bindings(bindings))
-            self._side_combo.setCurrentIndex(0 if side == "left" else 1)
-            if not self._dual_mode:
-                self._controller.select_side(side)
-            self._output_name.setText(self._active_controller_output_name())
-        except Exception as exc:
-            self._binding_status.setText(
-                L("序列号绑定失败：{exc}", "Serial binding failed: {exc}")
-                .format(exc=exc))
-        self._update_pair_availability()
-
-    def _swap_bindings(self) -> None:
-        try:
-            path = swap_glove_bindings(Path(self._args.registry))
-            bindings = glove_serial_bindings(Path(self._args.registry))
-            self._binding_status.setText(
-                L("已在 {path} 中交换左右绑定。",
-                  "Swapped left/right bindings in {path}.").format(path=path)
-                + " " + format_glove_bindings(bindings))
-        except Exception as exc:
-            self._binding_status.setText(
-                L("绑定交换失败：{exc}", "Binding swap failed: {exc}")
-                .format(exc=exc))
-        self._update_pair_availability()
 
     def _clear_bindings(self) -> None:
         answer = QMessageBox.question(
@@ -2151,7 +2122,7 @@ class CalibrationWindow(QWidget):
         controller = self._active_controller()
         dual = state.get("mode") == "dual"
         self._device_text.setText(state["device_text"])
-        firmware_version = state["firmware_version"]
+        firmware_version = display_firmware_version(state["firmware_version"])
         self._firmware_text.setText(
             L("固件：V{0}", "Firmware: V{0}").format(firmware_version)
             if firmware_version is not None else L("固件：--", "Firmware: --"))
@@ -2198,15 +2169,26 @@ class CalibrationWindow(QWidget):
         connected = state["connected"]
         session = state["session_started"]
         side_locked = bool(state.get("side_locked", False))
+        locked_side = state.get("locked_side")
         self._side_combo.setEnabled(not busy and not dual and not side_locked)
+        # Keep the combo showing the (auto-corrected) detected hand side.
+        if not dual:
+            detected_index = 0 if state.get("side") == "left" else 1
+            if self._side_combo.currentIndex() != detected_index:
+                self._side_combo.setCurrentIndex(detected_index)
         self._side_label.setText(
             L("手型（已自动识别）", "Hand Side (auto-detected)")
             if side_locked else L("手型", "Hand Side"))
+        if locked_side in ("left", "right"):
+            self._detected_side_label.setText(
+                L("已自动识别为左手", "Auto-detected: Left hand")
+                if locked_side == "left" else
+                L("已自动识别为右手", "Auto-detected: Right hand"))
+            self._detected_side_label.setVisible(True)
+        else:
+            self._detected_side_label.setVisible(False)
         self._mode_combo.setEnabled(not busy and not connected)
         self._refresh_btn.setEnabled(not busy)
-        self._bind_left_btn.setEnabled(not busy and not connected)
-        self._bind_right_btn.setEnabled(not busy and not connected)
-        self._swap_btn.setEnabled(not busy and not connected)
         self._connect_btn.setEnabled(not busy and not connected)
         self._start_btn.setEnabled(not busy and connected)
         self._output_name.setEnabled(not busy)

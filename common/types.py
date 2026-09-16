@@ -36,6 +36,10 @@ class DeviceInfo:
     pid: int
     location: str = ""
     bound_side: Side | None = None
+    # "usb" for a directly wired glove, "bluetooth" for a glove reached through
+    # the BP101Y dongle.  The wire protocol is identical; only the USB PID and
+    # the meaning of ``serial_number`` (glove vs dongle) differ.
+    link_kind: str = "usb"
 
 
 @dataclass(frozen=True)

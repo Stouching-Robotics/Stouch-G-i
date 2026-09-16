@@ -8,6 +8,7 @@ the public 21-keypoint interface.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from queue import Empty, Full, Queue
 import threading
 import time
@@ -20,13 +21,19 @@ from glove_io.usb_protocol import (
     STM32_USB_VID,
     is_supported_version,
     USB_TYPE_ADC_MATRIX,
+    USB_TYPE_DELAY_RESPONSE,
     USB_TYPE_IMU_Q14,
     USB_TYPE_STATUS,
     UsbCdcFrameParser,
+    UsbLinkLatency,
     decode_adc_matrix_payload,
+    decode_delay_response,
     decode_imu_q14_payload,
+    encode_host_probe,
     find_stm32_cdc_port,
+    link_latency_from_response,
     plausible_quaternion_mask,
+    supports_latency_probe,
 )
 from common.errors import StreamClosedError, StreamTimeoutError
 from common.types import RawImuFrame, TactileFrame
@@ -36,6 +43,37 @@ StatusCallback = Callable[[str], None]
 SERIAL_READ_LIMIT = 4096
 # Bit masks for the 16 IMU presence bits packed into a frame's flags word.
 _IMU_PRESENT_BITS = (1 << np.arange(16)).astype(np.uint32)
+# How often the reader thread probes the link for round-trip latency, and how
+# long an unanswered probe is kept before being discarded.
+LATENCY_PROBE_INTERVAL_S = 2.0
+LATENCY_PROBE_EXPIRY_S = 1.5
+
+
+def _monotonic_us() -> int:
+    """High-resolution monotonic microseconds, for round-trip measurement.
+
+    ``time.time_ns()`` is far too coarse here: on Windows its smallest step was
+    measured at ~995 us, so a sub-millisecond round trip lands in a single tick
+    and reads as exactly 0.  ``perf_counter_ns`` is QPC-backed (100 ns steps on
+    the same host) and monotonic, so a wall-clock adjustment cannot corrupt a
+    measurement already in flight.  Only differences are used, so the arbitrary
+    epoch is irrelevant.
+    """
+
+    return time.perf_counter_ns() // 1_000
+
+
+@dataclass
+class _PendingPing:
+    """One in-flight v1.2.11 probe, resolved by the reader thread."""
+
+    sequence: int
+    sent_us: int
+    event: threading.Event
+    result: UsbLinkLatency | None = None
+    # Monotonic deadline for the automatic probes; 0 disables expiry, which is
+    # what on-demand pings want since they clean up in their own ``finally``.
+    expires_s: float = 0.0
 
 
 def _read_available(serial_handle) -> bytes:
@@ -99,6 +137,17 @@ class _UsbSensorTransport:
         self.last_status: str = "idle"
         self.firmware_version: str | None = None
         self._state_lock = threading.RLock()
+        # v1.2.11 latency probes.  The reader thread owns the serial handle's
+        # read side; probes are written from the caller's thread, so both the
+        # handle reference and the in-flight table are lock-protected.
+        self._serial_handle = None
+        self._write_lock = threading.Lock()
+        self._ping_lock = threading.Lock()
+        self._pending_pings: dict[int, _PendingPing] = {}
+        self._ping_sequence = 0
+        # Latest link round trip, refreshed by the reader thread's own probes.
+        self.latency: UsbLinkLatency | None = None
+        self._next_probe_s = 0.0
 
     def _set_status(self, value: str, error: str | None = None) -> None:
         callback = None
@@ -129,7 +178,134 @@ class _UsbSensorTransport:
             thread.join(timeout=max(0.0, float(timeout_s)))
         with self._state_lock:
             self.connected = False
+            self._serial_handle = None
+        # Release any caller still waiting on a probe so it cannot hang for the
+        # remainder of its timeout after the stream is gone.
+        self._fail_pending_pings()
         self._set_status("stopped")
+
+    def _maybe_probe_latency(self) -> None:
+        """Send a latency probe on schedule, if the firmware understands one.
+
+        Runs on the reader thread, which owns the serial handle's read side and
+        already consumes the type 0x04 answer, so the measurement costs the
+        caller nothing and never blocks a consumer.  Probing is skipped unless
+        the device has announced v1.2.11+, because older firmware does not know
+        the probe frame.
+        """
+
+        now = time.monotonic()
+        self._expire_pending_pings(now)
+        if now < self._next_probe_s:
+            return
+        self._next_probe_s = now + LATENCY_PROBE_INTERVAL_S
+
+        version = self.firmware_version
+        if version is None or not supports_latency_probe(version):
+            return
+        with self._state_lock:
+            handle = self._serial_handle
+        if handle is None:
+            return
+
+        sent_us = _monotonic_us()
+        with self._ping_lock:
+            self._ping_sequence = (self._ping_sequence + 1) & 0xFFFF
+            sequence = self._ping_sequence
+            self._pending_pings[sequence] = _PendingPing(
+                sequence=sequence,
+                sent_us=sent_us,
+                event=threading.Event(),
+                expires_s=now + LATENCY_PROBE_EXPIRY_S,
+            )
+        try:
+            with self._write_lock:
+                handle.write(encode_host_probe(sequence, sent_us))
+        except Exception as exc:
+            with self._ping_lock:
+                self._pending_pings.pop(sequence, None)
+            self._set_status("error", f"latency probe write failed: {exc}")
+
+    def _expire_pending_pings(self, now: float) -> None:
+        """Drop probes the device never answered so the table cannot grow."""
+
+        with self._ping_lock:
+            stale = [
+                sequence for sequence, item in self._pending_pings.items()
+                if item.expires_s and now >= item.expires_s
+            ]
+            for sequence in stale:
+                self._pending_pings.pop(sequence, None)
+
+    def _fail_pending_pings(self) -> None:
+        with self._ping_lock:
+            pending = list(self._pending_pings.values())
+            self._pending_pings.clear()
+        for item in pending:
+            item.event.set()
+
+    def _resolve_ping(self, payload: bytes) -> None:
+        """Match a type 0x04 response to its probe and publish the round trip."""
+
+        try:
+            response = decode_delay_response(payload)
+        except ValueError as exc:
+            self._set_status("error", f"invalid delay response: {exc}")
+            return
+        with self._ping_lock:
+            pending = self._pending_pings.get(int(response.sequence))
+        if pending is None:
+            return
+        pending.result = link_latency_from_response(
+            response,
+            host_receive_us=_monotonic_us(),
+            host_send_us=pending.sent_us,
+        )
+        self.latency = pending.result
+        pending.event.set()
+
+    def ping(self, timeout_s: float = 1.0) -> UsbLinkLatency | None:
+        """Measure the host<->device round trip using a v1.2.11 probe.
+
+        Returns ``None`` when the stream is down, when the device has not
+        announced v1.2.11+ (older firmware does not know the probe frame, so no
+        probe is sent), or when no answer arrives within ``timeout_s``.  For
+        display purposes read :attr:`latency` instead, which the reader thread
+        refreshes on its own without blocking anything.
+        """
+
+        with self._state_lock:
+            handle = self._serial_handle
+            version = self.firmware_version
+        if handle is None:
+            return None
+        if version is None or not supports_latency_probe(version):
+            return None
+
+        sent_us = _monotonic_us()
+        with self._ping_lock:
+            self._ping_sequence = (self._ping_sequence + 1) & 0xFFFF
+            sequence = self._ping_sequence
+            pending = _PendingPing(
+                sequence=sequence, sent_us=sent_us, event=threading.Event())
+            self._pending_pings[sequence] = pending
+
+        try:
+            with self._write_lock:
+                handle.write(encode_host_probe(sequence, sent_us))
+        except Exception as exc:
+            with self._ping_lock:
+                self._pending_pings.pop(sequence, None)
+            self._set_status("error", f"ping write failed: {exc}")
+            return None
+
+        try:
+            if not pending.event.wait(max(0.0, float(timeout_s))):
+                return None
+            return pending.result
+        finally:
+            with self._ping_lock:
+                self._pending_pings.pop(sequence, None)
 
     def _run(self) -> None:
         try:
@@ -158,10 +334,12 @@ class _UsbSensorTransport:
                     with self._state_lock:
                         self.active_port = str(port)
                         self.connected = True
+                        self._serial_handle = serial_handle
                     self._set_status("connected", None)
                 except (OSError, serial.SerialException) as exc:
                     with self._state_lock:
                         self.connected = False
+                        self._serial_handle = None
                     self._set_status("waiting", f"cannot open serial port: {exc}")
                     serial_handle = None
                     self.stop_event.wait(0.5)
@@ -184,6 +362,8 @@ class _UsbSensorTransport:
                 self._set_status("disconnected", f"serial read failed: {exc}")
                 with self._state_lock:
                     self.connected = False
+                    self._serial_handle = None
+                self._fail_pending_pings()
                 try:
                     serial_handle.close()
                 except Exception:
@@ -191,6 +371,9 @@ class _UsbSensorTransport:
                 serial_handle = None
                 self.stop_event.wait(0.2)
                 continue
+
+            # Time-driven, so it still fires on a link that is idle right now.
+            self._maybe_probe_latency()
 
             if not data:
                 continue
@@ -207,7 +390,7 @@ class _UsbSensorTransport:
                 try:
                     if wire_frame.message_type == USB_TYPE_IMU_Q14:
                         quaternions = decode_imu_q14_payload(wire_frame.payload)
-                        present = (wire_frame.flags & _IMU_PRESENT_BITS) != 0
+                        present = (wire_frame.valid_mask & _IMU_PRESENT_BITS) != 0
                         plausible = plausible_quaternion_mask(quaternions)
                         _put_latest(self.imu_queue, RawImuFrame(
                             sequence=int(wire_frame.sequence),
@@ -216,15 +399,22 @@ class _UsbSensorTransport:
                             quaternions_xyzw=quaternions,
                             present_mask=present,
                             valid_mask=present & plausible,
+                            mag_ready=bool(wire_frame.mag_ready),
                         ))
                     elif wire_frame.message_type == USB_TYPE_ADC_MATRIX:
-                        matrix = decode_adc_matrix_payload(wire_frame.payload)
+                        matrix = decode_adc_matrix_payload(
+                            wire_frame.payload,
+                            sequence=wire_frame.sequence,
+                            scan_time_us=wire_frame.timestamp_us,
+                        )
                         _put_latest(self.tactile_queue, TactileFrame(
                             sequence=int(matrix.sequence),
                             timestamp_us=int(matrix.scan_time_us),
                             samples=matrix.samples,
                             processed=False,
                         ))
+                    elif wire_frame.message_type == USB_TYPE_DELAY_RESPONSE:
+                        self._resolve_ping(wire_frame.payload)
                     elif wire_frame.message_type == USB_TYPE_STATUS:
                         status = wire_frame.payload.decode(
                             "utf-8", errors="replace").strip()
@@ -240,6 +430,8 @@ class _UsbSensorTransport:
                 pass
         with self._state_lock:
             self.connected = False
+            self._serial_handle = None
+        self._fail_pending_pings()
 
 
 class RawImuStream:
@@ -334,6 +526,28 @@ class RawImuStream:
 
     def poll_tactile(self, maximum: int | None = None) -> list[TactileFrame]:
         return _drain(self._transport.tactile_queue, maximum)
+
+    @property
+    def latency(self) -> UsbLinkLatency | None:
+        """Latest link round trip, refreshed in the background every ~2 s.
+
+        ``None`` until the first answer arrives, which for firmware older than
+        v1.2.11 is permanent -- that firmware does not know the probe frame.
+        """
+
+        return self._transport.latency
+
+    def ping(self, timeout_s: float = 1.0) -> UsbLinkLatency | None:
+        """Measure the host<->device round trip (firmware v1.2.11+).
+
+        The same call works on the wired USB CDC link and on a Bluetooth dongle
+        port, since a dongle relays the SPP stream byte for byte.  Returns
+        ``None`` when the link is down, when the device has not announced
+        v1.2.11+, or when no answer arrives in time.
+        """
+
+        self.start()
+        return self._transport.ping(timeout_s)
 
 
 class TactileStream:

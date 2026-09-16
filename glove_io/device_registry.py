@@ -12,9 +12,10 @@ import json
 from pathlib import Path
 import os
 import sys
+import time
 from typing import Any
 
-from common.usb_cdc import validate_channel_to_hand
+from common.usb_cdc import glove_link_kind, validate_channel_to_hand
 
 
 def _sdk_root(start):
@@ -96,18 +97,145 @@ def load_device_registry(path: str | Path = DEFAULT_REGISTRY) -> dict[str, Any]:
     return data
 
 
-def list_matching_ports():
+def link_kind_of(port) -> str | None:
+    """Return ``"usb"``/``"bluetooth"`` for one enumerated port, else ``None``."""
+
+    return glove_link_kind(port.vid, port.pid)
+
+
+def list_matching_ports(kinds: tuple[str, ...] | None = None):
+    """Return every USB CDC port that carries a glove stream.
+
+    Both the wired glove (VID 0483 / PID 5740) and the Bluetooth dongle
+    (VID 0483 / PID 2013) qualify: the dongle relays the glove's SPP stream
+    verbatim, so from the registry's point of view it is an ordinary glove port
+    whose serial number happens to belong to the dongle.  ``kinds`` optionally
+    restricts the result to ``"usb"`` and/or ``"bluetooth"``.
+    """
+
     import serial.tools.list_ports
 
-    return [
-        port for port in serial.tools.list_ports.comports()
-        if (port.vid, port.pid) == (0x0483, 0x5740)
-    ]
+    matching = []
+    for port in serial.tools.list_ports.comports():
+        kind = link_kind_of(port)
+        if kind is None or (kinds is not None and kind not in kinds):
+            continue
+        matching.append(port)
+    return matching
+
+
+def link_kind_for_device(device: str) -> str | None:
+    """Return the link kind of a live COM port by device name, else ``None``."""
+
+    wanted = str(device or "").strip()
+    if not wanted:
+        return None
+    for port in list_matching_ports():
+        if str(port.device) == wanted:
+            return link_kind_of(port)
+    return None
+
+
+def _port_serves_side(port, expected: dict) -> bool:
+    """Return whether one enumerated port belongs to this side's glove entry.
+
+    A wired glove must match the side's configured ``usb_vid``/``usb_pid`` — the
+    same check as before, kept so a registry pointed at a non-STM32 device is
+    still rejected.  A Bluetooth dongle is accepted on its own known VID/PID
+    pair instead: the glove behind it is not a USB device at all, so the dongle's
+    identity is what the registry binds for that side.
+    """
+
+    if link_kind_of(port) == "bluetooth":
+        return True
+    return port.vid == expected["usb_vid"] and port.pid == expected["usb_pid"]
+
+
+def probe_glove_side(device: str, timeout_s: float = 2.0) -> str | None:
+    """Return the hand side a glove reports over ``device``, or ``None``.
+
+    The firmware encodes its hand side in the ones digit of the version patch,
+    so one frame header is enough (see :func:`common.usb_cdc.firmware_hand_side`).
+    Only frame headers are parsed — no payload decoding, calibration, or solver
+    work happens here.
+
+    This is the fallback for a link no registry entry claims.  A wired glove
+    normally resolves by its STM32 serial, but a Bluetooth dongle hides the
+    glove behind it: the only identity reaching the host is the dongle's own
+    serial plus this firmware-side marker.  Returns ``None`` when the port
+    cannot be opened (another process holds it) or no frame arrives in time.
+    """
+
+    from common.usb_cdc import UsbCdcFrameParser, firmware_hand_side
+
+    try:
+        import serial
+    except ImportError:
+        return None
+
+    try:
+        handle = serial.Serial(device, baudrate=115200, timeout=0.2)
+    except (OSError, serial.SerialException):
+        return None
+
+    parser = UsbCdcFrameParser()
+    try:
+        deadline = time.monotonic() + max(float(timeout_s), 0.1)
+        while time.monotonic() < deadline:
+            try:
+                data = handle.read(handle.in_waiting or 1)
+            except (OSError, serial.SerialException):
+                return None
+            if not data:
+                continue
+            for frame in parser.feed(data):
+                side = firmware_hand_side(frame.version)
+                if side is not None:
+                    return side
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+    return None
+
+
+def detect_unbound_glove_links(
+        registry_path: str | Path = DEFAULT_REGISTRY,
+        timeout_s: float = 2.0) -> dict[str, tuple[str, str]]:
+    """Return ``{side: (port, serial)}`` for connected-but-unbound glove links.
+
+    A link is unbound when its USB serial appears in no side's ``usb_serials``
+    list, so nothing in the registry claims it — the normal case the first time
+    a Bluetooth dongle is plugged in.  Each such link is probed for the hand
+    side its firmware reports.  A link that reports no side is left out, as is a
+    second link claiming a side an earlier one already reported: with one entry
+    per side it would only ever be ambiguous.
+    """
+
+    try:
+        registry = load_device_registry(registry_path)
+    except GloveDeviceError:
+        return {}
+    bound = {serial for side in VALID_SIDES
+             for serial in registry[side]["usb_serials"]}
+
+    discovered: dict[str, tuple[str, str]] = {}
+    for port in list_matching_ports():
+        serial = str(port.serial_number or "").strip().upper()
+        if not serial or serial in bound:
+            continue
+        side = probe_glove_side(str(port.device), timeout_s)
+        if side is None or side in discovered:
+            continue
+        discovered[side] = (str(port.device), serial)
+    return discovered
 
 
 def _describe_ports(ports) -> str:
     return ", ".join(
         f"{port.device}:{port.serial_number or 'no-serial'}"
+        f"({link_kind_of(port) or 'unknown'})"
         for port in ports) or "none"
 
 
@@ -133,8 +261,7 @@ def resolve_glove(
     matches = [
         port for port in list_matching_ports()
         if str(port.serial_number or "").upper() in serials
-        and port.vid == expected["usb_vid"]
-        and port.pid == expected["usb_pid"]
+        and _port_serves_side(port, expected)
     ]
     if not matches:
         present_ports = list_matching_ports()

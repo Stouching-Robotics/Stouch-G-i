@@ -332,6 +332,14 @@ class BimanualRecorder(KeypointParquetRecorder):
         "observation.imu.left.raw_valid_mask": 16,
         "observation.imu.right.raw_valid_mask": 16,
     }
+    # Device-side IMU arrival rate at sample time, next to the solved keypoints
+    # it produced.  Rows are written on the recorder's own wall-clock cadence,
+    # so without this a file cannot distinguish "the glove sent 50 Hz" from
+    # "the glove sent 100 Hz and the host solved 50 of it".
+    RATE_COLS = (
+        "observation.imu.left.device_fps",
+        "observation.imu.right.device_fps",
+    )
 
     def __init__(self, output_path, episode_index=0, task_index=0,
                  checkpoint_frames=600, serials=None):
@@ -377,6 +385,8 @@ class BimanualRecorder(KeypointParquetRecorder):
                 if tactile_raw is not None
                 else np.full(256, np.nan, np.float32).tolist())
             row[f"observation.device.{side}.serial"] = self.serials.get(side, "")
+            row[f"observation.imu.{side}.device_fps"] = float(
+                getattr(runtime, "device_fps", 0.0) or 0.0)
         if self._checkpoint and len(self.rows) % self._checkpoint == 0:
             self._schedule_save(list(self.rows))
 
@@ -398,6 +408,9 @@ class BimanualRecorder(KeypointParquetRecorder):
             name = f"observation.device.{side}.serial"
             series.append(pl.Series(
                 name, [row[name] for row in self.rows], dtype=pl.String))
+        for name in self.RATE_COLS:
+            series.append(pl.Series(
+                name, [row[name] for row in self.rows], dtype=pl.Float32))
         return series
 
 

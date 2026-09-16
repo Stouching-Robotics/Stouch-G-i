@@ -385,8 +385,10 @@ class BimanualViewer(Live3DViewer):
         self.recording_state = str(recording_state)
         self._record_action_requested: str | None = None
         self.side_status = {
-            "left": {"fps": 0.0, "missing": [], "safety": False, "contact": None},
-            "right": {"fps": 0.0, "missing": [], "safety": False, "contact": None},
+            "left": {"fps": 0.0, "device_fps": 0.0, "missing": [], "safety": False,
+                     "contact": None},
+            "right": {"fps": 0.0, "device_fps": 0.0, "missing": [], "safety": False,
+                      "contact": None},
         }
         self.tactile_frames = {"left": None, "right": None}
         self.tactile_calibrating_sides = {"left": True, "right": True}
@@ -461,8 +463,12 @@ class BimanualViewer(Live3DViewer):
                     metrics["right_nonthumb_motion_m"] * 1000.0))
         for side in ("left", "right"):
             status = self.side_status[side]
+            # Solve rate first, device arrival rate right behind it: when they
+            # differ, the gap is the host dropping frames, not the glove
+            # withholding them, and that is the whole point of showing both.
             lines.append(
                 f"{side.upper()}: {status['fps']:5.1f} FPS  "
+                f"DEV {float(status.get('device_fps') or 0.0):5.1f} Hz  "
                 f"IMU {16-len(status['missing'])}/16"
                 + ("  SAFETY" if status["safety"] else "")
                 + (f"  contact={status['contact']}" if status["contact"] else ""))
@@ -786,6 +792,10 @@ def main(argv=None):
     next_sample = started
     processed_frame_index = 0
     fps_times = {"left": [], "right": []}
+    # Device arrival rate, tracked beside the solve rate so a host that cannot
+    # keep up is not mistaken for a glove that is not delivering.
+    device_totals = {"left": 0, "right": 0}
+    device_samples = {"left": [], "right": []}
     try:
         while True:
             now = time.monotonic()
@@ -799,6 +809,13 @@ def main(argv=None):
                         viewer.set_tactile_side(side, processed)
                 raw_frames = runtime.stream.poll()
                 if raw_frames:
+                    # Count arrivals before the backlog is discarded below;
+                    # past this point the device rate is unobservable.
+                    device_totals[side] += len(raw_frames)
+                    device_samples[side].append((now, device_totals[side]))
+                    device_samples[side] = [
+                        sample for sample in device_samples[side]
+                        if now - sample[0] <= 1.0]
                     # Real-time: drop the buffered backlog and keep only the
                     # newest frame, so the view never lags behind the USB rate.
                     raw_frames = raw_frames[-1:]
@@ -826,6 +843,11 @@ def main(argv=None):
                     runtime.contact = keypoints.status.active_contact
                     fps_times[side].append(now)
                     fps_times[side] = fps_times[side][-60:]
+                    samples = device_samples[side]
+                    span = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
+                    runtime.device_fps = (
+                        (samples[-1][1] - samples[0][1]) / span
+                        if span > 0.0 else 0.0)
 
             ready = all(runtime.latest_joints is not None for runtime in runtimes.values())
             fresh = ready and all(
@@ -940,7 +962,10 @@ def main(argv=None):
                         fps = ((len(times)-1) / max(times[-1]-times[0], 1e-6)
                                if len(times) >= 2 else 0.0)
                         statuses[side] = {
-                            "fps": fps, "missing": runtimes[side].missing,
+                            "fps": fps,
+                            "device_fps": float(
+                                getattr(runtimes[side], "device_fps", 0.0)),
+                            "missing": runtimes[side].missing,
                             "safety": runtimes[side].safety,
                             "contact": runtimes[side].contact,
                         }
