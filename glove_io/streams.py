@@ -20,9 +20,12 @@ from glove_io.usb_protocol import (
     STM32_USB_PID,
     STM32_USB_VID,
     is_supported_version,
+    MagTelemetryCache,
+    MagTelemetrySnapshot,
     USB_TYPE_ADC_MATRIX,
     USB_TYPE_DELAY_RESPONSE,
     USB_TYPE_IMU_Q14,
+    USB_TYPE_MAG_TELEMETRY,
     USB_TYPE_STATUS,
     UsbCdcFrameParser,
     UsbLinkLatency,
@@ -147,7 +150,27 @@ class _UsbSensorTransport:
         self._ping_sequence = 0
         # Latest link round trip, refreshed by the reader thread's own probes.
         self.latency: UsbLinkLatency | None = None
+        # Latest v1.2.13 magnetometer telemetry, merged by the reader thread.
+        # The cache owns its own lock, so it needs no ``_state_lock`` here.
+        self._mag_cache = MagTelemetryCache()
         self._next_probe_s = 0.0
+        # The frame parser's error tally, republished here so it can be read
+        # from outside: the parser itself is a local of ``_run``, so its
+        # counters used to be unreachable.  Cumulative for the lifetime of this
+        # transport -- callers wanting a rate take deltas.  Replaced wholesale
+        # (never mutated) so a reader on another thread always sees a
+        # consistent triple.
+        self.link_errors: dict[str, int] = {
+            "crc_errors": 0,
+            "length_errors": 0,
+            "discarded_bytes": 0,
+        }
+
+    @property
+    def mag_telemetry(self) -> MagTelemetrySnapshot | None:
+        """Latest independently cached v1.2.13 magnetic telemetry."""
+
+        return self._mag_cache.snapshot
 
     def _set_status(self, value: str, error: str | None = None) -> None:
         callback = None
@@ -159,6 +182,22 @@ class _UsbSensorTransport:
                 callback = self.status_callback
         if callback is not None:
             callback(value)
+
+    def _sync_link_errors(self, parser) -> None:
+        """Republish the reader's parser tally after one drained read.
+
+        Called once per read rather than once per frame: the parser is owned
+        and consumed entirely by the reader thread, so this is the cheapest
+        point that still keeps the published triple within one read of the
+        truth.  The counters are cumulative, so a consumer that wants a rate
+        has to keep the previous triple and subtract.
+        """
+
+        self.link_errors = {
+            "crc_errors": parser.crc_errors,
+            "length_errors": parser.length_errors,
+            "discarded_bytes": parser.discarded_bytes,
+        }
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -264,6 +303,12 @@ class _UsbSensorTransport:
         self.latency = pending.result
         pending.event.set()
 
+    def _update_mag_telemetry(
+            self, wire_frame, host_timestamp_us: int) -> None:
+        """Merge one type-0x05 frame into the per-channel caches."""
+
+        self._mag_cache.update(wire_frame, host_timestamp_us)
+
     def ping(self, timeout_s: float = 1.0) -> UsbLinkLatency | None:
         """Measure the host<->device round trip using a v1.2.11 probe.
 
@@ -335,6 +380,7 @@ class _UsbSensorTransport:
                         self.active_port = str(port)
                         self.connected = True
                         self._serial_handle = serial_handle
+                        self._mag_cache.reset()
                     self._set_status("connected", None)
                 except (OSError, serial.SerialException) as exc:
                     with self._state_lock:
@@ -415,6 +461,9 @@ class _UsbSensorTransport:
                         ))
                     elif wire_frame.message_type == USB_TYPE_DELAY_RESPONSE:
                         self._resolve_ping(wire_frame.payload)
+                    elif wire_frame.message_type == USB_TYPE_MAG_TELEMETRY:
+                        self._update_mag_telemetry(
+                            wire_frame, host_timestamp_us)
                     elif wire_frame.message_type == USB_TYPE_STATUS:
                         status = wire_frame.payload.decode(
                             "utf-8", errors="replace").strip()
@@ -422,6 +471,7 @@ class _UsbSensorTransport:
                             self._set_status(f"device: {status}", None)
                 except ValueError as exc:
                     self._set_status("error", f"invalid USB payload: {exc}")
+            self._sync_link_errors(parser)
 
         if serial_handle is not None:
             try:
@@ -537,6 +587,27 @@ class RawImuStream:
 
         return self._transport.latency
 
+    @property
+    def mag_telemetry(self) -> MagTelemetrySnapshot | None:
+        """Latest independently cached v1.2.13 magnetic telemetry."""
+
+        return self._transport.mag_telemetry
+
+    @property
+    def link_errors(self) -> dict[str, int]:
+        """Cumulative frame-parser error tally for this link.
+
+        ``crc_errors`` counts frames whose CRC rejected the candidate layout,
+        ``length_errors`` frames whose declared length was impossible, and
+        ``discarded_bytes`` bytes dropped while hunting for the next magic.
+        Cumulative since the transport started, so a caller wanting a rate keeps
+        the previous triple and subtracts.  A steady stream at zero is normal;
+        a rising ``discarded_bytes`` means the parser, not the transport, is
+        eating the wire.
+        """
+
+        return self._transport.link_errors
+
     def ping(self, timeout_s: float = 1.0) -> UsbLinkLatency | None:
         """Measure the host<->device round trip (firmware v1.2.11+).
 
@@ -622,4 +693,6 @@ class TactileStream:
 SensorStream = RawImuStream
 
 
-__all__ = ["RawImuStream", "SensorStream", "TactileStream"]
+__all__ = [
+    "MagTelemetrySnapshot", "RawImuStream", "SensorStream", "TactileStream",
+]

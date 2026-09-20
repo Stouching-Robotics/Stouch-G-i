@@ -20,11 +20,13 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton,
-    QSlider, QVBoxLayout, QWidget)
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QSlider, QVBoxLayout, QWidget)
+
+from common.i18n import L  # noqa: E402
 
 # Default tactile threshold applied at startup: cells below this ADC value are
 # zeroed so tiny baseline / sensor fluctuations do not flicker the cell numbers.
@@ -55,6 +57,11 @@ class _CanvasArea(QWidget):
       - ``exit_requested`` attribute
     """
 
+    # Emitted whenever the floating orbit pad is shown or hidden, so the owning
+    # QtCanvas can keep its top-bar toggle button in sync with a close that came
+    # from the pad itself.
+    view_control_visibility_changed = Signal(bool)
+
     def __init__(self, parent: QWidget | None, controller, canvas_w: int,
                  canvas_h: int):
         super().__init__(parent)
@@ -64,6 +71,7 @@ class _CanvasArea(QWidget):
         self._image: QImage | None = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self._view_control_shown = True
         self._view_control = _ViewControl(self, controller)
         self._place_view_control()
         self._baseline_overlay: QLabel | None = None
@@ -114,9 +122,37 @@ class _CanvasArea(QWidget):
         if self._baseline_overlay is not None:
             self._baseline_overlay.hide()
 
+    def view_control_visible(self) -> bool:
+        """Whether the floating orbit pad is currently shown."""
+        return self._view_control_shown
+
+    def set_view_control_visible(self, visible: bool) -> None:
+        """Show or hide the floating orbit pad.
+
+        Driven by both the pad's own close button and the top bar's toggle; the
+        signal keeps whichever control the user did *not* touch in sync.
+        """
+        visible = bool(visible)
+        if visible == self._view_control_shown:
+            return
+        self._view_control_shown = visible
+        self._view_control.setVisible(visible)
+        if visible:
+            # Re-anchor on the way back, honouring any earlier manual drag.
+            self._place_view_control()
+        self.view_control_visibility_changed.emit(visible)
+
     def _place_view_control(self) -> None:
-        """Place the compact camera control between record and tactile cards."""
+        """Place the compact camera control between record and tactile cards.
+
+        Once the user has dragged the panel somewhere, that position is what is
+        kept: a resize only nudges it back inside the window.  Re-anchoring it
+        to the default corner would silently undo the move on the next resize.
+        """
         margin = 18
+        if self._view_control.was_moved_by_user():
+            self._view_control._move_to(self._view_control.pos())
+            return
         preferred_y = 70
         max_y = max(margin, self.height() - self._view_control.height() - margin)
         self._view_control.move(
@@ -230,11 +266,21 @@ class _ViewControl(QWidget):
     saved defaults, and dragging anywhere on the outer ring adjusts camera
     roll.  It deliberately talks to the viewer through tiny duck-typed
     callbacks so the same control works for single- and bimanual viewers.
+
+    The panel is also *movable*: pressing any part of it that is not a button
+    and not the roll ring grabs the whole widget, so a user can drag it off
+    whatever it happens to be covering.  That is why it floats on the canvas
+    instead of living in the top bar -- the thing it covers changes with the
+    view.
     """
 
     WIDTH, HEIGHT = 160, 210
     CX, CY = 80.0, 70.0
     OUTER_R, INNER_R = 62.0, 44.0
+    # Small, deliberately understated: it sits in the panel's top-right corner,
+    # clear of the roll ring, and must not compete with the pad itself.  The
+    # top bar's toggle button is the discoverable way back.
+    CLOSE_RECT = QRectF(136, 10, 16, 16)
 
     def __init__(self, parent: QWidget, controller):
         super().__init__(parent)
@@ -243,6 +289,12 @@ class _ViewControl(QWidget):
         self._hovered: str | None = None
         self._rolling = False
         self._last_pointer_angle = 0.0
+        # Offset from the pointer to the widget's top-left while dragging the
+        # panel itself; ``None`` means no grab is in progress.
+        self._drag_offset: QPoint | None = None
+        # Once the user has placed the panel, the canvas stops re-anchoring it
+        # to its default corner on every resize.
+        self._moved_by_user = False
         self._repeat = QTimer(self)
         self._repeat.setInterval(85)
         self._repeat.timeout.connect(self._repeat_direction)
@@ -254,7 +306,37 @@ class _ViewControl(QWidget):
         self.setToolTip(
             "方向键：俯仰/偏航（按住连续旋转）\n"
             "拖动外圈：滚转\n中心：恢复窗口刚打开时的状态\n"
-            "底部按钮：切换旋转灵敏度")
+            "底部按钮：切换旋转灵敏度\n"
+            "拖动空白处：移动此面板\n"
+            "右上角 ×：关闭（顶栏按钮可随时重新打开）")
+
+    def was_moved_by_user(self) -> bool:
+        """Whether the user has placed the panel, rather than the default anchor."""
+        return self._moved_by_user
+
+    def _request_close(self) -> None:
+        """Hide the panel; the top bar's toggle button is the way back.
+
+        Routed through the parent canvas rather than a bare ``hide()`` so a
+        close driven from the panel keeps the toggle button's label in sync.
+        """
+        parent = self.parentWidget()
+        setter = getattr(parent, "set_view_control_visible", None)
+        if setter is not None:
+            setter(False)
+        else:
+            self.hide()
+
+    def _move_to(self, top_left: QPoint) -> None:
+        """Move the whole panel, keeping it inside the canvas it floats over."""
+        parent = self.parentWidget()
+        x, y = int(top_left.x()), int(top_left.y())
+        if parent is not None:
+            x = max(0, min(x, max(0, parent.width() - self.width())))
+            y = max(0, min(y, max(0, parent.height() - self.height())))
+        self._moved_by_user = True
+        self.move(x, y)
+        self.raise_()
 
     @staticmethod
     def _normalized_delta(current: float, previous: float) -> float:
@@ -280,15 +362,25 @@ class _ViewControl(QWidget):
         }
 
     def _hit(self, pos) -> str | None:
-        if QRectF(20, 176, 120, 24).contains(QPointF(pos)):
+        point = QPointF(pos)
+        # Checked first: the close button overlays the panel corner, so it has
+        # to win over the "move" grip that covers everything else.
+        if self.CLOSE_RECT.contains(point):
+            return "close"
+        if QRectF(20, 176, 120, 24).contains(point):
             return "sensitivity"
         radius = self._radius(pos)
         if self.INNER_R <= radius <= self.OUTER_R + 5.0:
             return "roll"
-        point = QPointF(pos)
         for name, rect in self._button_rects().items():
             if rect.contains(point):
                 return name
+        # Everything else inside the panel is a grip.  The readout strip under
+        # the ring, the corners and the slack between the direction buttons are
+        # not controls, so pressing there moves the panel rather than doing
+        # nothing -- which is the only way to uncover what it is hiding.
+        if QRectF(0, 0, self.WIDTH, self.HEIGHT).contains(point):
+            return "move"
         return None
 
     def _repeat_direction(self) -> None:
@@ -313,7 +405,11 @@ class _ViewControl(QWidget):
             return
         hit = self._hit(ev.position())
         self._pressed = hit
-        if hit == "roll":
+        if hit == "move":
+            self._drag_offset = (
+                ev.globalPosition().toPoint() - self.frameGeometry().topLeft())
+            self.setCursor(Qt.ClosedHandCursor)
+        elif hit == "roll":
             self._rolling = True
             self._last_pointer_angle = self._pointer_angle(ev.position())
         elif hit == "reset":
@@ -325,6 +421,8 @@ class _ViewControl(QWidget):
                 self._controller, "_view_control_cycle_sensitivity", None)
             if callback is not None:
                 callback()
+        elif hit == "close":
+            self._request_close()
         elif hit is not None:
             self._repeat_direction()
             self._repeat.start()
@@ -332,6 +430,11 @@ class _ViewControl(QWidget):
         ev.accept()
 
     def mouseMoveEvent(self, ev) -> None:  # noqa: N802
+        if self._drag_offset is not None and (ev.buttons() & Qt.LeftButton):
+            self._move_to(
+                ev.globalPosition().toPoint() - self._drag_offset)
+            ev.accept()
+            return
         if self._rolling and (ev.buttons() & Qt.LeftButton):
             angle = self._pointer_angle(ev.position())
             delta = self._normalized_delta(angle, self._last_pointer_angle)
@@ -344,16 +447,25 @@ class _ViewControl(QWidget):
             hovered = self._hit(ev.position())
             if hovered != self._hovered:
                 self._hovered = hovered
-                self.setCursor(
-                    Qt.PointingHandCursor if hovered is not None
-                    else Qt.ArrowCursor)
+                if hovered == "move":
+                    self.setCursor(Qt.SizeAllCursor)
+                elif hovered is not None:
+                    self.setCursor(Qt.PointingHandCursor)
+                else:
+                    self.setCursor(Qt.ArrowCursor)
                 self.update()
         ev.accept()
 
     def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
+        dragged = self._drag_offset is not None
         self._repeat.stop()
         self._pressed = None
         self._rolling = False
+        self._drag_offset = None
+        if dragged:
+            # The pointer is still over the panel, so restore the neutral
+            # cursor; the next move re-derives the hover one.
+            self.setCursor(Qt.ArrowCursor)
         self.update()
         # Return keyboard shortcuts to the 3D surface after using the pad.
         if self.parentWidget() is not None:
@@ -361,7 +473,7 @@ class _ViewControl(QWidget):
         ev.accept()
 
     def leaveEvent(self, ev) -> None:  # noqa: N802
-        if not self._rolling:
+        if not self._rolling and self._drag_offset is None:
             self._hovered = None
             self.setCursor(Qt.ArrowCursor)
             self.update()
@@ -478,6 +590,29 @@ class _ViewControl(QWidget):
         painter.setPen(QColor(224, 230, 244))
         painter.drawText(
             sensitivity_rect, Qt.AlignCenter, sensitivity_label)
+
+        # Close button: a small x in the panel's top-right corner.  Held at low
+        # contrast until hovered so it stays secondary to the pad itself.
+        close_rect = self.CLOSE_RECT
+        close_active = self._pressed == "close"
+        close_hovered = self._hovered == "close"
+        painter.setPen(QPen(QColor(100, 119, 153, 200), 1.0))
+        painter.setBrush(
+            QColor(96, 52, 62, 245) if close_active else
+            QColor(74, 44, 54, 240) if close_hovered else
+            QColor(30, 42, 60, 200))
+        painter.drawRoundedRect(close_rect, 5, 5)
+        painter.setPen(QPen(
+            QColor(255, 226, 226) if (close_active or close_hovered)
+            else QColor(176, 190, 210),
+            1.6, Qt.SolidLine, Qt.RoundCap))
+        pad = 4.0
+        painter.drawLine(
+            QPointF(close_rect.left() + pad, close_rect.top() + pad),
+            QPointF(close_rect.right() - pad, close_rect.bottom() - pad))
+        painter.drawLine(
+            QPointF(close_rect.right() - pad, close_rect.top() + pad),
+            QPointF(close_rect.left() + pad, close_rect.bottom() - pad))
         painter.end()
 
 
@@ -497,7 +632,8 @@ class QtCanvas(QWidget):
                  show_tactile_toggle: bool = True,
                  show_orientation_button: bool = False,
                  show_selector_button: bool = False,
-                 show_dongle_reboot_button: bool = False):
+                 show_dongle_reboot_button: bool = False,
+                 show_view_control_button: bool = True):
         super().__init__()
         # Dark navy-blue chrome to match the in-canvas palette.
         self.setStyleSheet(
@@ -521,6 +657,15 @@ class QtCanvas(QWidget):
         self._display_modes = list(display_modes or [])
         self._tactile_panel_modes = list(tactile_panel_modes or [])
         self.setWindowTitle(title or "Live 3D")
+        # Windows can choose different fallback faces for Chinese and Latin
+        # glyphs.  A single UI face keeps both language modes at identical
+        # metrics, preventing the toolbar from looking oversized after a
+        # language switch.  Qt falls back safely on non-Windows platforms.
+        self.setFont(QFont("Microsoft YaHei UI", 10))
+        # The canvas itself aspect-fits its 1280x720 source, so it is safe to
+        # let the window shrink to a normal laptop-sized work area.  Controls
+        # that cannot fit horizontally live in a scrollable toolbar below.
+        self.setMinimumSize(720, 480)
         self._area = _CanvasArea(self, controller, w, h)
 
         layout = QVBoxLayout(self)
@@ -542,13 +687,14 @@ class QtCanvas(QWidget):
         self._orientation_button: QPushButton | None = None
         self._selector_button: QPushButton | None = None
         self._dongle_reboot_button: QPushButton | None = None
+        self._view_control_button: QPushButton | None = None
 
         # Top bar: the optional tactile-panel selector stays at the left edge;
         # display, language and pressure controls remain right-aligned.
         if (self._display_modes or lang_button or show_baseline
                 or show_surface_color or self._tactile_panel_modes
                 or show_orientation_button or show_selector_button
-                or show_dongle_reboot_button):
+                or show_dongle_reboot_button or show_view_control_button):
             top = QWidget()
             top_layout = QHBoxLayout(top)
             top_layout.setContentsMargins(10, 6, 10, 6)
@@ -571,7 +717,6 @@ class QtCanvas(QWidget):
                 self._display_combo = QComboBox()
                 self._display_combo.setFocusPolicy(Qt.NoFocus)
                 big = self._display_combo.font()
-                big.setPointSize(13)
                 big.setBold(True)
                 self._display_combo.setFont(big)
                 self._display_combo.setMinimumHeight(36)
@@ -583,9 +728,6 @@ class QtCanvas(QWidget):
                     self._on_display_mode)
                 self._display_label = QLabel()
                 self._display_label.setFocusPolicy(Qt.NoFocus)
-                label_font = self._display_label.font()
-                label_font.setPointSize(13)
-                self._display_label.setFont(label_font)
                 self._retranslate_display_label()
                 top_layout.addWidget(self._display_label)
                 top_layout.addWidget(self._display_combo)
@@ -593,7 +735,6 @@ class QtCanvas(QWidget):
                 self._lang_button = QPushButton()
                 self._lang_button.setFocusPolicy(Qt.NoFocus)
                 btn_font = self._lang_button.font()
-                btn_font.setPointSize(13)
                 btn_font.setBold(True)
                 self._lang_button.setFont(btn_font)
                 self._lang_button.setMinimumHeight(36)
@@ -604,7 +745,6 @@ class QtCanvas(QWidget):
                 self._selector_button = QPushButton()
                 self._selector_button.setFocusPolicy(Qt.NoFocus)
                 btn_font = self._selector_button.font()
-                btn_font.setPointSize(13)
                 btn_font.setBold(True)
                 self._selector_button.setFont(btn_font)
                 self._selector_button.setMinimumHeight(36)
@@ -615,7 +755,6 @@ class QtCanvas(QWidget):
                 self._dongle_reboot_button = QPushButton()
                 self._dongle_reboot_button.setFocusPolicy(Qt.NoFocus)
                 btn_font = self._dongle_reboot_button.font()
-                btn_font.setPointSize(13)
                 btn_font.setBold(True)
                 self._dongle_reboot_button.setFont(btn_font)
                 self._dongle_reboot_button.setMinimumHeight(36)
@@ -623,6 +762,24 @@ class QtCanvas(QWidget):
                     self._on_dongle_reboot)
                 self._retranslate_dongle_reboot_button()
                 top_layout.addWidget(self._dongle_reboot_button)
+                # Born hidden: the controller reveals it once a Bluetooth link
+                # is detected (see set_dongle_reboot_visible).
+                self._dongle_reboot_button.setVisible(False)
+            if show_view_control_button:
+                self._view_control_button = QPushButton()
+                self._view_control_button.setFocusPolicy(Qt.NoFocus)
+                btn_font = self._view_control_button.font()
+                btn_font.setBold(True)
+                self._view_control_button.setFont(btn_font)
+                self._view_control_button.setMinimumHeight(36)
+                self._view_control_button.clicked.connect(
+                    self._on_view_control_toggle)
+                self._retranslate_view_control_button()
+                top_layout.addWidget(self._view_control_button)
+                # The pad's own close button hides it directly, so the toggle
+                # label follows the canvas rather than only its own clicks.
+                self._area.view_control_visibility_changed.connect(
+                    self._on_view_control_visibility_changed)
             if show_baseline:
                 if show_tactile_toggle:
                     self._tactile_toggle = QCheckBox()
@@ -647,6 +804,9 @@ class QtCanvas(QWidget):
                 top_layout.addWidget(self._baseline_toggle)
                 top_layout.addWidget(self._baseline_button)
                 top_layout.addWidget(self._baseline_status)
+                # Born hidden: the controller reveals the group once a tactile
+                # panel view is selected (see set_baseline_controls_visible).
+                self.set_baseline_controls_visible(False)
             if show_surface_color:
                 self._pressure_mode_label = QLabel()
                 self._pressure_mode_label.setFocusPolicy(Qt.NoFocus)
@@ -668,7 +828,20 @@ class QtCanvas(QWidget):
                     self._on_recollect_orientation)
                 self._retranslate_orientation_button()
                 top_layout.addWidget(self._orientation_button)
-            layout.addWidget(top)
+            # Do not elide or hide controls at narrower widths.  The content
+            # keeps its natural minimum width and the bar gains a horizontal
+            # scrollbar only when needed; at ordinary desktop widths it still
+            # behaves like the original single-row toolbar.
+            top.setMinimumWidth(top_layout.minimumSize().width())
+            toolbar = QScrollArea()
+            toolbar.setWidget(top)
+            toolbar.setWidgetResizable(True)
+            toolbar.setFrameShape(QFrame.NoFrame)
+            toolbar.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            toolbar.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            toolbar.setMinimumHeight(48)
+            toolbar.setMaximumHeight(66)
+            layout.addWidget(toolbar)
 
         layout.addWidget(self._area, 1)
 
@@ -696,7 +869,13 @@ class QtCanvas(QWidget):
                 or show_orientation_button or show_selector_button
                 or show_dongle_reboot_button):
             extra += 48
-        self.resize(w, h + extra)
+        # A 1280x720 canvas plus chrome is taller than the usable height of
+        # many 1366x768 laptops.  Start within the available work area instead
+        # of opening partly off-screen; users can still enlarge it afterwards.
+        available = QApplication.primaryScreen().availableGeometry()
+        target_w = min(w, max(720, int(available.width() * 0.95)))
+        target_h = min(h + extra, max(480, int(available.height() * 0.92)))
+        self.resize(target_w, target_h)
         self.show()
         self._area.setFocus()
 
@@ -750,6 +929,24 @@ class QtCanvas(QWidget):
         self._dongle_reboot_button.setText(
             fn() if fn is not None else "Reboot Dongle")
 
+    def _retranslate_view_control_button(self) -> None:
+        """Label the pad toggle after the pad's *current* state, not this call."""
+        if self._view_control_button is None:
+            return
+        if self._area.view_control_visible():
+            self._view_control_button.setText(L("隐藏旋转盘", "Hide Pad"))
+        else:
+            self._view_control_button.setText(L("显示旋转盘", "Show Pad"))
+
+    def _on_view_control_toggle(self) -> None:
+        self._area.set_view_control_visible(
+            not self._area.view_control_visible())
+
+    def _on_view_control_visibility_changed(self) -> None:
+        # Signal carries the new state, but the label re-reads it from the
+        # canvas so the two can never disagree.
+        self._retranslate_view_control_button()
+
     def retranslate(self) -> None:
         """Refresh combo items + language button text after a language change."""
         if self._display_combo is not None:
@@ -764,6 +961,7 @@ class QtCanvas(QWidget):
         self._retranslate_orientation_button()
         self._retranslate_selector_button()
         self._retranslate_dongle_reboot_button()
+        self._retranslate_view_control_button()
 
     def _on_lang_toggle(self) -> None:
         fn = getattr(self._controller, "_toggle_language", None)
@@ -916,6 +1114,33 @@ class QtCanvas(QWidget):
     def set_baseline_button_enabled(self, enabled: bool) -> None:
         if self._baseline_button is not None:
             self._baseline_button.setEnabled(bool(enabled))
+
+    def set_dongle_reboot_visible(self, visible: bool) -> None:
+        """Show the dongle reboot button only while a Bluetooth link exists.
+
+        ``AT+REBOOT`` is a Bluetooth-dongle command: on a wired glove there is
+        nothing to send it to, so the button stays out of the bar until a dongle
+        link is actually detected.  Only visibility is driven -- the button, its
+        label and its handler are unchanged.
+        """
+        if self._dongle_reboot_button is not None:
+            self._dongle_reboot_button.setVisible(bool(visible))
+
+    def set_baseline_controls_visible(self, visible: bool) -> None:
+        """Show the pressure-baseline controls only while a tactile panel is on.
+
+        The toggle and its re-collect button act on the tactile panel's own
+        maps, so the group appears together with one of the panel's views and is
+        hidden while the panel is off.  Only visibility is driven here: the
+        toggle's state and the button's function are left exactly as they were,
+        so hiding the group never switches baseline correction off behind the
+        user's back.
+        """
+        visible = bool(visible)
+        for widget in (self._baseline_toggle, self._baseline_button,
+                       self._baseline_status):
+            if widget is not None:
+                widget.setVisible(visible)
 
     def show_baseline_overlay(self, text: str) -> None:
         """Show a large centre-top banner on the canvas."""

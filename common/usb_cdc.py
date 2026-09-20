@@ -9,9 +9,58 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
+import threading
 from typing import Iterable
 
 import numpy as np
+
+
+# Explicit export list: ``glove_io.usb_protocol`` is a thin re-export shim over
+# this module, so this is the whole protocol surface both layers see.  Keeping
+# it explicit keeps ``from ... import *`` from leaking ``np``/``struct`` into
+# callers and makes an accidental rename a loud failure instead of a silent one.
+__all__ = [
+    # Constants and frame layout
+    "STM32_USB_VID", "STM32_USB_PID",
+    "USB_MAGIC", "USB_HEADER_SIZE", "USB_CRC_SIZE", "USB_MAX_PAYLOAD",
+    "USB_NEW_FORMAT_FROM", "USB_SLIM_FORMAT_FROM", "USB_SLIM_HEADER_SIZE",
+    "USB_FULL_SEQUENCE_FROM", "SEQUENCE_COUNTER_MASK",
+    "MAGNETOMETER_NOT_READY_BIT",
+    "USB_TYPE_STATUS", "USB_TYPE_IMU_Q14", "USB_TYPE_ADC_MATRIX",
+    "USB_TYPE_DELAY_RESPONSE", "USB_TYPE_MAG_TELEMETRY", "USB_TYPE_HOST_PROBE",
+    "USB_HOST_PROBE_SIZE", "USB_DELAY_RESPONSE_PAYLOAD_SIZE",
+    "USB_LATENCY_PROBE_FROM",
+    "TOTAL_IMU_COUNT", "IMU_COMPONENT_COUNT", "IMU_Q14_PAYLOAD_SIZE",
+    "IMU_VALID_MASK_SIZE", "IMU_SLIM_PAYLOAD_SIZE", "Q14_SCALE",
+    "ADC_MATRIX_ROWS", "ADC_MATRIX_COLS", "ADC_MATRIX_META_SIZE",
+    "ADC_MATRIX_PAYLOAD_SIZE", "ADC_MATRIX_SLIM_PAYLOAD_SIZE",
+    "MAG_TELEMETRY_PAYLOAD_SIZE", "MAG_TELEMETRY_PAYLOAD_SIZES",
+    "MAG_TELEMETRY_IMU_COUNT", "MAG_TELEMETRY_VALID_MASK_SIZE",
+    "MAG_READY_MIN_NUMERATOR", "MAG_READY_MIN_DENOMINATOR", "mag_gate_met",
+    "MAG_LEVEL_SHIFT", "MAG_LEVEL_MASK",
+    # Decoded frames
+    "UsbCdcFrame", "UsbAdcMatrixFrame", "UsbDelayResponse", "UsbMagTelemetry",
+    "UsbLinkLatency", "MagTelemetrySnapshot", "MagTelemetryCache",
+    # Parser and codecs
+    "UsbCdcFrameParser", "crc16_ccitt_false", "encode_host_probe",
+    "decode_imu_q14_payload", "decode_adc_matrix_payload",
+    "decode_delay_response", "decode_mag_telemetry_payload",
+    "decode_sequence_word", "plausible_quaternion_mask",
+    "link_latency_from_response",
+    # Version helpers
+    "parse_firmware_version", "firmware_real_version", "is_supported_version",
+    "is_slim_format", "supports_latency_probe", "firmware_hand_side",
+    "display_firmware_version",
+    # Channel/hand mapping
+    "BLUETOOTH_DONGLE_VID", "BLUETOOTH_DONGLE_PID", "glove_link_kind",
+    "STM32_LINK_IDS", "LEGACY_CHANNEL_TO_HAND_BY_SIDE",
+    "NEW_FIRMWARE_CHANNEL_TO_HAND_BY_SIDE", "FIRMWARE_OUTPUT_ORDER_BY_SIDE",
+    "DEFAULT_CHANNEL_TO_HAND", "validate_channel_to_hand",
+    "channel_to_hand_for_firmware", "remap_physical_to_hand",
+    "readable_imu_mask",
+    # Port discovery
+    "find_stm32_cdc_port", "list_serial_ports",
+]
 
 
 STM32_USB_VID = 0x0483
@@ -72,24 +121,105 @@ IMU_VALID_MASK_SIZE = 2
 IMU_SLIM_PAYLOAD_SIZE = 130
 ADC_MATRIX_SLIM_PAYLOAD_SIZE = 384
 
-# Interface spec §4.6: the slim header's 16-bit sequence word is a counter
-# whose bit 15 the firmware forces to 1 while the magnetometer is not yet
-# ready.  That flag is what drives the "move the hand in circles" prompt, so
-# the parser must keep it out of the counter it publishes as ``sequence``.
+# Through v1.2.12, bit 15 of the slim sequence word is a magnetometer-not-ready
+# flag and the remaining 15 bits are the counter.  Starting with v1.2.13 the
+# word is an ordinary 16-bit counter; readiness is reported by type 0x05.
 SEQUENCE_COUNTER_MASK = 0x7FFF
 MAGNETOMETER_NOT_READY_BIT = 0x8000
+USB_FULL_SEQUENCE_FROM = (1, 2, 13)
 
 USB_TYPE_STATUS = 0x01
 USB_TYPE_IMU_Q14 = 0x02
 USB_TYPE_ADC_MATRIX = 0x03
 USB_TYPE_DELAY_RESPONSE = 0x04
+USB_TYPE_MAG_TELEMETRY = 0x05
 USB_TYPE_HOST_PROBE = 0x50
+
+# v1.2.13: the payload carries one calibration byte per physical IMU (16 of them)
+# and the magnetometer vectors are gone.
+#
+# 18 is the *only* length accepted.  A 23-byte variant used to be tolerated as
+# "the old struct with its reserves kept"; it had no source -- the vendor's own
+# reference decoder rejects anything but 18 (MAG_TELEMETRY(1).md 6), no firmware
+# has ever been seen to send it, and nothing said where those five bytes went.
+# Tolerating an unverifiable layout is only safe by luck, so a frame of any other
+# length is dropped and the parser resyncs on the next magic.
+MAG_TELEMETRY_VALID_MASK_SIZE = 2
+MAG_TELEMETRY_IMU_COUNT = 16
+MAG_TELEMETRY_PAYLOAD_SIZE = MAG_TELEMETRY_VALID_MASK_SIZE + MAG_TELEMETRY_IMU_COUNT
+MAG_TELEMETRY_PAYLOAD_SIZES = (MAG_TELEMETRY_PAYLOAD_SIZE,)
+# The readiness gate: three quarters of the channels a 0x05 frame carried must
+# read 3.
+#
+# The denominator is that frame's own valid mask -- the IMUs it read this round
+# -- not the 16 physical positions.  There is no usable "is this IMU working"
+# signal to divide by instead: the only thing the telemetry licenses is "of the
+# channels read this round, this fraction are at 3".  A frame carries about
+# twelve of the sixteen, so dividing by 16 would charge the glove for channels
+# nobody read, and make the bar unreachable on a hand with any sensor that is
+# simply quiet.
+#
+# Not all of them, because a glove held still never separates hard iron from the
+# earth's field on the fingers it does not move: the last few channels stay low
+# however long the user circles (MAG_TELEMETRY.md 2.2).  The bar sits at three
+# quarters rather than a half so a half-calibrated glove is not called ready; on
+# the ~12 channels a frame carries that is 9 of 12.
+MAG_READY_MIN_NUMERATOR = 3
+MAG_READY_MIN_DENOMINATOR = 4
+
+
+def mag_gate_met(fresh_ready: int, fresh_count: int) -> bool:
+    """Is ``fresh_ready`` of this frame's ``fresh_count`` channels enough?
+
+    A frame that carried nothing cannot pass: "0 of 0" is not a calibrated
+    magnetometer, it is an absent one.
+    """
+
+    return (fresh_count > 0
+            and fresh_ready * MAG_READY_MIN_DENOMINATOR
+            >= fresh_count * MAG_READY_MIN_NUMERATOR)
+
+# Where the MAG level sits in each calibration byte.
+#
+# The byte is the BNO055's CALIB_STAT register (0x35) verbatim, so it is the
+# chip's own order -- SYS in the high pair down to MAG in the low pair:
+#
+#     bit:      7 6     5 4     3 2     1 0
+#     content:  SYS     GYR     ACC     MAG
+#
+# BNO055 datasheet 4.3.54.  ``algorithm/imu_calibrate_cli``'s per-IMU gate in
+# ``common/datamodels.py`` has always read it this way ([5:4]>=2 is the gyro,
+# [1:0]>=1 the magnetometer).
+#
+# This was briefly believed to be reversed (MAG in [7:6]), on the strength of
+# the rule "SYS = min of the other three" applied to one early capture.  That
+# rule does not hold on this firmware -- feed the newer captures through it and
+# *every* placement of SYS contradicts itself -- so it was never evidence.  The
+# capture that settled it is ``mag_capture/``'s 0x05 dump:
+#
+#   * [1:0] is 0 for every fresh channel while the glove is cold, then flips to
+#     3 within one frame and stays there for ~100% of fresh channels afterwards:
+#     the shape of a magnetometer finishing calibration.
+#   * [5:4] toggles 0<->3 with hand motion and nowhere else: the gyroscope,
+#     which snaps to 3 whenever the glove is briefly still.
+#   * [1:0] cannot be SYS: at the moment it reads 3 on every channel, [3:2] is
+#     still 1, and SYS=3 requires all three subsystems at 3.
+#
+# Reading bits [7:6] instead is the trap this constant exists to prevent: it
+# returns SYS, which sits near 0 on a calibrated glove and makes it look like
+# none of its channels ever reach level 3 -- the gate then never opens.
+MAG_LEVEL_SHIFT = 0
+MAG_LEVEL_MASK = 0x03
 
 # v1.2.11 host→device ping probe: ``A5 5A 50 seq(2B) t1(8B)`` (no version, no
 # CRC).  The device replies with a normal type 0x04 frame whose 18-byte payload
 # is ``seq(2B) t1(8B) t2(4B) t3(4B)``.
 USB_HOST_PROBE_SIZE = 13
 USB_DELAY_RESPONSE_PAYLOAD_SIZE = 18
+
+# First firmware that understands the probe frame; see
+# :func:`supports_latency_probe`.
+USB_LATENCY_PROBE_FROM = (1, 2, 11)
 
 TOTAL_IMU_COUNT = 16
 IMU_COMPONENT_COUNT = 4
@@ -152,6 +282,18 @@ def is_slim_format(version: str | tuple[int, ...] | list[int]) -> bool:
 
     real = firmware_real_version(version)
     return real is not None and real >= USB_SLIM_FORMAT_FROM
+
+
+def supports_latency_probe(version: str | tuple[int, ...] | list[int]) -> bool:
+    """Return whether ``version`` answers the v1.2.11 latency probe.
+
+    v1.2.11 is the first firmware that knows the type 0x50 probe frame, so the
+    probe is only ever sent to a device that has announced it or newer; older
+    firmware would just see 13 unrecognised bytes injected into its stream.
+    """
+
+    real = firmware_real_version(version)
+    return real is not None and real >= USB_LATENCY_PROBE_FROM
 
 
 def firmware_hand_side(version: str) -> str | None:
@@ -233,15 +375,21 @@ NEW_FIRMWARE_CHANNEL_TO_HAND_BY_SIDE = {
 DEFAULT_CHANNEL_TO_HAND = NEW_FIRMWARE_CHANNEL_TO_HAND_BY_SIDE["right"]
 
 
-def decode_sequence_word(raw_sequence: int) -> tuple[int, bool]:
+def decode_sequence_word(
+        raw_sequence: int,
+        version: str | tuple[int, ...] | list[int] | None = None,
+) -> tuple[int, bool]:
     """Split a slim-header sequence word into (counter, magnetometer_ready).
 
-    ``sequence`` carries only the 15-bit counter; the flag is reported
-    separately so consumers counting frames never see the forced bit.  See
-    interface spec §4.6.
+    v1.2.12 and older carry a 15-bit counter plus the readiness flag.  v1.2.13
+    and newer use all 16 bits as the counter and report magnetic calibration in
+    a separate type-0x05 frame, so ``magnetometer_ready`` is true here.
     """
 
     word = int(raw_sequence)
+    real = firmware_real_version(version) if version is not None else None
+    if real is not None and real >= USB_FULL_SEQUENCE_FROM:
+        return word & 0xFFFF, True
     return (word & SEQUENCE_COUNTER_MASK,
             (word & MAGNETOMETER_NOT_READY_BIT) == 0)
 
@@ -261,11 +409,9 @@ class UsbCdcFrame:
     # distinguishable from a side-encoded ``1.2.1x`` by version alone, so
     # deriving this from the version would read the mask from the wrong place.
     header_size: int = USB_HEADER_SIZE
-    # False while the firmware reports the magnetometer as not yet ready.  The
-    # flag only exists in the slim layout, where it rides in bit 15 of the
-    # sequence word (see :func:`decode_sequence_word`); the legacy 32-bit
-    # sequence has no such bit and is always reported ready, so the prompt
-    # never stalls on older firmware.
+    # False while v1.2.10-v1.2.12 reports the magnetometer as not ready in bit
+    # 15 (see :func:`decode_sequence_word`).  Legacy 32-bit frames and v1.2.13+
+    # report True here; the latter exposes per-channel state through type 0x05.
     mag_ready: bool = True
 
     @property
@@ -307,17 +453,61 @@ class UsbDelayResponse:
     t3_us: int
 
 
+@dataclass(frozen=True)
+class UsbMagTelemetry:
+    """Decoded type-0x05 telemetry: one MAG level per physical IMU."""
+
+    valid_mask: int
+    levels_raw: tuple[int, ...]
+
+    @property
+    def level_fresh(self) -> tuple[bool, ...]:
+        """Which levels this frame actually carried (bit k = IMU k fresh)."""
+
+        return tuple(bool(self.valid_mask & (1 << k))
+                     for k in range(MAG_TELEMETRY_IMU_COUNT))
+
+    @property
+    def mag_levels(self) -> tuple[int, ...]:
+        return tuple((value >> MAG_LEVEL_SHIFT) & MAG_LEVEL_MASK
+                     for value in self.levels_raw)
+
+
+@dataclass(frozen=True)
+class UsbLinkLatency:
+    """One measured host<->device round trip (v1.2.11 ping)."""
+
+    sequence: int
+    rtt_us: int
+    device_turnaround_us: int
+    t1_us: int
+    t2_us: int
+    t3_us: int
+    host_receive_us: int
+
+    @property
+    def rtt_ms(self) -> float:
+        return self.rtt_us / 1000.0
+
+
+# CRC16-CCITT-FALSE (poly 0x1021, init 0xFFFF) byte-at-a-time lookup table,
+# precomputed once so the per-frame hot path avoids an 8-iteration bit loop.
+_CRC16_TABLE = []
+for _crc_i in range(256):
+    _crc_c = _crc_i << 8
+    for _ in range(8):
+        _crc_c = (((_crc_c << 1) ^ 0x1021) & 0xFFFF
+                  if _crc_c & 0x8000 else (_crc_c << 1) & 0xFFFF)
+    _CRC16_TABLE.append(_crc_c)
+
+
 def crc16_ccitt_false(data: bytes | bytearray | memoryview) -> int:
     """Return CRC16-CCITT-FALSE (poly 0x1021, init 0xFFFF)."""
 
     crc = 0xFFFF
     for value in data:
-        crc ^= int(value) << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
+        crc = ((crc << 8) & 0xFFFF) ^ _CRC16_TABLE[
+            ((crc >> 8) ^ int(value)) & 0xFF]
     return crc
 
 
@@ -383,7 +573,7 @@ class UsbCdcFrameParser:
                     continue
                 if header_size == USB_SLIM_HEADER_SIZE:
                     sequence, mag_ready = decode_sequence_word(
-                        int.from_bytes(self.buffer[6:8], "little"))
+                        int.from_bytes(self.buffer[6:8], "little"), version)
                     timestamp_us = int.from_bytes(self.buffer[8:12], "little")
                     payload_length = int.from_bytes(self.buffer[12:14], "little")
                     flags = 0
@@ -398,7 +588,12 @@ class UsbCdcFrameParser:
                     expected_lengths = (
                         IMU_Q14_PAYLOAD_SIZE, ADC_MATRIX_PAYLOAD_SIZE)
 
-                if message_type in (USB_TYPE_IMU_Q14, USB_TYPE_ADC_MATRIX):
+                if message_type == USB_TYPE_MAG_TELEMETRY:
+                    if (header_size != USB_SLIM_HEADER_SIZE
+                            or payload_length not in MAG_TELEMETRY_PAYLOAD_SIZES):
+                        length_rejected += 1
+                        continue
+                elif message_type in (USB_TYPE_IMU_Q14, USB_TYPE_ADC_MATRIX):
                     # Fixed-size payloads: anything else means this is the
                     # wrong layout, or the buffer is not at a frame boundary.
                     if payload_length not in expected_lengths:
@@ -500,6 +695,181 @@ def decode_imu_q14_payload(payload: bytes) -> np.ndarray:
     return wxyz[:, [1, 2, 3, 0]]
 
 
+def decode_mag_telemetry_payload(payload: bytes) -> UsbMagTelemetry:
+    """Decode a type-0x05 payload: ``mask(2B)`` then 16 level bytes."""
+
+    if len(payload) not in MAG_TELEMETRY_PAYLOAD_SIZES:
+        raise ValueError(
+            "mag telemetry payload must be one of "
+            f"{MAG_TELEMETRY_PAYLOAD_SIZES} bytes, got {len(payload)}")
+    start = MAG_TELEMETRY_VALID_MASK_SIZE
+    valid_mask = int.from_bytes(payload[:start], "little")
+    levels = tuple(int(value)
+                   for value in payload[start:start + MAG_TELEMETRY_IMU_COUNT])
+    return UsbMagTelemetry(valid_mask, levels)
+
+
+@dataclass(frozen=True)
+class MagTelemetrySnapshot:
+    """Latest cached magnetic levels for the 16 physical IMUs.
+
+    ``level_fresh`` describes only the most recently received type-0x05 frame.
+    A level stays cached when its fresh bit is clear; ``level_seen`` tells that
+    stale value apart from one that has never been received at all.
+    """
+
+    sequence: int
+    device_timestamp_us: int
+    host_timestamp_us: int
+    levels_raw: tuple[int | None, ...]
+    level_fresh: tuple[bool, ...]
+    level_seen: tuple[bool, ...]
+    # Stored rather than derived: a frame that carried no channels leaves the
+    # verdict where it was (see MagTelemetryCache.update).
+    ready: bool
+    # The newest frame exactly as it came off the wire: its 16 CALIB_STAT bytes
+    # with no merge and no decoding, paired with ``level_fresh`` for the mask it
+    # arrived under.  ``levels_raw`` above is the cache and cannot be used for
+    # this -- a channel the frame skipped keeps its older value there.  Recorded
+    # verbatim by the capture so the byte layout can be audited from the file
+    # rather than argued about.
+    frame_levels_raw: tuple[int, ...] = ()
+
+    @property
+    def mag_levels(self) -> tuple[int | None, ...]:
+        return tuple(None if value is None
+                     else (value >> MAG_LEVEL_SHIFT) & MAG_LEVEL_MASK
+                     for value in self.levels_raw)
+
+    @property
+    def fresh_count(self) -> int:
+        """How many channels the newest frame -- this round -- carried."""
+
+        return sum(1 for fresh in self.level_fresh if fresh)
+
+    @property
+    def fresh_ready_count(self) -> int:
+        """Of those, how many report MAG level 3."""
+
+        return sum(1 for fresh, level in zip(self.level_fresh, self.mag_levels)
+                   if fresh and level == 3)
+
+    @property
+    def gate_counts(self) -> tuple[int, int]:
+        """``(at 3, carried)`` for the newest 0x05 frame -- what the gate saw.
+
+        What a caller shows next to a "not calibrated" prompt: both numbers are
+        about this round, so the pair moves for the same reason the gate does.
+        The channels the frame did not carry are in neither of them.
+        """
+
+        return self.fresh_ready_count, self.fresh_count
+
+    @property
+    def unread_channels(self) -> tuple[int, ...]:
+        """The IMUs this round did not report, in physical channel order.
+
+        Not a fault and not a level: the device carries about twelve of the
+        sixteen per frame (MAG_TELEMETRY.md 2.4), and which ones is not
+        predictable.  Named so a count out of twelve has an explanation on
+        screen beside it.
+        """
+
+        return tuple(channel for channel, fresh in enumerate(self.level_fresh)
+                     if not fresh)
+
+    @property
+    def ready_count(self) -> int:
+        """How many channels have been seen *and* report MAG level 3.
+
+        A diagnostic over the whole cache, not the gate: it counts cached
+        levels too, and its denominator is all 16.
+        """
+
+        return sum(1 for seen, level in zip(self.level_seen, self.mag_levels)
+                   if seen and level == 3)
+
+    @property
+    def uncalibrated_channels(self) -> tuple[int, ...]:
+        """The physical IMUs that were read and are still below level 3."""
+
+        return tuple(channel
+                     for channel, (seen, level) in enumerate(
+                         zip(self.level_seen, self.mag_levels))
+                     if seen and level != 3)
+
+
+class MagTelemetryCache:
+    """Per-channel cache merging type-0x05 frames into a snapshot.
+
+    MAG_TELEMETRY.md 2.4: the device reports per-frame freshness rather than a
+    guaranteed stream -- not every level is carried by every frame -- so a level
+    is cached until its channel is reported again: a stale value stays readable
+    while a never-received one stays ``None``, and ``level_seen`` is what tells
+    the two apart.
+    """
+
+    def __init__(self) -> None:
+        # Own lock rather than borrowing the caller's: the two producers (the
+        # USB transport reader thread and the calibration receiver thread) each
+        # already hold a different outer lock while calling in.
+        self._lock = threading.RLock()
+        self._snapshot: MagTelemetrySnapshot | None = None
+
+    @property
+    def snapshot(self) -> MagTelemetrySnapshot | None:
+        with self._lock:
+            return self._snapshot
+
+    def reset(self) -> None:
+        """Forget everything; called when the link drops."""
+
+        with self._lock:
+            self._snapshot = None
+
+    def update(self, frame, host_timestamp_us: int) -> MagTelemetrySnapshot:
+        """Merge one parsed type-0x05 frame and return the merged snapshot.
+
+        Raises :class:`ValueError` for a wrong-length payload (the caller
+        decides whether that is fatal); the cache is left untouched.
+        """
+
+        decoded = decode_mag_telemetry_payload(frame.payload)
+        with self._lock:
+            previous = self._snapshot
+            blank = (None,) * MAG_TELEMETRY_IMU_COUNT
+            levels = list(previous.levels_raw if previous is not None else blank)
+            seen = list(previous.level_seen if previous is not None
+                        else (False,) * MAG_TELEMETRY_IMU_COUNT)
+            for channel in range(MAG_TELEMETRY_IMU_COUNT):
+                if decoded.level_fresh[channel]:
+                    levels[channel] = decoded.levels_raw[channel]
+                    seen[channel] = True
+            fresh_ready = sum(
+                1 for fresh, value in zip(decoded.level_fresh, decoded.levels_raw)
+                if fresh and ((value >> MAG_LEVEL_SHIFT) & MAG_LEVEL_MASK) == 3)
+            fresh_count = sum(1 for fresh in decoded.level_fresh if fresh)
+            if fresh_count:
+                ready = mag_gate_met(fresh_ready, fresh_count)
+            else:
+                # A frame whose mask is empty carried no reading at all, so it
+                # is not evidence of anything -- falling to "not ready" here
+                # would start a circles countdown off a frame that said nothing.
+                ready = previous.ready if previous is not None else False
+            self._snapshot = MagTelemetrySnapshot(
+                sequence=int(frame.sequence),
+                device_timestamp_us=int(frame.timestamp_us),
+                host_timestamp_us=int(host_timestamp_us),
+                levels_raw=tuple(levels),
+                level_fresh=decoded.level_fresh,
+                level_seen=tuple(seen),
+                ready=ready,
+                frame_levels_raw=tuple(int(value)
+                                       for value in decoded.levels_raw),
+            )
+            return self._snapshot
+
+
 def _unpack_12bit_matrix(payload: bytes) -> np.ndarray:
     """Unpack a 384-byte 12-bit-packed block into a 16x16 float array.
 
@@ -591,6 +961,36 @@ def decode_delay_response(payload: bytes) -> UsbDelayResponse:
         t1_us=int.from_bytes(payload[2:10], "little"),
         t2_us=int.from_bytes(payload[10:14], "little"),
         t3_us=int.from_bytes(payload[14:18], "little"),
+    )
+
+
+def link_latency_from_response(
+        response: UsbDelayResponse,
+        *,
+        host_receive_us: int,
+        host_send_us: int | None = None,
+) -> UsbLinkLatency:
+    """Combine a decoded 0x04 response with the host send/receive times.
+
+    The round trip is measured entirely inside the host clock and needs no
+    clock synchronisation with the device.  ``host_send_us`` (the timestamp the
+    host actually recorded when it wrote the probe) is preferred over the
+    device's echoed ``t1`` so a corrupted echo cannot produce a bogus latency;
+    the probe was already matched by sequence number.  ``t2``/``t3`` are device
+    timestamps on a 32-bit microsecond counter that wraps after ~71.6 minutes,
+    so the turnaround is computed modulo 2^32.
+    """
+
+    t1_us = int(response.t1_us)
+    sent_us = t1_us if host_send_us is None else int(host_send_us)
+    return UsbLinkLatency(
+        sequence=int(response.sequence),
+        rtt_us=int(host_receive_us) - sent_us,
+        device_turnaround_us=(int(response.t3_us) - int(response.t2_us)) & 0xFFFFFFFF,
+        t1_us=t1_us,
+        t2_us=int(response.t2_us),
+        t3_us=int(response.t3_us),
+        host_receive_us=int(host_receive_us),
     )
 
 

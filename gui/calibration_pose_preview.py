@@ -35,6 +35,15 @@ else:
 PREVIEW_WIDTH = 660
 PREVIEW_HEIGHT = 300
 _CONTACT_NAMES = ("index", "middle", "ring", "little")
+# Fist preview: four-finger flexion in degrees (MANO pose order 0..12; thumb
+# 13..15 stays relaxed).  Bend is positive flexion along the anatomy Z axis,
+# matching the runtime's ``as_euler("XYZ")`` bend convention.
+_FIST_BENDS = {
+    1: 90.0, 2: 100.0, 3: 80.0,     # index MCP/PIP/DIP
+    4: 90.0, 5: 100.0, 6: 80.0,     # middle
+    7: 90.0, 8: 100.0, 9: 80.0,     # little
+    10: 90.0, 11: 100.0, 12: 80.0,  # ring
+}
 
 # The 21-point live 3D view uses yaw=270, elev=8 and roll=240 together with
 # its tuned palm display basis.  These are the equivalent camera angles after
@@ -127,6 +136,10 @@ class CalibrationPosePreview:
             side: {name: geometry[1] for name, geometry in contacts.items()}
             for side, contacts in contact_geometry.items()
         }
+        self._fist: dict[str, np.ndarray] = {}
+        self._fist_mesh: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            self._fist[side], self._fist_mesh[side] = self._build_fist(side)
         self._live_enabled = False
         self._live_view = {
             "yaw": _PREVIEW_YAW, "elev": _PREVIEW_ELEV,
@@ -146,6 +159,8 @@ class CalibrationPosePreview:
         self._live_root: dict[str, dict[str, R]] = {}
         self._live_contacts: dict[str, dict[str, np.ndarray]] = {}
         self._live_contact_meshes: dict[str, dict[str, np.ndarray]] = {}
+        self._live_fist: dict[str, np.ndarray] = {}
+        self._live_fist_mesh: dict[str, np.ndarray] = {}
         try:
             payload = json.loads(
                 _BIMANUAL_DISPLAY_CONFIG.read_text(encoding="utf-8"))
@@ -210,6 +225,10 @@ class CalibrationPosePreview:
                         mesh, live_map, self._contacts[side][name][0])
                     for name, mesh in self._contact_meshes[side].items()
                 }
+                self._live_fist[side] = apply_hand_display_rotation(
+                    self._fist[side], live_map)
+                self._live_fist_mesh[side] = self._rotate_points(
+                    self._fist_mesh[side], live_map, self._fist[side][0])
             # Fine-calibration preview (contact steps): the left glove's contact
             # anchors render as a right-hand-shaped contact already, so the right
             # panel reuses that exact pose (its own calibration file is absent
@@ -308,6 +327,8 @@ class CalibrationPosePreview:
                 _CONTACT_NAMES[index - 8]].copy()
         if index == 12:
             return self._live_contacts[side]["little"].copy()
+        if index in (13, 14):
+            return self._live_fist[side].copy()
         return base.copy()
 
     def _mesh_for_step_live(self, side: str, index: int) -> np.ndarray:
@@ -332,6 +353,8 @@ class CalibrationPosePreview:
                 _CONTACT_NAMES[index - 8]].copy()
         if index == 12:
             return self._live_contact_meshes[side]["little"].copy()
+        if index in (13, 14):
+            return self._live_fist_mesh[side].copy()
         return base.copy()
 
     def _mirror_pose_about_camera(self, joints: np.ndarray) -> np.ndarray:
@@ -480,11 +503,23 @@ class CalibrationPosePreview:
                 for name in _CONTACT_NAMES
             }
 
+    def _build_fist(self, side: str) -> tuple[np.ndarray, np.ndarray]:
+        """Curl the four fingers (thumb relaxed) into a fist preview pose."""
+        angles = np.zeros((16, 3), dtype=np.float64)
+        for joint, degrees in _FIST_BENDS.items():
+            angles[joint] = R.from_euler(
+                "XYZ", [0.0, 0.0, np.deg2rad(degrees)]).as_rotvec()
+        output = self._models[side].forward(angles)
+        return (
+            self._align(side, output.joints),
+            self._align_mesh(side, output.verts, output.joints[0]),
+        )
+
     def joints_for_step(self, side: str, step_index: int) -> np.ndarray:
         side = str(side).lower()
         if side not in ("left", "right"):
             raise ValueError(f"side must be left or right, got {side!r}")
-        index = max(0, min(int(step_index), 12))
+        index = max(0, min(int(step_index), 14))
         if self._live_enabled:
             return self._joints_for_step_live(side, index)
         base = self._align(side, self._neutral[side])
@@ -502,6 +537,8 @@ class CalibrationPosePreview:
             return self._contacts[side][_CONTACT_NAMES[index - 8]].copy()
         if index == 12:
             return self._contacts[side]["little"].copy()
+        if index in (13, 14):
+            return self._fist[side].copy()
         return base.copy()
 
     def mesh_for_step(self, side: str, step_index: int) -> np.ndarray:
@@ -509,7 +546,7 @@ class CalibrationPosePreview:
         side = str(side).lower()
         if side not in ("left", "right"):
             raise ValueError(f"side must be left or right, got {side!r}")
-        index = max(0, min(int(step_index), 12))
+        index = max(0, min(int(step_index), 14))
         if self._live_enabled:
             return self._mesh_for_step_live(side, index)
         base = self._align_mesh(
@@ -532,6 +569,8 @@ class CalibrationPosePreview:
                 _CONTACT_NAMES[index - 8]].copy()
         if index == 12:
             return self._contact_meshes[side]["little"].copy()
+        if index in (13, 14):
+            return self._fist_mesh[side].copy()
         return base.copy()
 
     def render_bgr(self, side: str, step_index: int) -> np.ndarray:
@@ -609,7 +648,7 @@ class CalibrationPosePreview:
         important for the mirrored root yaw and roll poses: duplicating one
         side's image would teach exactly the wrong motion to the other hand.
         """
-        index = max(0, min(int(step_index), 12))
+        index = max(0, min(int(step_index), 14))
         cached = self._bimanual_image_cache.get(index)
         if cached is not None:
             return cached

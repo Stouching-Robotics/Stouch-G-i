@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two STM32 gloves -> HAND2mm-calibrated skeletons -> live 3D."""
+"""Two STM32 gloves -> HAND2mm-calibrated MANO meshes -> live 3D."""
 
 from __future__ import annotations
 
@@ -37,9 +37,12 @@ from gui.calibration_selector import select_calibration_files  # noqa: E402
 from gui.live_3d import (  # noqa: E402
     H, W, Live3DViewer, LiveViewState, VIEW3D_CONFIG_PATH,
     align_left_to_right_reference, apply_hand_display_rotation,
-    hand_display_basis,
+    hand_display_basis, _latest_solver_mesh_vertices,
     place_hands_at_wrist_anchors)
 from gui.rendering.tactile import render_hand  # noqa: E402
+from gui.rendering.tactile_pressure_hand import (  # noqa: E402
+    PressureHandMapper, draw_pressure_color_points, draw_pressure_tiles,
+)
 from glove_io.recording import (  # noqa: E402
     BimanualRecorder, BimanualRecordingSession,
     JointPositionSmoother, KeypointParquetRecorder,
@@ -392,6 +395,11 @@ class BimanualViewer(Live3DViewer):
         }
         self.tactile_frames = {"left": None, "right": None}
         self.tactile_calibrating_sides = {"left": True, "right": True}
+        # Pressure samples can be projected onto the animated MANO surface as
+        # either coloured points or cell-shaped tiles.  The barycentric anchor
+        # map is static; only the live mesh positions change each frame.
+        self.pressure_display_mode = "none"
+        self._pressure_mappers: dict[str, PressureHandMapper] = {}
         self.separation_m = float(separation_m)
         self._relative_reference_slots = None
         raw_initial_slots = np.asarray(
@@ -429,7 +437,18 @@ class BimanualViewer(Live3DViewer):
         self._bimanual_grid_basis = np.stack([
             self._anchor_axis, grid_forward, grid_normal], axis=1)
         super().__init__(*args, hand_side="right",
-                         display_rotations=fixed_rotations, **kwargs)
+                         display_rotations=fixed_rotations,
+                         show_surface_color=True, **kwargs)
+        if self._mesh_faces is not None:
+            for side in ("left", "right"):
+                try:
+                    self._pressure_mappers[side] = PressureHandMapper(
+                        side, self._mesh_faces,
+                        BUNDLE_ROOT / "assets" / "hand")
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(
+                        f"[Pressure view warning] Cannot prepare {side} hand map: {exc}",
+                        file=sys.stderr)
         self._relative_reference_slots = self._display_slots().copy()
         self._redraw_requested = True
 
@@ -474,12 +493,23 @@ class BimanualViewer(Live3DViewer):
                 + (f"  contact={status['contact']}" if status["contact"] else ""))
         return lines
 
-    def update_both(self, left, right, frame_count, statuses):
+    def update_both(self, left, right, frame_count, statuses,
+                    mesh_slots: list[np.ndarray | None] | None = None):
         slots = np.stack([
             np.asarray(left, np.float32).reshape(21, 3),
             np.asarray(right, np.float32).reshape(21, 3),
         ])
         self._kpts_slots = slots
+        # Keep the mesh in the solver's wrist-relative coordinate frame.  It
+        # receives the same display-space transforms as the 21 joints below.
+        self._mesh_slots = [None, None]
+        if mesh_slots is not None:
+            for slot, vertices in enumerate(mesh_slots[:2]):
+                if vertices is None:
+                    continue
+                mesh = np.asarray(vertices, dtype=np.float32)
+                if mesh.shape == (778, 3) and np.isfinite(mesh).all():
+                    self._mesh_slots[slot] = mesh
         self.frame_count = int(frame_count)
         self.side_status = statuses
         self._redraw_requested = True
@@ -493,8 +523,43 @@ class BimanualViewer(Live3DViewer):
             slots, separation_m=self.separation_m,
             anchor_axis=self._anchor_axis)
 
+    def _display_mesh_slots(self) -> list[np.ndarray | None]:
+        """Place MANO surfaces exactly where their corresponding joints land."""
+        source_slots = super()._display_slots()
+        source_mesh_slots = super()._display_mesh_slots()
+        final_slots = self._display_slots()
+        result: list[np.ndarray | None] = [None, None]
+        for slot, source_mesh in enumerate(source_mesh_slots):
+            if (source_mesh is None or not np.isfinite(source_slots[slot]).all()
+                    or not np.isfinite(final_slots[slot]).all()):
+                continue
+            source_basis = hand_display_basis(source_slots[slot])
+            final_basis = hand_display_basis(final_slots[slot])
+            rotation = final_basis @ source_basis.T
+            mesh = np.asarray(source_mesh, dtype=np.float32).reshape(778, 3)
+            result[slot] = (
+                (mesh - source_slots[slot, 0]) @ rotation.T
+                + final_slots[slot, 0]
+            ).astype(np.float32)
+        return result
+
     def _grid_basis(self):
         return self._bimanual_grid_basis
+
+    def _pressure_display_mode_label(self) -> str:
+        return "Pressure on hand"
+
+    def _pressure_display_mode_options(self) -> list[tuple[str, str]]:
+        return [
+            ("none", "None"),
+            ("points", "Pressure points"),
+            ("tiles", "Pressure tiles"),
+        ]
+
+    def _on_pressure_display_mode(self, mode: str) -> None:
+        self.pressure_display_mode = (
+            str(mode) if str(mode) in {"none", "points", "tiles"} else "none")
+        self._redraw_requested = True
 
     def _draw(self):
         img = super()._draw()
@@ -579,6 +644,19 @@ class BimanualViewer(Live3DViewer):
         self._redraw_requested = True
 
     def _draw_tactile(self, img):
+        if (self.display_mode == "hand" and self._pressure_mappers
+                and self.pressure_display_mode != "none"):
+            draw_args = (
+                img, self._camera(), self._controlled_display_mesh_slots(),
+                self.tactile_frames, self._pressure_mappers,
+                {"left": False, "right": False},
+            )
+            if self.pressure_display_mode == "tiles":
+                draw_pressure_tiles(
+                    *draw_args, threshold=float(self.tactile_threshold))
+            else:
+                draw_pressure_color_points(
+                    *draw_args, threshold=float(self.tactile_threshold))
         draw_bimanual_tactile_overlay(
             img,
             self.tactile_frames,
@@ -622,6 +700,8 @@ def main(argv=None):
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--display-mode", default="hand", choices=("bones", "hand"),
+                        help="Initial 3D display mode: bones or full MANO hand mesh")
     parser.add_argument("--startup-timeout", type=float, default=15.0)
     parser.add_argument("--max-frame-age", type=float, default=0.25)
     parser.add_argument("--display-config", type=Path,
@@ -949,6 +1029,9 @@ def main(argv=None):
                         display_config_path=None,
                         recording_enabled=not args.no_save,
                         recording_state=recording_session.state,
+                        display_mode=args.display_mode,
+                        initial_mesh_vertices=_latest_solver_mesh_vertices(
+                            runtimes["right"].solver),
                         redraw_interval_s=1.0 / max(args.fps, 1.0))
                 startup_initialized = True
             if fresh and now >= next_sample:
@@ -973,7 +1056,11 @@ def main(argv=None):
                         runtimes["left"].latest_joints,
                         runtimes["right"].latest_joints,
                         (recording_session.frame_count
-                         if recording_session is not None else 0), statuses)
+                         if recording_session is not None else 0), statuses,
+                        mesh_slots=[
+                            _latest_solver_mesh_vertices(runtimes["left"].solver),
+                            _latest_solver_mesh_vertices(runtimes["right"].solver),
+                        ])
                 processed_frame_index += 1
                 next_sample = now + 1.0 / max(args.fps, 1.0)
                 if args.max_frames and processed_frame_index >= args.max_frames:

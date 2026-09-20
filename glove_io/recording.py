@@ -23,6 +23,19 @@ except ImportError:  # pragma: no cover - recording is optional
     pl = None
 
 
+def _vec(value, dtype=np.float32) -> np.ndarray:
+    """One row's wide vector, as its own contiguous 1-D array.
+
+    Rows keep numpy arrays rather than Python lists.  A single bimanual row
+    carries ~1600 numbers, which as Python floats is ~45 KB per row (a
+    ten-minute take reached ~500 MB) and, worse, had to be walked element by
+    element to build the Parquet columns -- that loop is what froze the GUI
+    while recording (see ``_series``).  ``copy=True`` because callers pass
+    views of buffers they reuse for the next frame.
+    """
+    return np.array(value, dtype=dtype, copy=True).reshape(-1)
+
+
 class JointPositionSmoother:
     """Display-only exponential smoother for 21 Cartesian keypoints."""
 
@@ -112,6 +125,7 @@ class KeypointParquetRecorder:
         self.rows: list[dict] = []
         self._save_lock = threading.Lock()
         self._finalized = False
+        self._checkpoint_running = False
 
     def add(self, frame_index: int, timestamp_s: float, result: dict) -> None:
         keypoints2d = np.asarray(result["hands2d"], np.float32).reshape(2, 21, 2)
@@ -124,23 +138,36 @@ class KeypointParquetRecorder:
             "frame_index": int(frame_index),
             "timestamp": np.float32(timestamp_s),
             "task_index": self.task_index,
-            "observation.keypoints.stereo_left": keypoints2d.reshape(-1).tolist(),
-            "observation.keypoints.stereo_right": np.zeros(84, np.float32).tolist(),
-            "observation.keypoints.hand_3d": hand3d.reshape(-1).tolist(),
-            "observation.keypoints.reprojection_error": np.asarray(
-                result["reprojection_error"], np.float32).reshape(2).tolist(),
+            "observation.keypoints.stereo_left": _vec(keypoints2d),
+            "observation.keypoints.stereo_right": np.zeros(84, np.float32),
+            "observation.keypoints.hand_3d": _vec(hand3d),
+            "observation.keypoints.reprojection_error": _vec(
+                result["reprojection_error"]),
             "observation.keypoints.hand_0_present": presents[0],
             "observation.keypoints.hand_1_present": presents[1],
             "observation.keypoints.hand_0_label": labels[0],
             "observation.keypoints.hand_1_label": labels[1],
-            "observation.keypoints.stage2": [bool(v) for v in result["stage2"]],
-            "observation.keypoints.propagated": [
-                bool(v) for v in result["propagated"]],
-            "action": [0.0],
-            "observation.keypoints.hand_3d_smoothed": smoothed.reshape(-1).tolist(),
+            "observation.keypoints.stage2": _vec(result["stage2"], dtype=bool),
+            "observation.keypoints.propagated": _vec(
+                result["propagated"], dtype=bool),
+            "action": np.zeros(1, np.float32),
+            "observation.keypoints.hand_3d_smoothed": _vec(smoothed),
         })
         if self.checkpoint_frames and len(self.rows) % self.checkpoint_frames == 0:
             self._schedule_save(list(self.rows))
+
+    def _column(self, name, dtype, width: int):
+        """One ``Array`` column, stacked in C rather than walked in Python.
+
+        ``np.stack`` + polars' 2-D numpy path is ~17x faster than handing
+        polars a list of per-row lists, and -- the part that matters while a
+        take is running -- it does not spend the whole conversion holding the
+        GIL, so the GUI thread keeps its timeslice.
+        """
+        rows = [row[name] for row in self.rows]
+        if not rows:                  # np.stack([]) raises; an empty take is fine
+            return pl.Series(name, [], dtype=pl.Array(dtype, width))
+        return pl.Series(name, np.stack(rows), dtype=pl.Array(dtype, width))
 
     def _series(self):
         values = lambda name: [row[name] for row in self.rows]
@@ -149,18 +176,11 @@ class KeypointParquetRecorder:
             pl.Series("frame_index", values("frame_index"), dtype=pl.Int64),
             pl.Series("timestamp", values("timestamp"), dtype=pl.Float32),
             pl.Series("task_index", values("task_index"), dtype=pl.Int64),
-            pl.Series("observation.keypoints.stereo_left",
-                      values("observation.keypoints.stereo_left"),
-                      dtype=pl.Array(pl.Float32, 84)),
-            pl.Series("observation.keypoints.stereo_right",
-                      values("observation.keypoints.stereo_right"),
-                      dtype=pl.Array(pl.Float32, 84)),
-            pl.Series("observation.keypoints.hand_3d",
-                      values("observation.keypoints.hand_3d"),
-                      dtype=pl.Array(pl.Float32, 126)),
-            pl.Series("observation.keypoints.reprojection_error",
-                      values("observation.keypoints.reprojection_error"),
-                      dtype=pl.Array(pl.Float32, 2)),
+            self._column("observation.keypoints.stereo_left", pl.Float32, 84),
+            self._column("observation.keypoints.stereo_right", pl.Float32, 84),
+            self._column("observation.keypoints.hand_3d", pl.Float32, 126),
+            self._column(
+                "observation.keypoints.reprojection_error", pl.Float32, 2),
             pl.Series("observation.keypoints.hand_0_present",
                       values("observation.keypoints.hand_0_present"),
                       dtype=pl.Boolean),
@@ -171,16 +191,11 @@ class KeypointParquetRecorder:
                       values("observation.keypoints.hand_0_label"), dtype=pl.String),
             pl.Series("observation.keypoints.hand_1_label",
                       values("observation.keypoints.hand_1_label"), dtype=pl.String),
-            pl.Series("observation.keypoints.stage2",
-                      values("observation.keypoints.stage2"),
-                      dtype=pl.Array(pl.Boolean, 2)),
-            pl.Series("observation.keypoints.propagated",
-                      values("observation.keypoints.propagated"),
-                      dtype=pl.Array(pl.Boolean, 2)),
-            pl.Series("action", values("action"), dtype=pl.Array(pl.Float32, 1)),
-            pl.Series("observation.keypoints.hand_3d_smoothed",
-                      values("observation.keypoints.hand_3d_smoothed"),
-                      dtype=pl.Array(pl.Float32, 126)),
+            self._column("observation.keypoints.stage2", pl.Boolean, 2),
+            self._column("observation.keypoints.propagated", pl.Boolean, 2),
+            self._column("action", pl.Float32, 1),
+            self._column(
+                "observation.keypoints.hand_3d_smoothed", pl.Float32, 126),
         ]
 
     def save(self) -> Path | None:
@@ -207,7 +222,18 @@ class KeypointParquetRecorder:
     def _schedule_save(self, rows: list[dict]) -> None:
         """Write a complete-row snapshot on a daemon thread so checkpointing
         never blocks the recording cadence. ``rows`` must be captured at a
-        point where every row is fully populated; it is not mutated after."""
+        point where every row is fully populated; it is not mutated after.
+
+        At most one checkpoint runs at a time.  Each checkpoint rewrites the
+        whole file from a snapshot that only ever grows, so a slow one is
+        always followed by a slower one; letting them stack up is how a long
+        take turned into an unbounded pile of threads all competing for the
+        GIL.  Skipping a beat is free -- checkpoints are best-effort crash
+        protection and the next one carries the same rows plus more.
+        """
+        if self._checkpoint_running:
+            return
+        self._checkpoint_running = True
         threading.Thread(
             target=self._save_checkpoint, args=(rows,), daemon=True).start()
 
@@ -223,6 +249,8 @@ class KeypointParquetRecorder:
             # Checkpoint writes are best-effort crash protection; a failure
             # must never propagate into the recording path.
             pass
+        finally:
+            self._checkpoint_running = False
 
 
 class KeypointParquetRecorderWithIMU(KeypointParquetRecorder):
@@ -257,31 +285,26 @@ class KeypointParquetRecorderWithIMU(KeypointParquetRecorder):
             tactile_raw=None) -> None:
         super().add(frame_index, timestamp_s, result)
         row = self.rows[-1]
-        row[self.IMU_COL] = (np.asarray(imu_quats, np.float32).reshape(64).tolist()
-                             if imu_quats is not None
-                             else np.full(64, np.nan, np.float32).tolist())
-        row[self.TACTILE_COL] = (
-            np.asarray(tactile, np.float32).reshape(256).tolist()
-            if tactile is not None
-            else np.full(256, np.nan, np.float32).tolist())
+        row[self.IMU_COL] = (_vec(imu_quats) if imu_quats is not None
+                             else np.full(64, np.nan, np.float32))
+        row[self.TACTILE_COL] = (_vec(tactile) if tactile is not None
+                                 else np.full(256, np.nan, np.float32))
         row[self.SERIAL_COL] = self.usb_serial
-        row[self.RAW_IMU_COL] = (
-            np.asarray(raw_imu_quats, np.float32).reshape(64).tolist()
-            if raw_imu_quats is not None
-            else np.full(64, np.nan, np.float32).tolist())
-        row[self.RAW_PRESENT_COL] = (
-            np.asarray(raw_present_mask, dtype=bool).reshape(16).tolist()
-            if raw_present_mask is not None else [False] * 16)
-        row[self.RAW_VALID_COL] = (
-            np.asarray(raw_valid_mask, dtype=bool).reshape(16).tolist()
-            if raw_valid_mask is not None else [False] * 16)
+        row[self.RAW_IMU_COL] = (_vec(raw_imu_quats)
+                                 if raw_imu_quats is not None
+                                 else np.full(64, np.nan, np.float32))
+        row[self.RAW_PRESENT_COL] = (_vec(raw_present_mask, dtype=bool)
+                                     if raw_present_mask is not None
+                                     else np.zeros(16, bool))
+        row[self.RAW_VALID_COL] = (_vec(raw_valid_mask, dtype=bool)
+                                   if raw_valid_mask is not None
+                                   else np.zeros(16, bool))
         row[self.RAW_TIMESTAMP_COL] = (
             int(raw_device_timestamp_us)
             if raw_device_timestamp_us is not None else -1)
-        row[self.RAW_TACTILE_COL] = (
-            np.asarray(tactile_raw, np.float32).reshape(256).tolist()
-            if tactile_raw is not None
-            else np.full(256, np.nan, np.float32).tolist())
+        row[self.RAW_TACTILE_COL] = (_vec(tactile_raw)
+                                     if tactile_raw is not None
+                                     else np.full(256, np.nan, np.float32))
         if (self._imu_checkpoint_frames
                 and len(self.rows) % self._imu_checkpoint_frames == 0):
             self._schedule_save(list(self.rows))
@@ -289,28 +312,17 @@ class KeypointParquetRecorderWithIMU(KeypointParquetRecorder):
     def _series(self):
         series = super()._series()
         series.extend([
-            pl.Series(self.IMU_COL, [row[self.IMU_COL] for row in self.rows],
-                      dtype=pl.Array(pl.Float32, 64)),
-            pl.Series(self.TACTILE_COL,
-                      [row[self.TACTILE_COL] for row in self.rows],
-                      dtype=pl.Array(pl.Float32, 256)),
+            self._column(self.IMU_COL, pl.Float32, 64),
+            self._column(self.TACTILE_COL, pl.Float32, 256),
             pl.Series(self.SERIAL_COL,
                       [row[self.SERIAL_COL] for row in self.rows], dtype=pl.String),
-            pl.Series(self.RAW_IMU_COL,
-                      [row[self.RAW_IMU_COL] for row in self.rows],
-                      dtype=pl.Array(pl.Float32, 64)),
-            pl.Series(self.RAW_PRESENT_COL,
-                      [row[self.RAW_PRESENT_COL] for row in self.rows],
-                      dtype=pl.Array(pl.Boolean, 16)),
-            pl.Series(self.RAW_VALID_COL,
-                      [row[self.RAW_VALID_COL] for row in self.rows],
-                      dtype=pl.Array(pl.Boolean, 16)),
+            self._column(self.RAW_IMU_COL, pl.Float32, 64),
+            self._column(self.RAW_PRESENT_COL, pl.Boolean, 16),
+            self._column(self.RAW_VALID_COL, pl.Boolean, 16),
             pl.Series(self.RAW_TIMESTAMP_COL,
                       [row[self.RAW_TIMESTAMP_COL] for row in self.rows],
                       dtype=pl.Int64),
-            pl.Series(self.RAW_TACTILE_COL,
-                      [row[self.RAW_TACTILE_COL] for row in self.rows],
-                      dtype=pl.Array(pl.Float32, 256)),
+            self._column(self.RAW_TACTILE_COL, pl.Float32, 256),
         ])
         return series
 
@@ -354,14 +366,12 @@ class BimanualRecorder(KeypointParquetRecorder):
             runtime = runtimes[side]
             imu_key = f"observation.imu.{side}.quaternion"
             tactile_key = f"observation.tactile.{side}_glove"
-            row[imu_key] = (
-                np.asarray(runtime.latest_imu, np.float32).reshape(64).tolist()
-                if runtime.latest_imu is not None
-                else np.full(64, np.nan, np.float32).tolist())
-            row[tactile_key] = (
-                np.asarray(runtime.latest_tactile, np.float32).reshape(256).tolist()
-                if runtime.latest_tactile is not None
-                else np.full(256, np.nan, np.float32).tolist())
+            row[imu_key] = (_vec(runtime.latest_imu)
+                            if runtime.latest_imu is not None
+                            else np.full(64, np.nan, np.float32))
+            row[tactile_key] = (_vec(runtime.latest_tactile)
+                                if runtime.latest_tactile is not None
+                                else np.full(256, np.nan, np.float32))
             raw_imu = getattr(runtime, "latest_raw_imu", None)
             raw_present = getattr(runtime, "latest_raw_present", None)
             raw_valid = getattr(runtime, "latest_raw_valid", None)
@@ -369,21 +379,19 @@ class BimanualRecorder(KeypointParquetRecorder):
                 runtime, "latest_raw_device_timestamp_us", None)
             tactile_raw = getattr(runtime, "latest_tactile_raw", None)
             row[f"observation.imu.{side}.raw_physical_quaternion"] = (
-                np.asarray(raw_imu, np.float32).reshape(64).tolist()
-                if raw_imu is not None
-                else np.full(64, np.nan, np.float32).tolist())
+                _vec(raw_imu) if raw_imu is not None
+                else np.full(64, np.nan, np.float32))
             row[f"observation.imu.{side}.raw_present_mask"] = (
-                np.asarray(raw_present, dtype=bool).reshape(16).tolist()
-                if raw_present is not None else [False] * 16)
+                _vec(raw_present, dtype=bool) if raw_present is not None
+                else np.zeros(16, bool))
             row[f"observation.imu.{side}.raw_valid_mask"] = (
-                np.asarray(raw_valid, dtype=bool).reshape(16).tolist()
-                if raw_valid is not None else [False] * 16)
+                _vec(raw_valid, dtype=bool) if raw_valid is not None
+                else np.zeros(16, bool))
             row[f"observation.imu.{side}.device_timestamp_us"] = (
                 int(raw_timestamp) if raw_timestamp is not None else -1)
             row[f"observation.tactile.{side}_glove_raw"] = (
-                np.asarray(tactile_raw, np.float32).reshape(256).tolist()
-                if tactile_raw is not None
-                else np.full(256, np.nan, np.float32).tolist())
+                _vec(tactile_raw) if tactile_raw is not None
+                else np.full(256, np.nan, np.float32))
             row[f"observation.device.{side}.serial"] = self.serials.get(side, "")
             row[f"observation.imu.{side}.device_fps"] = float(
                 getattr(runtime, "device_fps", 0.0) or 0.0)
@@ -393,13 +401,9 @@ class BimanualRecorder(KeypointParquetRecorder):
     def _series(self):
         series = super()._series()
         for name, dimension in self.EXTRA_DIMS.items():
-            series.append(pl.Series(
-                name, [row[name] for row in self.rows],
-                dtype=pl.Array(pl.Float32, dimension)))
+            series.append(self._column(name, pl.Float32, dimension))
         for name, dimension in self.BOOL_DIMS.items():
-            series.append(pl.Series(
-                name, [row[name] for row in self.rows],
-                dtype=pl.Array(pl.Boolean, dimension)))
+            series.append(self._column(name, pl.Boolean, dimension))
         for side in ("left", "right"):
             name = f"observation.imu.{side}.device_timestamp_us"
             series.append(pl.Series(

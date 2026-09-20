@@ -26,13 +26,14 @@ import threading
 import time
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QVBoxLayout,
-    QWidget,
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 
@@ -57,6 +58,7 @@ from common.enums import (  # noqa: E402
     MoCapCalibrateInstallationType,
     MoCapCalibrateRootType,
     MoCapCalibrateShapeType,
+    MoCapCalibrateFistType,
 )
 from glove_io.device_registry import (  # noqa: E402
     GloveDeviceError,
@@ -64,11 +66,9 @@ from glove_io.device_registry import (  # noqa: E402
     link_kind_of,
     list_matching_ports,
     load_device_registry,
-    resolve_glove,
     set_glove_serial,
 )
 from common.usb_cdc import (  # noqa: E402
-    display_firmware_version,
     firmware_hand_side,
 )
 from common.i18n import (  # noqa: E402
@@ -79,6 +79,7 @@ from algorithm.imu_calibrate_cli import (  # noqa: E402
     compute_motion_rms,
     default_out_path,
 )
+from algorithm.utils import get_average_rotation  # noqa: E402
 from gui import APP_VERSION  # noqa: E402
 from gui.calibration_pose_preview import (  # noqa: E402
     CalibrationPosePreview,
@@ -219,6 +220,22 @@ def calibration_steps(side: str) -> tuple[CalibrationStep, ...]:
               "The four fingertip contacts are fitted as IMU-driven position "
               "constraints."),
             L("计算", "Compute"), "shape", MoCapCalibrateShapeType.CALC),
+        CalibrationStep(
+            L("握拳 - 四指弯曲", "Fist - Four-Finger Curl"),
+            L("四指（食/中/无名/小指）弯曲握拳，拇指自然放松、不参与。",
+              "Curl the four fingers (index/middle/ring/little) into a fist; "
+              "relax the thumb and leave it out."),
+            L("四指逐节弯曲到底、不要横向张开或扭动。保持完全静止。",
+              "Curl each finger fully without spreading or twisting them "
+              "sideways. Hold completely still."),
+            L("采集姿势", "Capture Pose"), "fist", MoCapCalibrateFistType.CAPTURE),
+        CalibrationStep(
+            L("计算四指握拳标定", "Compute Fist Calibration"),
+            L("此计算无需任何姿势。", "No pose is required for this calculation."),
+            L("握拳位姿用于实测四指弯曲时的横向偏移，运行时自动减去。",
+              "The fist pose measures the four fingers' lateral offset during "
+              "flexion, subtracted automatically at runtime."),
+            L("计算", "Compute"), "fist", MoCapCalibrateFistType.CALC),
     )
 
 
@@ -241,6 +258,96 @@ _ROOT_ANGLE_SKIP_HI_DEG = 160.0
 _ROOT_ANGLE_TARGET_DEG = 90.0
 _ROOT_ANGLE_WARN_OFF_DEG = 30.0
 _ROOT_ANGLE_GOOD_BAND_DEG = 15.0
+
+# A root-pose capture is the mean of 30 static IMU frames.  The live readout
+# must use the same kind of value: a single just-arrived quaternion can still
+# describe the turn that the user has finished, rather than the pose they are
+# holding.  At the normal 80 Hz stream rate this is about 0.375 seconds.
+_LIVE_ROOT_ANGLE_WINDOW_FRAMES = 30
+
+# These are deliberately the same labelled axes used by
+# Raw2MANOCalibrator.  A 90-degree magnitude alone is insufficient: the
+# rotation must also be about the axis required by this step.
+_ROOT_AXIS_TARGETS = {
+    "z_rot_pose_1": (np.array([0.0, 0.0, 1.0]), -np.pi / 2),
+    "z_rot_pose_2": (np.array([0.0, 0.0, 1.0]), +np.pi / 2),
+    "roll_pose": (np.array([1.0, 0.0, 0.0]), -np.pi / 2),
+    "yaw_pose": (np.array([0.0, 1.0, 0.0]), -np.pi / 2),
+}
+
+
+def root_axis_residuals(base, poses: dict[str, R | None], side: str) -> dict | None:
+    """Fit the wizard poses exactly as root calibration does, for live QA.
+
+    The returned values are axis errors, not angle-to-90 errors.  It becomes
+    useful as soon as three independent labelled rotations are available
+    (during Roll and Yaw, and on the Compute step).
+    """
+    measured, target, weights, used = [], [], [], []
+    base_root = base[0]
+    for name, (axis, angle) in _ROOT_AXIS_TARGETS.items():
+        pose = poses.get(name)
+        if pose is None:
+            continue
+        expected_angle = angle
+        if side == "left" and name == "roll_pose":
+            expected_angle = -expected_angle
+        if side == "right" and name == "yaw_pose":
+            # The right-hand wizard captures the mirrored, left-turn yaw.
+            expected_angle = -expected_angle
+        rel = pose[0] * base_root.inv()
+        rotvec = rel.as_rotvec()
+        rotation_angle = float(np.linalg.norm(rotvec))
+        if not np.radians(20.0) < rotation_angle < np.radians(160.0):
+            continue
+        measured.append(rotvec / rotation_angle)
+        target.append(axis * np.sign(expected_angle))
+        weights.append(np.sin(rotation_angle))
+        used.append(name)
+    if len(used) < 3:
+        return None
+    measured_matrix = np.asarray(measured).T
+    target_matrix = np.asarray(target).T
+    u, _, vt = np.linalg.svd(
+        measured_matrix @ np.diag(np.asarray(weights)) @ target_matrix.T)
+    determinant = np.sign(np.linalg.det(u @ vt))
+    transform = u @ np.diag([1.0, 1.0, determinant]) @ vt
+    residual = np.degrees(np.arccos(np.clip(
+        np.sum(measured_matrix * (transform @ target_matrix), axis=0), -1.0, 1.0)))
+    return {
+        "per_pose_deg": {name: float(value) for name, value in zip(used, residual)},
+        "max_deg": float(residual.max()),
+    }
+
+
+def vertical_pair_impossibility(base, up_pose: R | None,
+                                down_pose: R | None) -> dict | None:
+    """Return a proof that the Up/Down pair alone cannot pass the 15° gate.
+
+    Up and Down represent opposite rotations about the same physical axis. If
+    their measured axes differ by ``d`` from being antiparallel, even the best
+    possible root frame must miss at least one of them by ``d / 2``.  Thus
+    ``d > 30°`` makes the final 15° maximum-residual requirement impossible,
+    irrespective of any later Roll/Yaw capture.
+    """
+    if base is None or up_pose is None or down_pose is None:
+        return None
+    base_root = base[0]
+    up = (up_pose[0] * base_root.inv()).as_rotvec()
+    down = (down_pose[0] * base_root.inv()).as_rotvec()
+    up_norm = float(np.linalg.norm(up))
+    down_norm = float(np.linalg.norm(down))
+    if not (np.radians(20.0) < up_norm < np.radians(160.0)
+            and np.radians(20.0) < down_norm < np.radians(160.0)):
+        return None
+    anti_parallel_error = float(np.degrees(np.arccos(np.clip(
+        np.dot(up / up_norm, -down / down_norm), -1.0, 1.0))))
+    unavoidable_residual = anti_parallel_error * 0.5
+    return {
+        "axis_mismatch_deg": anti_parallel_error,
+        "minimum_possible_max_residual_deg": unavoidable_residual,
+        "restart_required": unavoidable_residual > 15.0,
+    }
 
 # Auto-capture: a step must hold its "ready" conditions (motion RMS below the
 # threshold and, for root poses, the live angle inside the good band) for this
@@ -319,6 +426,25 @@ def format_root_angle(snapshot: dict) -> tuple[str, tuple[int, int, int], str]:
                 L("所有已采集姿势都接近 {target:.0f}°。",
                   "all captured poses are near {target:.0f} deg").format(
                       target=_ROOT_ANGLE_TARGET_DEG))
+        axis_report = snapshot.get("axis_report")
+        if axis_report is not None:
+            axis_max = float(axis_report["max_deg"])
+            axis_detail = " / ".join(
+                f"{_root_angle_labels().get(name, name)} {value:.0f}°"
+                for name, value in axis_report["per_pose_deg"].items())
+            verdict += L(
+                " 轴一致性 {value:.1f}°（{detail}，限值 15°）。",
+                " Axis consistency {value:.1f} deg ({detail}; limit 15 deg)."
+            ).format(value=axis_max, detail=axis_detail)
+            if axis_max > 15.0:
+                color = _ANGLE_COLORS["skip"]
+        restart_report = snapshot.get("restart_report")
+        if restart_report is not None and restart_report["restart_required"]:
+            color = _ANGLE_COLORS["skip"]
+            verdict += L(
+                " 上/下两步已保证无法通过；请点击“开始新标定”重新标定。",
+                " The Up/Down pair cannot pass; click Start New Calibration to restart."
+            )
         return (L("计算前请复核：{verdict}",
                   "Review before computing: {verdict}.").format(verdict=verdict),
                 color, history)
@@ -329,6 +455,41 @@ def format_root_angle(snapshot: dict) -> tuple[str, tuple[int, int, int], str]:
             L("腕部 IMU 信号丢失。请检查手套连接并保持静止。",
               "Wrist IMU signal lost. Check the glove connection and hold still."),
             _ANGLE_COLORS["skip"], history)
+
+    sample_count = int(snapshot.get("live_sample_count", 0))
+    live_rms = snapshot.get("live_motion_rms_deg")
+    axis_report = snapshot.get("axis_report")
+    restart_report = snapshot.get("restart_report")
+    averaging_note = L(
+        "（最近 {n} 帧均值）",
+        " (mean of the latest {n} frames)").format(n=sample_count)
+    moving_note = ""
+    if live_rms is not None and live_rms > 3.0:
+        moving_note = L(
+            "；手仍在运动（RMS {rms:.1f}°），请停稳后再判断/采集",
+            "; hand is still moving (RMS {rms:.1f} deg); hold still before judging or capturing"
+        ).format(rms=live_rms)
+    axis_note = ""
+    if axis_report is not None:
+        axis_max = float(axis_report["max_deg"])
+        detail = " / ".join(
+            f"{_root_angle_labels().get(name, name)} {value:.0f}°"
+            for name, value in axis_report["per_pose_deg"].items())
+        axis_note = L(
+            "；轴一致性 {value:.1f}°（{detail}，限值 15°）",
+            "; axis consistency {value:.1f} deg ({detail}; limit 15 deg)"
+        ).format(value=axis_max, detail=detail)
+    restart_note = ""
+    if restart_report is not None and restart_report["restart_required"]:
+        restart_note = L(
+            "；上/下两步的旋转轴相差 {mismatch:.1f}°，最终残差至少为 "
+            "{minimum:.1f}°，请点击“开始新标定”重新标定",
+            "; the Up/Down axes differ by {mismatch:.1f} deg, so final residual "
+            "must be at least {minimum:.1f} deg. Click Start New Calibration to restart"
+        ).format(
+            mismatch=restart_report["axis_mismatch_deg"],
+            minimum=restart_report["minimum_possible_max_residual_deg"],
+        )
 
     if snapshot["target_deg"] == 0.0:
         # Re-capturing Level: the stored base is the original capture.
@@ -345,9 +506,10 @@ def format_root_angle(snapshot: dict) -> tuple[str, tuple[int, int, int], str]:
                 L("与原始水平采集偏差较大；重新采集将替换 0° 基准",
                   "far from the original Level capture; re-capturing replaces "
                   "the 0 deg reference"))
-        return (L("相对水平的实时旋转：{live:.0f}° - {verdict}。",
-                  "Live rotation from Level: {live:.0f} deg - {verdict}.").format(
-                      live=live, verdict=verdict), color, history)
+        return (L("相对水平的稳定旋转：{live:.0f}°{average} - {verdict}{moving}。",
+                  "Stable rotation from Level: {live:.0f} deg{average} - {verdict}{moving}.").format(
+                      live=live, average=averaging_note, verdict=verdict,
+                      moving=moving_note), color, history)
 
     if live < _ROOT_ANGLE_SKIP_LO_DEG or live > _ROOT_ANGLE_SKIP_HI_DEG:
         color, verdict = _ANGLE_COLORS["skip"], (
@@ -366,11 +528,20 @@ def format_root_angle(snapshot: dict) -> tuple[str, tuple[int, int, int], str]:
             .format(target=_ROOT_ANGLE_TARGET_DEG))
     else:
         color, verdict = _ANGLE_COLORS["ok"], L("处于良好区间", "in the good band")
+    if axis_report is not None and float(axis_report["max_deg"]) > 15.0:
+        color = _ANGLE_COLORS["skip"]
+        verdict = L("转角接近目标，但旋转轴不一致；请调整动作方向",
+                    "angle is near target, but the rotation axis is inconsistent; adjust the motion direction")
+    if restart_note:
+        color = _ANGLE_COLORS["skip"]
+        verdict = L("当前根标定不可能通过", "this root calibration cannot pass")
     return (
-        L("相对水平的实时旋转：{live:.0f}°（目标 {target:.0f}°）- {verdict}。",
-          "Live rotation from Level: {live:.0f} deg "
-          "(target {target:.0f} deg) - {verdict}.").format(
-              live=live, target=_ROOT_ANGLE_TARGET_DEG, verdict=verdict),
+        L("相对水平的稳定旋转：{live:.0f}°{average}（目标 {target:.0f}°）- {verdict}{axis}{restart}{moving}。",
+          "Stable rotation from Level: {live:.0f} deg{average} "
+          "(target {target:.0f} deg) - {verdict}{axis}{restart}{moving}.").format(
+              live=live, average=averaging_note, target=_ROOT_ANGLE_TARGET_DEG,
+              verdict=verdict, axis=axis_note, restart=restart_note,
+              moving=moving_note),
         color, history)
 
 
@@ -397,13 +568,22 @@ def glove_link_label(port) -> str:
             else L("USB", "USB"))
 
 
-def detected_glove_options() -> list[tuple[str, str]]:
-    """Return display labels and USB serials for connected STM32 gloves.
+def _join_list(items: list[str]) -> str:
+    """Join device names with the separator the current language reads with."""
+    return ("、" if not is_en() else ", ").join(items)
+
+
+def detected_glove_options() -> list[tuple[str, str, str]]:
+    """Return ``(label, USB serial, COM port)`` for each connected STM32 glove.
 
     Bluetooth dongle ports are listed alongside wired gloves, tagged so the
     user can tell which transport a device will be opened over.  The serial
     reported for a dongle is the dongle's own, which is what the registry and
     the calibration bindings persist for that side.
+
+    The COM port travels with the option because the panel keeps its connected
+    gloves keyed by port: it is the one identity that is stable while a glove
+    is open, and it is what "do not list this one twice" has to compare.
     """
     options = []
     for port in list_matching_ports():
@@ -413,7 +593,7 @@ def detected_glove_options() -> list[tuple[str, str]]:
         label = (
             f"[{glove_link_label(port)}] {serial_number} | {port.device} | "
             f"{port.location or 'unknown location'}")
-        options.append((label, serial_number))
+        options.append((label, serial_number, str(port.device)))
     return options
 
 
@@ -436,22 +616,76 @@ def detected_glove_port(serial_number: str) -> str | None:
     return None
 
 
-def detect_hand_pair(registry: Path) -> dict[str, str] | None:
-    """Return ``{"left": port, "right": port}`` when a full left+right pair is
-    bound and connected, else ``None``.
+def hand_side_label(side: str | None) -> str:
+    """The user-facing name of a hand, from the firmware's own report.
 
-    Each side resolves through ``resolve_glove`` (registry serial -> COM port);
-    a missing, unbound, or ambiguous side raises ``GloveDeviceError``, which
-    means the pair is incomplete and dual-hand calibration must stay disabled.
+    ``None`` is not dressed up as a guess: firmware that names no hand says so,
+    because the calibration that follows is only correct for the hand it ran on.
     """
-    ports: dict[str, str] = {}
-    for side in ("left", "right"):
-        try:
-            port, _serial = resolve_glove(side, registry)
-        except GloveDeviceError:
-            return None
-        ports[side] = port
-    return ports
+    if side == "left":
+        return L("左手", "left")
+    if side == "right":
+        return L("右手", "right")
+    return L("手型未标明", "hand not named")
+
+
+def glove_transport_label(com_port: str) -> str:
+    """USB / 蓝牙 for a COM port, read from the live enumeration.
+
+    Returns ``""`` when the port is not listed right now.  A glove that is open
+    but no longer enumerated has no transport that can honestly be named, and an
+    empty tag is better than a made-up ``USB``.
+    """
+    wanted = str(com_port or "").strip().upper()
+    if not wanted:
+        return ""
+    for port in list_matching_ports():
+        if str(port.device or "").strip().upper() == wanted:
+            return glove_link_label(port)
+    return ""
+
+
+def classify_glove_set(gloves: list[tuple[str, str | None]]) -> dict:
+    """Decide which calibration mode the connected gloves add up to.
+
+    ``gloves`` is ``[(port, firmware_side), ...]`` in connection order, where
+    ``firmware_side`` is the hand the glove's own firmware names (``"left"`` /
+    ``"right"``) or ``None`` when it names none.  Two gloves form a dual-hand
+    pair only when both name a *different* hand: an unnamed glove cannot be
+    shown to complete a pair, and two gloves naming the same hand never can.
+    A lone glove is always single-hand.  The registry is deliberately not
+    consulted -- it records what was plugged in before, not what is now.
+
+    Returns ``mode`` (``"none"`` / ``"single"`` / ``"dual"``), ``pair`` (the
+    left/right ports when dual), ``duplicates`` (ports naming a hand that
+    another port also names) and ``unnamed`` (ports naming no hand at all).
+    """
+    unnamed = [port for port, side in gloves if side is None]
+    if len(gloves) < 2:
+        return {
+            "mode": "single" if gloves else "none",
+            "pair": None,
+            "duplicates": [],
+            "unnamed": unnamed,
+        }
+    first, second = gloves[0], gloves[1]
+    if not unnamed and first[1] != second[1]:
+        return {
+            "mode": "dual",
+            "pair": {
+                "left": first[0] if first[1] == "left" else second[0],
+                "right": first[0] if first[1] == "right" else second[0],
+            },
+            "duplicates": [],
+            "unnamed": [],
+        }
+    return {
+        "mode": "single",
+        "pair": None,
+        "duplicates": ([port for port, side in gloves if side == first[1]]
+                       if first[1] is not None else []),
+        "unnamed": unnamed,
+    }
 
 
 def glove_serial_bindings(registry: Path) -> dict[str, list[str]]:
@@ -531,8 +765,9 @@ class CalibrationController:
         self.busy = False
         self.saved_path: Path | None = None
         self._status = (
-            "选择手型，然后连接对应的 STM32 手套。",
-            "Select the hand, then connect the corresponding STM32 glove.")
+            "连接 STM32 手套；左右手由固件版本号自动识别。",
+            "Connect the STM32 glove; the hand side is read from its "
+            "firmware version.")
         self._error = ("", "")
         self._device_text = ("未连接", "Not connected")
         self._imu_text = ("IMU 就绪：0 / 16", "IMUs ready: 0 / 16")
@@ -708,32 +943,6 @@ class CalibrationController:
         self._worker.start()
         return True
 
-    def select_side(self, side: str) -> None:
-        normalized = str(side).strip().lower()
-        if normalized not in ("left", "right"):
-            raise ValueError("Hand side must be left or right.")
-        with self._lock:
-            if self.busy:
-                return
-            if normalized == self.side:
-                return
-        # Switching hands while a glove is connected tears the old backend
-        # down and resets the session first; otherwise the combo shows the
-        # new side while the stream still belongs to the old hand.
-        switched = self.reset_session(
-            ("已切换手型。请连接所选手套以开始。",
-             "Switched hand. Connect the selected glove to begin."))
-        with self._lock:
-            self.side = normalized
-            self._steps = calibration_steps(normalized)
-            self.output = self._default_output(normalized)
-            self._status = (
-                ("已切换手型。请连接所选手套以开始。",
-                 "Switched hand. Connect the selected glove to begin.")
-                if switched else
-                ("请连接所选手套以开始。", "Connect the selected glove to begin."))
-            self._error = ("", "")
-
     def reset_session(self, status: tuple[str, str] | None = None) -> bool:
         """Tear down a connected glove and reset the calibration session.
 
@@ -759,11 +968,38 @@ class CalibrationController:
             self.stream_fps = 0.0
             if was_connected:
                 self._status = status or (
-                    "请连接所选手套以开始。", "Connect the selected glove to begin.")
+                    "请连接手套以开始。", "Connect a glove to begin.")
             self._error = ("", "")
         if backend is not None:
             backend.shutdown()
         return was_connected
+
+    def hand_over_to_dual(self) -> None:
+        """Give up local control of the capture gate to the dual coordinator.
+
+        The coordinator fires a capture only when *both* hands are ready at
+        once, so a hand must stop gating itself -- otherwise it would keep
+        capturing alone between the joint ticks.  The firmware side correction
+        is disabled at the same time, matching the hands the coordinator used
+        to connect itself: with two gloves attached a mismatched side is a
+        swapped pair, and that has to be reported rather than silently fixed
+        by rebooting the glove as the other hand.
+        """
+        with self._lock:
+            self.auto_capture = False
+            self.auto_correct_side = False
+            self._auto_stable_since = None
+
+    def release_from_dual(self) -> None:
+        """Take the single-hand rules back after the pair breaks up.
+
+        Both flags describe the *next* connect and the capture gate, not the
+        session in progress, so the glove keeps its already-locked firmware
+        side; the window reapplies the user's auto-capture choice right after.
+        """
+        with self._lock:
+            self.auto_correct_side = True
+            self._auto_stable_since = None
 
     def set_output_filename(self, filename: str) -> Path:
         with self._lock:
@@ -783,11 +1019,12 @@ class CalibrationController:
         """Persist the USB serial of a newly-connected glove to its hand side.
 
         Single-hand connect already opens a brand-new glove's COM port through
-        the live detection combo, but the serial stays out of
-        ``glove_devices.json`` unless the user presses a Bind button.  Persisting
-        it here makes calibrating a new glove a complete one-step onboarding:
-        afterwards the live viewer resolves the glove by its serial (and a
-        second new glove can then be calibrated for dual-hand mode).
+        the live detection combo, but the serial would stay out of
+        ``glove_devices.json`` -- there is no Bind button any more, so the
+        connect itself is the onboarding.  The side comes from the firmware
+        version digit (``_boot_backend``), which is why this runs after the
+        backend is up: that is what makes a fresh glove resolvable for the live
+        viewer, and lets a second new glove be calibrated for dual-hand mode.
         """
         serial = str(getattr(backend, "bound_serial", "") or "").strip().upper()
         if not serial:
@@ -805,6 +1042,7 @@ class CalibrationController:
             return
 
     def connect(self, serial_port: str | None = None) -> bool:
+        """Boot the backend and mark the session as connected."""
         def work():
             with self._lock:
                 self._status = (
@@ -880,6 +1118,8 @@ class CalibrationController:
             backend.hand.update_root_calibrator(step.trigger)
         elif step.flow == "installation":
             backend.hand.update_installation_calibrator(step.trigger)
+        elif step.flow == "fist":
+            backend.hand.update_fist_calibrator(step.trigger)
         else:
             backend.hand.update_shape_calibrator(step.trigger)
         state = backend.hand.mano_state
@@ -893,17 +1133,24 @@ class CalibrationController:
                             "Calibration was rejected. Hold the required pose "
                             "still and retry.")
             raise RuntimeError(message)
+        result_message = state.last_calibration_message
         with self._lock:
             self.completed_steps.add(step_index)
+            # 计算步骤（指根/安装/精细/握拳）把结果摘要追加到状态里，
+            # 让用户能看到例如"握拳偏移 index twist +3.1° spread -2.0°"或
+            # "精细接触标定残差 1.2mm"这类量化结果。
+            detail = ""
+            if self._is_compute_step(step) and result_message:
+                detail = "\n" + result_message
             if step_index + 1 < len(self._steps):
                 self.current_step = step_index + 1
                 self._status = (
-                    "本步骤已完成。请继续下一步。",
-                    "Step completed. Continue to the next step.")
+                    "本步骤已完成。请继续下一步。" + detail,
+                    "Step completed. Continue to the next step." + detail)
             else:
                 self._status = (
-                    "IMU 标定已完成。请保存标定文件。",
-                    "IMU calibration completed. Save the calibration file.")
+                    "IMU 标定已完成。请保存标定文件。" + detail,
+                    "IMU calibration completed. Save the calibration file." + detail)
 
     def capture_current_step(self) -> bool:
         step_index = self.current_step
@@ -980,6 +1227,7 @@ class CalibrationController:
             MoCapCalibrateRootType.CALC,
             MoCapCalibrateInstallationType.CALC,
             MoCapCalibrateShapeType.CALC,
+            MoCapCalibrateFistType.CALC,
         )
 
     def _angle_ready(self, step: CalibrationStep) -> bool:
@@ -1005,7 +1253,14 @@ class CalibrationController:
         target = snap["target_deg"]
         if target == 0.0:
             return live < 10.0
-        return abs(live - target) <= _ROOT_ANGLE_GOOD_BAND_DEG
+        if abs(live - target) > _ROOT_ANGLE_GOOD_BAND_DEG:
+            return False
+        restart_report = snap.get("restart_report")
+        if restart_report is not None and restart_report["restart_required"]:
+            return False
+        axis_report = snap.get("axis_report")
+        return (axis_report is None
+                or float(axis_report["max_deg"]) <= 15.0)
 
     def auto_capture_readiness(self) -> tuple[bool, bool, bool]:
         """Return ``(warm, rms_ok, angle_ok)`` for the current step.
@@ -1034,13 +1289,17 @@ class CalibrationController:
         if not self.auto_capture:
             self._auto_stable_since = None
             return
+        # Connected/session first, busy second: the connecting worker sets
+        # ``connected`` only when it is done, so checking ``busy`` first would
+        # report "capturing..." for the whole connect instead of leaving the
+        # connect's own status on screen.
+        if not self.connected or not self.session_started or self.complete:
+            self._auto_stable_since = None
+            return
         if self.busy:
             self._auto_stable_since = None
             self._auto_status = (
                 "自动采集：正在采集…", "Auto-capture: capturing...")
-            return
-        if not self.connected or not self.session_started or self.complete:
-            self._auto_stable_since = None
             return
         if self.current_step != self._auto_last_step:
             self._auto_stable_since = None
@@ -1100,11 +1359,11 @@ class CalibrationController:
     def root_angle_snapshot(self) -> dict | None:
         """Live rotation data for the guided root steps.
 
-        The angle shown is the exact quantity the root solver measures: the
-        rotation magnitude between the current wrist IMU orientation and the
-        captured Level (base) pose, ``|R_current * R_base^-1|``.  The solver
-        fits the same relative rotations, so the readout reuses its numbers
-        and its 20-160 deg skip window.
+        The angle shown is the same relative-rotation quantity the root solver
+        measures, but the current orientation is a short rolling mean (the
+        same 30-frame method used for a capture):
+        ``|R_current_mean * R_base^-1|``.  This prevents a transition frame
+        from being displayed as though it were the held calibration pose.
 
         Returns None when the readout should be hidden (no connected root
         step).  Safe to call from the GUI thread; the backend only swaps
@@ -1121,16 +1380,32 @@ class CalibrationController:
         base = state.calib_root_horizontal_pose if base_ready else None
 
         live_angle = None
+        live_motion_rms = None
+        live_sample_count = 0
+        current_pose = None
         if base is not None:
             buffer = backend.hand.buffer
             counter = buffer.get_counter()
-            if counter > 0:
-                frame, _, err = buffer.peek(counter - 1)
+            recent_rotations = []
+            for offset in range(min(counter, _LIVE_ROOT_ANGLE_WINDOW_FRAMES)):
+                frame, _, err = buffer.peek(counter - 1 - offset)
                 if (err is None and frame is not None
                         and bool(frame.valid_mask[0])):
-                    current = frame.imu_rotation[0]
-                    live_angle = float(np.degrees(
-                        (current * base[0].inv()).magnitude()))
+                    recent_rotations.append(frame.imu_rotation)
+            if recent_rotations:
+                # Match the averaging used by get_averaged_hand_pose_input()
+                # for the actual root-pose capture.  The RMS is surfaced to
+                # distinguish a held pose from a turn still in progress.
+                current = get_average_rotation(recent_rotations)
+                current_pose = current
+                live_angle = float(np.degrees(
+                    (current[0] * base[0].inv()).magnitude()))
+                wrist_deviation_deg = np.asarray([
+                    np.degrees((rotation[0] * current[0].inv()).magnitude())
+                    for rotation in recent_rotations
+                ])
+                live_motion_rms = float(np.sqrt(np.mean(wrist_deviation_deg ** 2)))
+                live_sample_count = len(recent_rotations)
 
         captured = {}
         for _trigger, name, _label in _ROOT_POSE_READOUT:
@@ -1141,9 +1416,41 @@ class CalibrationController:
                 None if stored is None or base is None
                 else float(np.degrees((stored[0] * base[0].inv()).magnitude())))
 
+        axis_poses = {
+            "z_rot_pose_1": (
+                state.calib_root_vertical_up_pose
+                if state.calib_root_pose_ready.get("vertical_up") else None),
+            "z_rot_pose_2": (
+                state.calib_root_vertical_down_pose
+                if state.calib_root_pose_ready.get("vertical_down") else None),
+            "roll_pose": (
+                state.calib_root_roll_pose
+                if state.calib_root_pose_ready.get("roll") else None),
+            "yaw_pose": (
+                state.calib_root_yaw_pose
+                if state.calib_root_pose_ready.get("yaw") else None),
+        }
+        current_pose_name = {
+            MoCapCalibrateRootType.VERTICAL_UP: "z_rot_pose_1",
+            MoCapCalibrateRootType.VERTICAL_DOWN: "z_rot_pose_2",
+            MoCapCalibrateRootType.ROLL: "roll_pose",
+            MoCapCalibrateRootType.YAW: "yaw_pose",
+        }.get(step.trigger)
+        if current_pose_name is not None and current_pose is not None:
+            axis_poses[current_pose_name] = current_pose
+        axis_report = (
+            root_axis_residuals(base, axis_poses, self.side)
+            if base is not None else None)
+        restart_report = vertical_pair_impossibility(
+            base, axis_poses["z_rot_pose_1"], axis_poses["z_rot_pose_2"])
+
         return {
             "base_ready": base_ready,
             "live_angle_deg": live_angle,
+            "live_motion_rms_deg": live_motion_rms,
+            "live_sample_count": live_sample_count,
+            "axis_report": axis_report,
+            "restart_report": restart_report,
             "target_deg": (
                 0.0 if step.trigger == MoCapCalibrateRootType.HORIZONTAL
                 else _ROOT_ANGLE_TARGET_DEG),
@@ -1207,9 +1514,8 @@ class BimanualCalibrationController:
         self._auto_last_step = -1
         self._auto_status = ("", "")
         self._status = (
-            "请先绑定成对的左右手，然后连接并开始双手标定。",
-            "Bind a left+right pair first, then connect and start dual-hand "
-            "calibration.")
+            "请连接成对的左右手，然后开始双手标定。",
+            "Connect a left+right pair, then start dual-hand calibration.")
         self._error = ("", "")
         self._lock = threading.RLock()
         self._busy = False
@@ -1285,30 +1591,45 @@ class BimanualCalibrationController:
             self._status = ("操作失败。", "Operation failed.")
 
     # -- lifecycle ------------------------------------------------------------
-    def connect(self) -> bool:
-        def work():
-            # Serial enumeration can block briefly on some Windows USB stacks;
-            # keep it off the GUI thread (single-hand connect already boots in
-            # a worker for the same reason).
-            ports = detect_hand_pair(Path(self.args.registry))
-            if ports is None:
-                self.report_error(L(
-                    "未检测到成对的左右手。请先绑定左右手套，再选择双手标定。",
-                    "No matched left+right pair detected. Bind the left and "
-                    "right gloves first, then choose dual-hand calibration."))
-                return
-            with self._lock:
-                self._status = (
-                    "正在连接双手并等待全部 16 个 IMU…",
-                    "Connecting both hands and waiting for all 16 IMUs...")
-            # 一次只启动一只手。两个后端同时扫 USB 注册表 / 打开串口在部分
-            # Windows USB 栈上会死锁，所以串行启动（SDK 的双手 viewer 也是给
-            # 每只手单独开进程，同理规避并发）。
-            for side, hand in self.hands.items():
-                hand.connect(serial_port=ports[side])
-                while hand.busy:
-                    time.sleep(0.1)
-        return self._start_worker(work, "hand2mm-bimanual-connect")
+    def adopt(self, hands: dict[str, CalibrationController]) -> None:
+        """Take over two already-connected single-hand controllers in place.
+
+        The pair is made of gloves the window has already opened, so this must
+        not open either COM port again: a second backend on a port that is
+        still open fails outright on Windows.  An earlier version connected the
+        pair itself from the registry; it could therefore only ever run before
+        the gloves were connected, which is exactly the limitation this
+        replaces.  The two placeholders from ``__init__`` are shut down (they
+        never connected, so this is bookkeeping) and each adopted hand hands
+        its capture gate over to the coordinator.
+        """
+        for placeholder in self.hands.values():
+            placeholder.shutdown()
+        for hand in hands.values():
+            hand.hand_over_to_dual()
+        with self._lock:
+            self.hands = dict(hands)
+            self._steps = self.hands["left"]._steps
+            self._status = (
+                "已接管两只已连接的手套，可以进行双手标定。",
+                "Both connected gloves taken over; dual-hand calibration is "
+                "ready.")
+
+    def detach(self) -> dict[str, CalibrationController]:
+        """Hand both controllers back to the window, leaving them connected.
+
+        The caller must drop its reference to this coordinator before the next
+        tick: the rest of this class indexes ``self.hands["left"]`` and
+        ``["right"]`` directly, so an empty mapping would turn those lookups
+        into a ``KeyError``.
+        """
+        hands = dict(self.hands)
+        self.hands = {}
+        self.saved_paths = {}
+        self._auto_stable_since = None
+        self._auto_last_step = -1
+        self._auto_status = ("", "")
+        return hands
 
     def start_new_session(self) -> bool:
         for hand in self.hands.values():
@@ -1399,7 +1720,13 @@ class BimanualCalibrationController:
         self._steps = self.hands["left"]._steps
 
     def shutdown(self) -> None:
-        for hand in self.hands.values():
+        """Shut both hands down and forget them, so this is safe to repeat.
+
+        The window holds references to the same controllers, so a second
+        shutdown call must not reach an already-closed backend again.
+        """
+        hands, self.hands = dict(self.hands), {}
+        for hand in hands.values():
             hand.shutdown()
 
     def save(self) -> bool:
@@ -1611,6 +1938,23 @@ class CalibrationWindow(QWidget):
         self._args = args
         self._preview = CalibrationPosePreview()
         self._detected_serials: dict[str, str] = {}
+        self._detected_ports: dict[str, str] = {}
+        # 已连接的手套，键是 COM 端口。一只手套一个后端，连接本身记在这里，
+        # 不看注册表：注册表说的是"以前插过什么"，不是"现在插着什么"。
+        self._gloves: dict[str, dict] = {}
+        # 连接在后台 worker 里完成，端口要等握手结束才能记进 _gloves。
+        self._pending: list[tuple[CalibrationController, str | None]] = []
+        # 单手标定时真正参与的那一只（两只都插着时由用户选择）。
+        self._participant_port: str | None = None
+        # 同侧两只已经问过用户的那一组端口，避免每 120ms 重复弹窗。
+        self._prompted_ports: frozenset[str] = frozenset()
+        # 想要的模式："single" / "dual"。插着的手套一变就按判定结果重置，之后
+        # 用户在模式下拉里改过的选择一直有效——一左一右也可以只标一只手。
+        self._wanted_mode = "single"
+        # 已连接集合的指纹，用来判断"手套变了没有"。
+        self._glove_signature: frozenset = frozenset()
+        # 用户点了双手但当前两只凑不成对时置位，判断栏据此说明原因。
+        self._dual_denied = False
         self._shown_preview_key = None
         self._preview_bgr = None
         self._finished = False
@@ -1641,8 +1985,21 @@ class CalibrationWindow(QWidget):
         label.setWordWrap(True)
 
     def _build_ui(self) -> None:
-        self.resize(1240, 900)
-        self.setMinimumSize(1100, 760)
+        self.setMinimumSize(820, 560)
+        # Keep Chinese and English on one predictable face/size.  Without an
+        # explicit common font Qt may swap to a different fallback face after
+        # the text changes, which changes metrics and makes the layout appear
+        # to jump even though no geometry was requested.
+        self.setFont(QFont("Microsoft YaHei UI", 10))
+        # Keep the first show wholly inside the usable desktop area.  A
+        # 1366x768 laptop commonly has about 720px of usable height once the
+        # taskbar is accounted for, so the old 900px initial window opened
+        # below the screen edge.
+        available = QApplication.primaryScreen().availableGeometry()
+        self.resize(
+            min(1120, max(820, int(available.width() * 0.95))),
+            min(760, max(560, int(available.height() * 0.92))),
+        )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 10, 12, 10)
@@ -1656,39 +2013,32 @@ class CalibrationWindow(QWidget):
         self._app_subtitle = self._muted("")
         top.addWidget(self._app_title)
         top.addWidget(self._app_subtitle)
+        # 固件版本号最右一位识别出的手型：连接后在这里直接显示，不再让用户选。
+        self._side_badge = QLabel()
+        self._side_badge.setAlignment(Qt.AlignCenter)
+        top.addWidget(self._side_badge)
         top.addStretch(1)
         self._lang_btn = QPushButton()
         self._lang_btn.clicked.connect(self._toggle_language)
         top.addWidget(self._lang_btn)
         outer.addLayout(top)
 
-        main = QHBoxLayout()
-        main.setSpacing(14)
-        outer.addLayout(main, 1)
+        # Both columns remain reachable on a notebook-sized window.  The
+        # splitter replaces the fixed left width; each column scrolls vertically
+        # rather than clipping buttons or preview/status content.
+        main = QSplitter(Qt.Horizontal)
+        main.setChildrenCollapsible(False)
+        outer.addWidget(main, 1)
 
         # ---- left column ----
         left = QWidget()
-        left.setFixedWidth(470)
+        left.setMinimumWidth(320)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(5)
 
         self._device_heading = self._heading("")
         left_layout.addWidget(self._device_heading)
-
-        self._side_label = QLabel()
-        left_layout.addWidget(self._side_label)
-        self._side_combo = QComboBox()
-        self._side_combo.addItem("", "left")
-        self._side_combo.addItem("", "right")
-        self._side_combo.setCurrentIndex(
-            0 if self._controller.side == "left" else 1)
-        self._side_combo.currentIndexChanged.connect(self._choose_side)
-        left_layout.addWidget(self._side_combo)
-
-        self._detected_side_label = QLabel()
-        self._detected_side_label.setWordWrap(True)
-        left_layout.addWidget(self._detected_side_label)
 
         self._detected_label = QLabel()
         left_layout.addWidget(self._detected_label)
@@ -1699,6 +2049,9 @@ class CalibrationWindow(QWidget):
         self._refresh_btn = QPushButton()
         self._refresh_btn.clicked.connect(self.refresh_devices)
         row.addWidget(self._refresh_btn)
+        self._disconnect_btn = QPushButton()
+        self._disconnect_btn.clicked.connect(self._disconnect_all)
+        row.addWidget(self._disconnect_btn)
         left_layout.addLayout(row)
 
         self._clear_btn = QPushButton()
@@ -1707,11 +2060,16 @@ class CalibrationWindow(QWidget):
 
         self._mode_label = QLabel()
         left_layout.addWidget(self._mode_label)
+        # 用户可选的模式。插着的手套一变，_sync_mode 会把它拨到判定出来的默认
+        # 值（一左一右默认双手）；之后用户说了算——一左一右也允许只标一只手，
+        # 两只同侧也可以再点一次"单手标定"重开选择框。接 activated 而不是
+        # currentIndexChanged：程序自己拨动下拉不该当成用户操作，而用户重复选
+        # 中同一项时也要能再次弹窗。
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("", "single")
         self._mode_combo.addItem("", "dual")
         self._mode_combo.setCurrentIndex(0)
-        self._mode_combo.currentIndexChanged.connect(self._choose_mode)
+        self._mode_combo.activated.connect(self._mode_selected)
         left_layout.addWidget(self._mode_combo)
         self._pair_hint = self._muted("")
         self._wrap(self._pair_hint)
@@ -1744,13 +2102,28 @@ class CalibrationWindow(QWidget):
 
         self._steps_heading = self._heading("")
         left_layout.addWidget(self._steps_heading)
+        # 步骤列表放进可滚动区域：15 步时左侧栏高度不足，直接堆叠会压扁底部
+        # （输出文件等）控件、甚至把字体挤到看不见。滚动区独占剩余高度，
+        # 设备/模式/输出区块始终可见，步骤列表在空间不够时内部滚动。
+        self._steps_scroll = QScrollArea()
+        self._steps_scroll.setWidgetResizable(True)
+        self._steps_scroll.setFrameShape(QFrame.NoFrame)
+        self._steps_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        steps_container = QWidget()
+        steps_layout = QVBoxLayout(steps_container)
+        steps_layout.setContentsMargins(0, 0, 0, 0)
+        steps_layout.setSpacing(3)
         self._step_buttons: list[QPushButton] = []
-        for index in range(13):
+        for index in range(len(self._controller._steps)):
             btn = QPushButton()
             btn.clicked.connect(
                 lambda _checked=False, i=index: self._choose_step(i))
             self._step_buttons.append(btn)
-            left_layout.addWidget(btn)
+            steps_layout.addWidget(btn)
+        steps_layout.addStretch(1)
+        self._steps_scroll.setWidget(steps_container)
+        left_layout.addWidget(self._steps_scroll, 1)
 
         left_layout.addWidget(_separator())
 
@@ -1765,11 +2138,15 @@ class CalibrationWindow(QWidget):
         self._wrap(self._output_path)
         left_layout.addWidget(self._output_path)
 
-        left_layout.addStretch(1)
-        main.addWidget(left)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setWidget(left)
+        main.addWidget(left_scroll)
 
         # ---- right column ----
         right = QWidget()
+        right.setMinimumWidth(400)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(5)
@@ -1780,7 +2157,7 @@ class CalibrationWindow(QWidget):
         self._preview_caption = self._muted("")
         right_layout.addWidget(self._preview_caption)
         self._preview_label = QLabel()
-        self._preview_label.setMinimumSize(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        self._preview_label.setMinimumSize(0, 180)
         self._preview_label.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(self._preview_label)
         self._compute_hint = QLabel()
@@ -1878,7 +2255,14 @@ class CalibrationWindow(QWidget):
         right_layout.addWidget(self._footer)
 
         right_layout.addStretch(1)
-        main.addWidget(right, 1)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setWidget(right)
+        main.addWidget(right_scroll)
+        main.setStretchFactor(0, 0)
+        main.setStretchFactor(1, 1)
+        main.setSizes([390, 700])
 
     def _retranslate_ui(self) -> None:
         self.setWindowTitle(
@@ -1892,11 +2276,9 @@ class CalibrationWindow(QWidget):
               "calibration."))
         self._lang_btn.setText(L("English", "中文"))
         self._device_heading.setText(L("设备", "Device"))
-        self._side_label.setText(L("手型", "Hand Side"))
-        self._side_combo.setItemText(0, L("左手", "Left"))
-        self._side_combo.setItemText(1, L("右手", "Right"))
         self._detected_label.setText(L("检测到的设备", "Detected Device"))
         self._refresh_btn.setText(L("刷新设备", "Refresh Devices"))
+        self._disconnect_btn.setText(L("断开手套", "Disconnect Gloves"))
         self._clear_btn.setText(L("清除所有绑定", "Clear All Bindings"))
         self._mode_label.setText(L("标定模式", "Calibration Mode"))
         self._mode_combo.setItemText(0, L("单手标定", "Single Hand"))
@@ -1928,7 +2310,10 @@ class CalibrationWindow(QWidget):
     # -- language switching -------------------------------------------------
     def _toggle_language(self) -> None:
         set_lang("zh" if is_en() else "en")
-        self._controller.retranslate()
+        # Step titles are resolved when the step list is built, so every hand
+        # the window owns has to rebuild its own list -- not just the first.
+        for glove_controller in self._glove_controllers():
+            glove_controller.retranslate()
         if self._dual_controller is not None:
             self._dual_controller.retranslate()
         # Force the preview caption + "compute step" hint to retranslate too;
@@ -1938,54 +2323,115 @@ class CalibrationWindow(QWidget):
         self._on_tick()
 
     # -- handlers ------------------------------------------------------------
+    def _glove_controllers(self) -> list[CalibrationController]:
+        """Every hand controller the window owns, each listed exactly once.
+
+        The first glove reuses the controller built at startup, so the list is
+        not simply the rows of ``self._gloves``.
+        """
+        controllers = [record["controller"] for record in self._gloves.values()]
+        if self._controller not in controllers:
+            controllers.append(self._controller)
+        return controllers
+
+    def _owned_controllers(self) -> list[CalibrationController]:
+        """Every controller to shut down: the connected gloves plus any connect
+        still in flight, each listed exactly once."""
+        controllers = self._glove_controllers()
+        for pending, _port in self._pending:
+            if not any(existing is pending for existing in controllers):
+                controllers.append(pending)
+        return controllers
+
+    def _apply_ui_settings(self, controller) -> None:
+        """Push the window's capture settings onto a controller just taken on."""
+        controller.auto_capture = self._auto_capture_check.isChecked()
+        controller.rms_threshold = float(self._rms_threshold_spin.value())
+        controller.replace_output = self._replace_check.isChecked()
+        controller._auto_stable_since = None
+
     def _replace_changed(self, checked: bool) -> None:
-        self._controller.replace_output = bool(checked)
+        for controller in self._glove_controllers():
+            controller.replace_output = bool(checked)
         if self._dual_controller is not None:
             self._dual_controller.replace_output = bool(checked)
 
     def _auto_capture_changed(self, checked: bool) -> None:
         value = bool(checked)
-        self._controller.auto_capture = value
-        self._controller._auto_stable_since = None
+        for controller in self._glove_controllers():
+            controller.auto_capture = value
+            controller._auto_stable_since = None
         if self._dual_controller is not None:
             self._dual_controller.auto_capture = value
             self._dual_controller._auto_stable_since = None
 
     def _rms_threshold_changed(self, value: float) -> None:
-        self._controller.rms_threshold = float(value)
+        for controller in self._glove_controllers():
+            controller.rms_threshold = float(value)
         if self._dual_controller is not None:
             self._dual_controller.rms_threshold = float(value)
 
     def _active_controller(self):
-        return self._dual_controller if self._dual_mode else self._controller
+        if self._dual_mode:
+            return self._dual_controller
+        record = self._gloves.get(self._participant_port or "")
+        return record["controller"] if record is not None else self._controller
 
-    def _choose_mode(self, index: int) -> None:
-        mode = self._mode_combo.itemData(index)
-        if mode == "dual":
-            if self._dual_controller is None:
-                self._dual_controller = BimanualCalibrationController(self._args)
-            self._dual_controller.auto_capture = self._controller.auto_capture
-            self._dual_controller.rms_threshold = self._controller.rms_threshold
-            self._dual_controller.replace_output = self._controller.replace_output
-            self._dual_mode = True
-        else:
-            self._dual_mode = False
+    def _classify_connected(self) -> dict:
+        """What the gloves that are up right now add up to."""
+        return classify_glove_set(
+            [(port, record["side"]) for port, record in self._gloves.items()])
+
+    def _set_mode_readout(self) -> None:
+        """Show the mode in force, snapping the combo back when it cannot hold."""
+        self._mode_combo.blockSignals(True)
+        self._mode_combo.setCurrentIndex(1 if self._dual_mode else 0)
+        self._mode_combo.blockSignals(False)
         self._output_name.setText(self._active_controller_output_name())
-        self._on_tick()
+
+    def _mode_selected(self, index: int) -> None:
+        """Apply the mode the user picked from the combo.
+
+        Dual-hand needs a left+right pair; asking for it without one is refused
+        out loud rather than silently ignored.  Picking single-hand while two
+        gloves are up re-opens the picker, so the participant can be changed
+        without unplugging anything.
+        """
+        wanted = self._mode_combo.itemData(index)
+        result = self._classify_connected()
+        if wanted == "dual" and result["mode"] != "dual":
+            self._dual_denied = True
+            self._set_mode_readout()
+            self._update_mode_hint(result)
+            return
+        self._dual_denied = False
+        self._wanted_mode = wanted
+        if wanted == "single" and len(self._gloves) >= 2:
+            # Forget the "already asked" guard so _sync_mode asks again.
+            self._prompted_ports = frozenset()
+        self._sync_mode()
+
+    def _glove_descriptor(self, port: str, with_serial: bool = False) -> str:
+        """`COM35 · USB · 左手` -- what the user needs to tell two gloves apart."""
+        record = self._gloves.get(port) or {}
+        parts = [str(port)]
+        transport = str(record.get("transport") or "").strip()
+        if transport:
+            parts.append(transport)
+        parts.append(hand_side_label(record.get("side")))
+        text = " · ".join(parts)
+        if with_serial:
+            serial = str(record.get("serial") or "").strip()
+            if serial:
+                text += L("（序列号 {serial}）",
+                          " (serial {serial})").format(serial=serial)
+        return text
 
     def _active_controller_output_name(self) -> str:
         controller = self._active_controller()
         if self._dual_mode:
             return controller._pair_base + ".json"
         return controller.output.name
-
-    def _choose_side(self, index: int) -> None:
-        if self._dual_mode:
-            return
-        side = self._side_combo.itemData(index)
-        if side:
-            self._controller.select_side(side)
-            self._output_name.setText(self._controller.output.name)
 
     def _start_calibration(self) -> None:
         self._active_controller().start_new_session()
@@ -2012,53 +2458,249 @@ class CalibrationWindow(QWidget):
         self.close()
 
     def refresh_devices(self) -> None:
-        # While a glove is connected, Refresh Devices also resets the
-        # calibration session (tears the backend down and clears state) so
-        # the bind/connect flow can be redone from a clean slate.
-        self._controller.reset_session()
-        if self._dual_controller is not None:
-            self._dual_controller.reset_session()
+        """Re-enumerate the USB gloves without disturbing the connected ones.
+
+        Refreshing used to tear the backend down, which made a second glove
+        impossible to connect: pressing Refresh to see the new device cost you
+        the one already running.  Ports that are open are therefore left out of
+        the list and stay connected -- "Disconnect Gloves" is what closes them.
+        """
+        connected_ports = set(self._gloves) | {
+            port for _controller, port in self._pending if port}
         try:
             options = detected_glove_options()
-            self._detected_serials = dict(options)
-            labels = list(self._detected_serials) or [
+            self._detected_serials = {
+                label: serial for label, serial, _port in options}
+            self._detected_ports = {
+                label: port for label, _serial, port in options}
+            free = [
+                (label, serial, port) for label, serial, port in options
+                if port not in connected_ports]
+            labels = [label for label, _serial, _port in free] or [
                 L("未检测到 STM32 手套", "No STM32 gloves detected")]
             self._detected_combo.clear()
             for label in labels:
                 self._detected_combo.addItem(label)
+            bindings = glove_serial_bindings(Path(self._args.registry))
             intro = (
                 L("检测到 {n} 个 STM32 手套。", "Detected {n} STM32 glove(s).")
                 .format(n=len(options))
                 if options else
                 L("未检测到 STM32 手套。", "No STM32 gloves detected."))
-            self._binding_status.setText(intro)
+            self._binding_status.setText(
+                intro + " " + L("绑定：", "Bindings: ")
+                + format_glove_bindings(bindings))
         except Exception as exc:
             self._detected_serials = {}
+            self._detected_ports = {}
             self._detected_combo.clear()
             self._detected_combo.addItem(
                 L("未检测到 STM32 手套", "No STM32 gloves detected"))
             self._binding_status.setText(
                 L("设备刷新失败：{exc}", "Device refresh failed: {exc}")
                 .format(exc=exc))
-        self._update_pair_availability()
+        self._sync_mode()
 
-    def _update_pair_availability(self) -> None:
-        """Enable the dual-hand mode option only when a full pair is bound."""
-        pair = detect_hand_pair(Path(self._args.registry))
-        enabled = pair is not None
-        dual_index = self._mode_combo.findData("dual")
-        if dual_index >= 0:
-            self._mode_combo.model().item(dual_index).setEnabled(enabled)
-        if not enabled and self._mode_combo.currentData() == "dual":
-            self._mode_combo.setCurrentIndex(0)
-        self._pair_hint.setText(
-            L("检测到成对左右手，可进行双手标定。",
-              "A matched left+right pair is detected; dual-hand calibration "
-              "is available.")
-            if enabled else
-            L("未检测到成对左右手；仅可单手标定。",
-              "No matched left+right pair detected; single-hand calibration "
-              "only."))
+    def _disconnect_all(self) -> None:
+        """Close every connected glove and return to a clean slate."""
+        if not (self._gloves or self._pending):
+            return
+        answer = QMessageBox.question(
+            self,
+            L("断开手套", "Disconnect Gloves"),
+            L("确定要断开当前已连接的手套吗？未保存的标定进度会丢失。",
+              "Disconnect the connected gloves? Unfinished calibration "
+              "progress is lost."),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._drop_dual_pair()
+        for record in self._gloves.values():
+            record["controller"].release_from_dual()
+            record["controller"].reset_session()
+        self._gloves.clear()
+        self._participant_port = None
+        self._prompted_ports = frozenset()
+        self._glove_signature = frozenset()
+        self._wanted_mode = "single"
+        self._dual_denied = False
+        self.refresh_devices()
+
+    def _drop_dual_pair(self) -> None:
+        """Return the pair to the window and stop coordinating it."""
+        if self._dual_controller is None:
+            self._dual_mode = False
+            return
+        hands = self._dual_controller.detach()
+        self._dual_controller = None
+        self._dual_mode = False
+        for hand in hands.values():
+            hand.release_from_dual()
+            # A hand that goes back to single-hand calibration has to gate its
+            # own capture again, at whatever the checkbox says right now.
+            self._apply_ui_settings(hand)
+
+    def _sync_mode(self) -> None:
+        """Match the mode to the gloves that are up, honouring the user's pick.
+
+        Runs on every tick and only acts when the answer changes, so a pair is
+        adopted (or returned) exactly once per connect, unplug, or disconnect.
+        Whenever the connected set changes, the mode resets to what the firmware
+        sides add up to: a fresh left+right pair defaults to dual-hand, anything
+        else -- one glove, two gloves naming the same hand, a glove naming no
+        hand -- defaults to single-hand.  Between such changes the user's own
+        choice stands, so a left+right pair may still be calibrated one hand at
+        a time.
+        """
+        result = self._classify_connected()
+        signature = frozenset(
+            (port, record["side"]) for port, record in self._gloves.items())
+        if signature != self._glove_signature:
+            self._glove_signature = signature
+            self._wanted_mode = (
+                "dual" if result["mode"] == "dual" else "single")
+            self._dual_denied = False
+        want_dual = self._wanted_mode == "dual" and result["mode"] == "dual"
+        if want_dual and not self._dual_mode:
+            self._adopt_pair(result["pair"])
+        elif not want_dual and self._dual_mode:
+            self._drop_dual_pair()
+        ports = list(self._gloves)
+        if self._participant_port not in ports:
+            self._participant_port = ports[0] if ports else None
+        self._set_mode_readout()
+        self._update_mode_hint(result)
+        self._maybe_ask_participant()
+
+    def _adopt_pair(self, pair: dict[str, str]) -> None:
+        """Hand both connected hands to a dual coordinator, without reconnecting."""
+        controller = BimanualCalibrationController(self._args)
+        controller.adopt({
+            side: self._gloves[port]["controller"]
+            for side, port in pair.items()})
+        controller.replace_output = self._replace_check.isChecked()
+        controller.rms_threshold = float(self._rms_threshold_spin.value())
+        controller.auto_capture = self._auto_capture_check.isChecked()
+        controller._auto_stable_since = None
+        self._dual_controller = controller
+        self._dual_mode = True
+
+    def _update_mode_hint(self, result: dict) -> None:
+        """Say what the connected set adds up to, and what stands in the way."""
+        ports = list(self._gloves)
+        if not ports:
+            text = L(
+                "未连接手套。连接后由固件版本号报告的手型决定单/双手标定。",
+                "No glove connected. The hand named by the firmware version "
+                "decides single- or dual-hand calibration.")
+        elif self._dual_mode:
+            text = L(
+                "已识别一左一右，可进行双手标定。",
+                "One left and one right detected; dual-hand calibration is "
+                "available.")
+        elif len(ports) == 1:
+            text = L(
+                "已连接 1 只手套（{device}）：单手标定。",
+                "1 glove connected ({device}): single-hand calibration."
+            ).format(device=self._glove_name(ports[0]))
+        else:
+            participant = (self._participant_port
+                           if self._participant_port in ports else ports[0])
+            idle = [port for port in ports if port != participant]
+            text = L(
+                "已连接 2 只手套：{active} 参与标定，{idle} 未参与标定。",
+                "2 gloves connected: {active} is calibrating, {idle} is not."
+            ).format(active=self._glove_descriptor(participant),
+                     idle=_join_list(
+                         [self._glove_descriptor(port) for port in idle]))
+            if result["unnamed"]:
+                text += " " + L(
+                    "{port} 的固件未标明手型，无法组成左右手对；"
+                    "双手标定需要一左一右。",
+                    "{port} firmware names no hand, so a left+right pair "
+                    "cannot be confirmed; dual-hand calibration needs one of "
+                    "each.").format(port=_join_list(
+                        [self._glove_name(port) for port in result["unnamed"]]))
+            elif result["duplicates"]:
+                text += " " + L(
+                    "两只都是{side}，无法组成左右手对。",
+                    "Both gloves are {side}; a left+right pair needs one of "
+                    "each.").format(
+                        side=hand_side_label(self._gloves[participant]["side"]))
+        if self._dual_denied:
+            text = L("无法切到双手标定：", "Cannot switch to dual-hand "
+                     "calibration: ") + text
+        if self._pending:
+            port = self._pending[0][1] or L("(按注册表)", "(from the registry)")
+            text += " " + L("正在连接 {port}…", "Connecting {port}...").format(
+                port=port)
+        self._pair_hint.setText(text)
+
+    def _glove_name(self, port: str) -> str:
+        """The user-facing name of a connected glove: its serial, else the port."""
+        record = self._gloves.get(port) or {}
+        return str(record.get("serial") or port)
+
+    def _maybe_ask_participant(self) -> None:
+        """Ask which glove calibrates whenever single-hand runs with two up.
+
+        That covers both cases: two gloves that cannot form a left+right pair,
+        and a pair the user chose to calibrate one hand at a time.
+        """
+        if self._dual_mode or len(self._gloves) < 2:
+            self._prompted_ports = frozenset()
+            return
+        ports = frozenset(self._gloves)
+        if ports == self._prompted_ports:
+            return
+        self._prompted_ports = ports
+        # A modal dialog cannot run inside the tick: it spins a nested event
+        # loop while this tick is still on the stack. Queue it instead.
+        QTimer.singleShot(0, self._ask_participant)
+
+    def _ask_participant(self) -> None:
+        """Let the user pick which of the connected gloves this run calibrates."""
+        if self._dual_mode or len(self._gloves) < 2:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(L("选择参与标定的手套",
+                             "Choose the Glove to Calibrate"))
+        result = self._classify_connected()
+        if result["duplicates"]:
+            port = result["duplicates"][0]
+            box.setText(L(
+                "检测到两只{side}，只能单手标定。请选择参与标定的那一只：",
+                "Two {side} gloves detected, so this run calibrates one hand at "
+                "a time. Choose the glove to calibrate:"
+            ).format(side=hand_side_label(self._gloves[port]["side"])))
+        elif result["unnamed"]:
+            box.setText(L(
+                "两只手套里有一支的固件未标明手型，无法组成左右手对。"
+                "请选择本次标定使用的那一只：",
+                "One of the two gloves' firmware names no hand, so a left+right "
+                "pair cannot be confirmed. Choose the glove to calibrate:"))
+        else:
+            box.setText(L(
+                "已连接一左一右两只手套，本次进行单手标定。"
+                "请选择参与标定的那一只：",
+                "A left and a right glove are connected and this run calibrates "
+                "one hand at a time. Choose the glove to calibrate:"))
+        # The port, the transport and the hand are on every button, because
+        # those are what tell two plugged-in gloves apart at a glance.
+        box.setInformativeText(_join_list(
+            [self._glove_descriptor(port, with_serial=True)
+             for port in self._gloves]))
+        buttons = {}
+        for port in self._gloves:
+            buttons[box.addButton(self._glove_descriptor(port),
+                                  QMessageBox.AcceptRole)] = port
+        box.exec()
+        chosen = buttons.get(box.clickedButton())
+        if chosen is not None:
+            self._participant_port = chosen
 
     def _clear_bindings(self) -> None:
         answer = QMessageBox.question(
@@ -2074,6 +2716,9 @@ class CalibrationWindow(QWidget):
         try:
             path = clear_glove_bindings(Path(self._args.registry))
             bindings = glove_serial_bindings(Path(self._args.registry))
+            # Clear first, then re-render: refresh_devices rewrites the binding
+            # status line, and this confirmation is what the user has to see.
+            self.refresh_devices()
             self._binding_status.setText(
                 L("已清除所有绑定记录（{path}）。",
                   "Cleared all binding records ({path}).").format(path=path)
@@ -2082,37 +2727,118 @@ class CalibrationWindow(QWidget):
             self._binding_status.setText(
                 L("清除绑定失败：{exc}", "Clearing bindings failed: {exc}")
                 .format(exc=exc))
-        self._update_pair_availability()
 
     def _connect_selected(self) -> None:
-        """Connect the device currently shown in the live detection combo.
+        """Connect one more glove and let the firmware name the hand.
 
-        This avoids a confusing failure when a replacement board has a new
-        USB serial number that is not yet in ``glove_devices.json``.  The
-        explicit Bind buttons remain available for making that assignment
-        persistent; connecting does not change the registry.
+        Every press opens one additional COM port, so two gloves can be brought
+        up one after the other -- pressing Connect used to lock the button until
+        the window was refreshed, which tore the first glove down.  What the
+        two gloves add up to (single- or dual-hand) is decided afterwards, in
+        ``_sync_mode``, from the sides their firmware reports.
 
-        In dual mode both gloves are resolved by their bound left/right serials
-        and connected together.
+        The device combo is only a preference: with nothing selected the first
+        free glove is used, so plugging one glove in and pressing Connect is the
+        whole flow.  Opening the port through the live serial list (rather than
+        the registry) also avoids a confusing failure when a replacement board
+        has a new USB serial number that is not yet in ``glove_devices.json``.
         """
-        if self._dual_mode:
-            self._active_controller().connect()
+        if len(self._gloves) >= 2 or self._pending:
             return
         label = self._detected_combo.currentText()
         serial_number = self._detected_serials.get(label)
+        if serial_number is None and self._detected_serials:
+            serial_number = next(iter(self._detected_serials.values()))
+        # Prefer a fresh lookup by serial (the combo may be a refresh old), and
+        # fall back to the port recorded with the listed option.
         selected_port = detected_glove_port(serial_number) \
             if serial_number else None
-        if serial_number and selected_port:
-            self._controller.connect(serial_port=selected_port)
+        if selected_port is None:
+            selected_port = self._detected_ports.get(label)
+        if selected_port is not None and selected_port in self._gloves:
+            self._binding_status.setText(
+                L("{port} 已经连接。", "{port} is already connected.")
+                .format(port=selected_port))
+            return
+        controller = (self._controller if not self._is_claimed(self._controller)
+                      else CalibrationController(self._args))
+        self._apply_ui_settings(controller)
+        self._pending.append((controller, selected_port))
+        if selected_port:
+            controller.connect(serial_port=selected_port)
         else:
-            # Preserve the normal registry-based path when no live selection
-            # is available so the resulting error still contains diagnostics.
-            self._controller.connect()
+            # Preserve the normal registry-based path when no live device is
+            # available so the resulting error still contains diagnostics.
+            controller.connect()
+
+    def _is_claimed(self, controller) -> bool:
+        """True when a controller is already connected or connecting."""
+        if any(record["controller"] is controller
+               for record in self._gloves.values()):
+            return True
+        return any(pending is controller for pending, _port in self._pending)
+
+    def _promote_pending_gloves(self) -> None:
+        """Move finished connects into the connected set, keyed by COM port."""
+        remaining = []
+        for controller, port in self._pending:
+            if not controller.connected:
+                if controller.busy:
+                    remaining.append((controller, port))
+                # A connect that finished without connecting has already put
+                # its error on screen; it is simply dropped here.
+                continue
+            backend = controller.backend
+            resolved = (port
+                        or getattr(getattr(backend, "hand_config", None),
+                                   "serial_port", "")
+                        or f"auto:{id(controller)}")
+            self._gloves[resolved] = {
+                "controller": controller,
+                "serial": str(getattr(backend, "bound_serial", "")
+                              or "").strip().upper(),
+                "side": controller.locked_side,
+                # Read now, while the port is still enumerated: a glove behind
+                # a Bluetooth dongle enumerates as the dongle's own CDC port.
+                "transport": glove_transport_label(resolved),
+            }
+            if self._participant_port is None:
+                self._participant_port = resolved
+            self._forget_detected_port(resolved)
+        self._pending = remaining
+
+    def _forget_detected_port(self, port: str) -> None:
+        """Drop a now-connected port from the device list and select the next.
+
+        Without this the combo would keep offering the glove that is already
+        up, and the second press of "Connect Glove" would aim at it and quietly
+        do nothing.  The list is edited in place rather than re-enumerated: this
+        runs on the tick, and re-scanning the USB bus there is not worth it.
+        """
+        for label in [label for label, detected in self._detected_ports.items()
+                      if detected == port]:
+            self._detected_ports.pop(label, None)
+            self._detected_serials.pop(label, None)
+            index = self._detected_combo.findText(label)
+            if index >= 0:
+                self._detected_combo.removeItem(index)
+        if self._detected_combo.count() == 0:
+            self._detected_combo.addItem(
+                L("未检测到 STM32 手套", "No STM32 gloves detected"))
 
     # -- periodic refresh ----------------------------------------------------
     def _on_tick(self) -> None:
+        self._promote_pending_gloves()
+        for record in self._gloves.values():
+            record["controller"].refresh_health()
+        if self._pending:
+            self._pending[0][0].refresh_health()
+        self._sync_mode()
         controller = self._active_controller()
-        controller.refresh_health()
+        if self._pending and not self._gloves:
+            # Nothing is up yet: show the glove being connected so its
+            # handshake status (and any failure) reaches the panel.
+            controller = self._pending[0][0]
         controller.auto_capture_tick()
         state = controller.snapshot()
         self._apply_snapshot(state)
@@ -2122,7 +2848,7 @@ class CalibrationWindow(QWidget):
         controller = self._active_controller()
         dual = state.get("mode") == "dual"
         self._device_text.setText(state["device_text"])
-        firmware_version = display_firmware_version(state["firmware_version"])
+        firmware_version = state["firmware_version"]
         self._firmware_text.setText(
             L("固件：V{0}", "Firmware: V{0}").format(firmware_version)
             if firmware_version is not None else L("固件：--", "Firmware: --"))
@@ -2168,28 +2894,18 @@ class CalibrationWindow(QWidget):
         busy = state["busy"]
         connected = state["connected"]
         session = state["session_started"]
-        side_locked = bool(state.get("side_locked", False))
-        locked_side = state.get("locked_side")
-        self._side_combo.setEnabled(not busy and not dual and not side_locked)
-        # Keep the combo showing the (auto-corrected) detected hand side.
-        if not dual:
-            detected_index = 0 if state.get("side") == "left" else 1
-            if self._side_combo.currentIndex() != detected_index:
-                self._side_combo.setCurrentIndex(detected_index)
-        self._side_label.setText(
-            L("手型（已自动识别）", "Hand Side (auto-detected)")
-            if side_locked else L("手型", "Hand Side"))
-        if locked_side in ("left", "right"):
-            self._detected_side_label.setText(
-                L("已自动识别为左手", "Auto-detected: Left hand")
-                if locked_side == "left" else
-                L("已自动识别为右手", "Auto-detected: Right hand"))
-            self._detected_side_label.setVisible(True)
-        else:
-            self._detected_side_label.setVisible(False)
-        self._mode_combo.setEnabled(not busy and not connected)
+        self._update_side_badge(controller, dual, connected)
         self._refresh_btn.setEnabled(not busy)
-        self._connect_btn.setEnabled(not busy and not connected)
+        self._disconnect_btn.setEnabled(
+            not busy and not self._pending and bool(self._gloves))
+        # One press connects one glove, so the button stays live until two are
+        # up.  It is held while a connect is in flight to keep a double click
+        # from opening the same port twice.
+        self._connect_btn.setEnabled(
+            not busy and not self._pending and len(self._gloves) < 2)
+        # The mode only becomes a choice once two gloves are up: with one or
+        # none, the firmware sides leave nothing to choose between.
+        self._mode_combo.setEnabled(not busy and len(self._gloves) >= 2)
         self._start_btn.setEnabled(not busy and connected)
         self._output_name.setEnabled(not busy)
         self._action_btn.setEnabled(
@@ -2234,6 +2950,52 @@ class CalibrationWindow(QWidget):
                 self._angle_readout.setStyleSheet(
                     f"color: rgb({color[0]},{color[1]},{color[2]});")
                 self._angle_history.setText(history)
+
+    def _update_side_badge(self, controller, dual: bool, connected: bool) -> None:
+        """Show the hand the firmware names, at the top of the window.
+
+        The ones digit of the firmware patch is the only hand-side marker a
+        glove carries (``1.2.91`` left, ``1.2.92`` right); the backend reads it
+        as it boots, so this reports what was detected on connect and is never
+        something the user sets.  Firmware predating the marker names no hand --
+        that is said out loud rather than passed off as a detection, because the
+        calibration that follows is only correct for the hand it was run on.
+        """
+        good, warn, muted = "#4fd08a", "#f0a03c", "#8fa4bd"
+        if not connected:
+            text, color = L("手型：未连接", "HAND: NOT CONNECTED"), muted
+        elif dual:
+            unnamed = [side for side in ("left", "right")
+                       if getattr(controller.hands[side], "locked_side", None)
+                       is None]
+            if unnamed:
+                text, color = (
+                    L("双手：固件未标明手型", "DUAL: FIRMWARE NAMES NO HAND"),
+                    warn)
+            else:
+                text, color = (
+                    L("已识别：左手 + 右手", "DETECTED: LEFT + RIGHT"), good)
+        elif getattr(controller, "locked_side", None) is not None:
+            side_name = (L("左手", "LEFT HAND")
+                         if controller.locked_side == "left"
+                         else L("右手", "RIGHT HAND"))
+            text, color = L(f"已识别：{side_name}",
+                            f"DETECTED: {side_name}"), good
+        else:
+            side_name = (L("左手", "LEFT") if controller.side == "left"
+                         else L("右手", "RIGHT"))
+            text, color = (
+                L(f"固件未标明手型（按{side_name}手标定）",
+                  f"FIRMWARE NAMES NO HAND (CALIBRATING AS {side_name})"),
+                warn)
+        self._side_badge.setText(text)
+        # The second literal is *not* an f-string, so a doubled ``}}`` here would
+        # survive as two literal braces and leave the rule unbalanced: Qt then
+        # refuses the whole stylesheet, and the badge silently loses its colour,
+        # border and padding.
+        self._side_badge.setStyleSheet(
+            f"QLabel {{ color: {color}; border: 1px solid {color}; "
+            "border-radius: 4px; padding: 2px 10px; font-weight: 600; }")
 
     def _format_dual_readiness(self, state: dict) -> str:
         """Two-line readiness readout: one RMS + angle line per hand."""
@@ -2281,15 +3043,11 @@ class CalibrationWindow(QWidget):
                 bgr = self._preview.render_bimanual_bgr(
                     state["current_step"])
                 self._preview_bgr = bgr
-                height, width = bgr.shape[:2]
-                image = QImage(
-                    bgr.data, width, height, bgr.strides[0],
-                    QImage.Format.Format_BGR888)
-                self._preview_label.setPixmap(QPixmap.fromImage(image))
+                self._set_preview_pixmap()
                 self._preview_caption.setText(
                     L("双手完整手姿势参考 | 左右手分别按 L / R 演示动作",
                       "Dual Full-Hand Reference | Follow the separate L / R poses"))
-            if state["current_step"] in (5, 7, 12):
+            if state["current_step"] in (5, 7, 12, 14):
                 self._compute_hint.setText(
                     L("无需姿势 - 计算步骤", "NO POSE REQUIRED - COMPUTE STEP"))
                 self._compute_hint.show()
@@ -2301,28 +3059,56 @@ class CalibrationWindow(QWidget):
             self._shown_preview_key = key
             bgr = self._preview.render_bgr(*key)
             self._preview_bgr = bgr  # keep alive for the zero-copy QImage
-            height, width = bgr.shape[:2]
-            image = QImage(
-                bgr.data, width, height, bgr.strides[0],
-                QImage.Format.Format_BGR888)
-            pixmap = QPixmap.fromImage(image)
-            self._preview_label.setPixmap(pixmap)
+            self._set_preview_pixmap()
             side_label = L("左", "LEFT") if state["side"] == "left" else L("右", "RIGHT")
             self._preview_caption.setText(
                 L("轻量 3D 姿势参考 | {side} | 步骤 {n}",
                   "Full 3D Hand Reference | {side} | STEP {n}").format(
                       side=side_label, n=state["current_step"] + 1))
-            if state["current_step"] in (5, 7, 12):
+            if state["current_step"] in (5, 7, 12, 14):
                 self._compute_hint.setText(
                     L("无需姿势 - 计算步骤", "NO POSE REQUIRED - COMPUTE STEP"))
                 self._compute_hint.show()
             else:
                 self._compute_hint.hide()
 
+    def _set_preview_pixmap(self) -> None:
+        """Fit the generated reference image into the preview area.
+
+        Keeping the source BGR array on ``self`` avoids a dangling QImage
+        buffer, while scaling the resulting pixmap on every resize prevents a
+        fixed 660px preview from forcing the whole calibration window wide.
+        """
+        bgr = self._preview_bgr
+        if bgr is None or self._preview_label.size().isEmpty():
+            return
+        height, width = bgr.shape[:2]
+        image = QImage(
+            bgr.data, width, height, bgr.strides[0],
+            QImage.Format.Format_BGR888)
+        pixmap = QPixmap.fromImage(image)
+        self._preview_label.setPixmap(pixmap.scaled(
+            self._preview_label.size(), Qt.KeepAspectRatio,
+            Qt.SmoothTransformation))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._set_preview_pixmap()
+
     def closeEvent(self, ev) -> None:  # noqa: N802
-        self._controller.shutdown()
-        if self._dual_controller is not None:
-            self._dual_controller.shutdown()
+        # Stop the 120 ms tick first.  Closing a window does not delete it --
+        # the timer's connection to ``_on_tick`` keeps it alive -- and the
+        # launcher goes straight back to the live viewer's event loop, so an
+        # unstopped timer would keep ticking a window nobody can see any more.
+        self._timer.stop()
+        # Whoever holds the hands shuts them down, so give the pair back first:
+        # one holder, one shutdown.  Shutting the coordinator down in place
+        # would instead empty its ``hands`` while leaving itself referenced and
+        # ``_dual_mode`` True, and every later tick would index ``hands["left"]``
+        # of a coordinator that owns nothing (the reported ``KeyError: 'left'``).
+        self._drop_dual_pair()
+        for controller in self._owned_controllers():
+            controller.shutdown()
         ev.accept()
 
 

@@ -75,6 +75,13 @@ class MoCapCalibrateShapeType(str, Enum):
     CALC = "calc"  #
 
 
+class MoCapCalibrateFistType(str, Enum):
+    """四指握拳标定：实测四指弯曲时的横向偏移（思路一），供运行时减去。"""
+    CAPTURE = "capture"  # 四指握拳采集弯曲位姿
+    RESET = "reset"
+    CALC = "calc"
+
+
 class MoCapCalibrateShapeKeyPointType(tuple[str, int], Enum):
     T_MCP = ("T_MCP", 0)
     T_PIP = ("T_PIP", 1)

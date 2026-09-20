@@ -20,12 +20,63 @@ Any other leading argument is forwarded to the live-3D viewer together with
 from __future__ import annotations
 
 import importlib
+import multiprocessing
 import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+
+def _fixup_stdio() -> None:
+    """Windowed builds set stdout/stderr to None; redirect them to a log file.
+
+    PyInstaller's ``--windowed`` mode leaves ``sys.stdout``/``sys.stderr`` as
+    ``None`` because there is no console.  That breaks anything that hands the
+    stream to a third party: ``loguru``'s ``logger.add(sys.stderr)`` raises
+    ``TypeError: Cannot log to objects of type 'NoneType'``, and bare
+    ``sys.stdout.isatty()`` raises ``AttributeError``.  Both happen at *module
+    import* time inside ``algorithm/imu_calibrate_cli.py`` (lines 69-71), which
+    is why selecting the calibration program used to die on a traceback.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    import os
+    try:
+        log_path = Path(sys.executable).resolve().with_name("stouch_toolkit_console.log")
+        stream = open(log_path, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        stream = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
+def _install_crash_log() -> None:
+    """Frozen windowed builds have no console; write tracebacks to a log file."""
+    if not getattr(sys, "frozen", False):
+        return
+    import traceback
+    from datetime import datetime
+    log_path = Path(sys.executable).resolve().with_name("stouch_toolkit.log")
+    real_excepthook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write("=" * 70 + "\n")
+                fh.write(f"uncaught exception at {datetime.now().isoformat()}\n")
+                fh.writelines(traceback.format_exception(exc_type, exc_value, exc_tb))
+                fh.write("\n")
+        except OSError:
+            pass
+        real_excepthook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
 
 
 _APPLICATIONS = {
@@ -66,6 +117,14 @@ def run_application(name: str, argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Must run before importing any application module: those modules touch
+    # sys.stdout/sys.stderr at import time.
+    _fixup_stdio()
+    _install_crash_log()
+    # Required so multiprocessing children bootstrap correctly when the app is
+    # packaged (PyInstaller); the child re-executes this file, so let it be
+    # intercepted here before any GUI module is imported.
+    multiprocessing.freeze_support()
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in _APPLICATIONS:
         return run_application(args[0], args[1:])

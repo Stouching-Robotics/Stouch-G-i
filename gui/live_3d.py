@@ -100,6 +100,9 @@ VIEW3D_CONFIG_PATH = PROJECT_ROOT / "config" / "view_config_3d.json"
 N_HANDS, N_KPTS = 2, 21
 W, H = 1280, 720
 FOV_DEG = 50.0                                   # vertical field of view
+# How far the fixed 2D tactile overlay may be scaled: the keyboard steps and
+# the drag-to-resize handles both stay inside this range.
+TACTILE_SCALE_MIN, TACTILE_SCALE_MAX = 0.3, 2.0
 
 # 21-point skeleton bones + groups: 0 thumb 1 index 2 middle 3 ring 4 pinky 5 metacarpal
 BONES = [
@@ -833,10 +836,12 @@ class Live3DViewer:
             self._redraw_requested = True
         elif key == ord("["):
             # Shrink the tactile overlay (fixed 2D, does not affect the 3D view)
-            self.tactile_scale = max(0.3, round(self.tactile_scale - 0.1, 1))
+            self.tactile_scale = max(
+                TACTILE_SCALE_MIN, round(self.tactile_scale - 0.1, 1))
             self._redraw_requested = True
         elif key == ord("]"):
-            self.tactile_scale = min(2.0, round(self.tactile_scale + 0.1, 1))
+            self.tactile_scale = min(
+                TACTILE_SCALE_MAX, round(self.tactile_scale + 0.1, 1))
             self._redraw_requested = True
         elif key == ord("r"):
             self._view_control_reset()

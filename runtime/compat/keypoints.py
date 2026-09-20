@@ -1,6 +1,6 @@
 """runtime.compat.keypoints — 公开的 21 个手部关键点接口（纯源码，不加密）。
 
-这是明文程序与**加密的 FK 解算核心**（``glove_fk``）之间的唯一闸口：
+这是明文程序与**加密的 FK 解算核心**之间的唯一闸口：
   - :func:`create_solver` 构造 16 IMU → 21 关键点的解算器（内部调用加密核心）；
   - :class:`KeypointSolver` 对外公开与解算器一致的接口（``neutral_joints`` /
     ``solve``），消费方无需感知核心是否加密。
@@ -47,7 +47,7 @@ class KeypointSolver:
         self._solver = solver
         self.backend = dict(backend)
 
-    # -- 与 DirectKinematics21Solver 一致的公开接口 -------------------------
+    # -- 与底层求解器一致的公开接口（Glove21SolverLite / UncalibratedGlove21Solver）
     def neutral_joints(self) -> np.ndarray:
         """中性姿态 21 点（(21, 3) float32）。"""
         return self._solver.neutral_joints()
@@ -60,11 +60,6 @@ class KeypointSolver:
     @property
     def side(self) -> str:
         return self._solver.side
-
-    @property
-    def fitted_direct(self) -> bool:
-        """是否使用拟合后的 direct-FK 校准链。"""
-        return bool(getattr(self._solver, "_fitted_direct", False))
 
     def solve(
         self,
@@ -110,13 +105,14 @@ def uncalibrated_solver(
     side: str,
     geometry_path,
 ) -> tuple[KeypointSolver, dict[str, Any]]:
-    """无标定诊断回退：首帧捕获 base，仅用于预览。"""
-    from algorithm.fk.kinematics import UncalibratedDirectKinematics21Solver
-    solver = UncalibratedDirectKinematics21Solver(side, geometry_path)
+    """无标定诊断回退：首帧捕获 base 的 MANO 中性预览，仅用于诊断。"""
+    from algorithm.lite.uncalibrated import UncalibratedGlove21Solver
+    solver = UncalibratedGlove21Solver(side)
     backend = {
-        "backend": "direct_fk",
-        "local_only": False,
-        "pinky_extra_length_mm": 0.0,
+        "backend": "uncalibrated_mano",
+        "local_only": True,
+        "pinky_extra_length_mm": 2.0,
+        "hand_model_required": True,
     }
     return KeypointSolver(solver, backend), backend
 

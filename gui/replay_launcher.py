@@ -163,7 +163,10 @@ def run(data_root: Path | None = None) -> int:
 
     dialog = QDialog()
     dialog.setWindowTitle("Glove Replay 回放渲染")
-    dialog.setMinimumSize(900, 620)
+    # The log already absorbs spare space; permit a standard laptop window and
+    # let the layouts reflow instead of placing the lower action/status area
+    # outside the visible work area.
+    dialog.setMinimumSize(640, 480)
 
     layout = QVBoxLayout(dialog)
     intro = QLabel("选择录制会话,点击“开始渲染”生成 MP4 视频。")

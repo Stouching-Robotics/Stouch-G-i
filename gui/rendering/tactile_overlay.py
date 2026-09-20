@@ -11,6 +11,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from glove_io.pressure_linear_fit import fit_finger_force_matrix
 from gui.rendering.tactile import HAND_REGIONS_LEFT, HAND_REGIONS_RIGHT
 
 
@@ -62,6 +63,14 @@ _PRESSURE_BANDS_RAW = (
     (3600, (22, 115, 249)),         # #f97316 orange
     (float("inf"), (68, 68, 239)),  # #ef4444 red, no upper limit
 )
+_PRESSURE_BANDS_FORCE_N = (
+    (1.0, (95, 58, 30)),
+    (2.0, (199, 134, 22)),
+    (3.0, (94, 197, 34)),
+    (4.0, (21, 204, 250)),
+    (5.0, (22, 115, 249)),
+    (float("inf"), (68, 68, 239)),
+)
 
 
 def _band_colors(values: np.ndarray, bands: tuple) -> np.ndarray:
@@ -75,7 +84,11 @@ def _band_colors(values: np.ndarray, bands: tuple) -> np.ndarray:
 
 _CARD_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 _CARD_CACHE_MAX = 8
+# Held to a few entries for the same reason as the card cache, and one more:
+# dragging a card to size walks it through every cell on the way, so an
+# uncapped cache would keep a full-size template for each step of the drag.
 _TEMPLATE_CACHE: dict[tuple[str, int], tuple] = {}
+_TEMPLATE_CACHE_MAX = 8
 _CARD_HEADER = 34
 _CARD_PAD_X = 10
 _CARD_PAD_TOP = 6
@@ -84,6 +97,239 @@ _REGION_LABEL_HEIGHT = 17
 _X_TICK_HEIGHT = 14
 _CARD_FOOTER = 21
 _CARD_BOTTOM_MARGIN = 60
+
+# Cell size at the viewer's default tactile scale (0.6).  The pixel constants
+# above and the glyph sizes below are all tuned for a 21 px cell, so a card
+# built at that size is unchanged; ``_ui_factor`` scales them for the larger
+# cells the viewer reaches by growing the scale, keeping a grown card in
+# proportion instead of leaving a small header and small digits in a big grid.
+_CARD_CELL_AT_DEFAULT_SCALE = 28.0
+_CARD_CELL_TUNED_FOR = 21.0
+# Below this the per-cell numbers stop being legible, so it is a hard floor even
+# when the frame is too small to honour it.
+_CARD_CELL_MIN = 11
+# Placement of the two cards: outer margin (``x0`` in the overlay), the gap kept
+# between them, and the breathing room left above them.
+_CARD_EDGE_MARGIN = 12
+_CARD_CENTER_GAP = 24
+_CARD_TOP_MARGIN = 8
+# The drag handle painted beside each card's inner top corner: its size, the
+# gap left to the card, and how far past the painted square the cursor may
+# land and still grab it (an 18 px target is small on a scaled-down canvas).
+# The handle sits outside the card because the inside of that corner holds the
+# side badge or the peak reading, and every cell of the map is data.
+_CARD_GRIP = 18
+_CARD_GRIP_GAP = 4
+_CARD_GRIP_SLOP = 7
+
+
+def _ui_factor(cell: int) -> float:
+    """Scale pixel constants and glyph sizes for a card built at ``cell``."""
+
+    return max(1.0, float(cell) / _CARD_CELL_TUNED_FOR)
+
+
+def _card_size(cell: int) -> tuple[int, int]:
+    """Pixel size of a card built at ``cell``, mirroring the template's math.
+
+    This must equal the shape of what ``_render_card`` returns for the same
+    cell -- the resize handles are placed from this function alone, without
+    rendering a card first, so a drift here would put the handle off the card.
+    """
+
+    ui = _ui_factor(cell)
+    pad_x = int(round(_CARD_PAD_X * ui))
+    width = 2 * pad_x + int(round(_AXIS_LEFT * ui)) + _GRID_COLS * cell
+    height = (int(round(_CARD_HEADER * ui)) + int(round(_CARD_PAD_TOP * ui))
+              + int(round(_REGION_LABEL_HEIGHT * ui))
+              + int(round(_X_TICK_HEIGHT * ui))
+              + _GRID_ROWS * cell + int(round(_CARD_FOOTER * ui)))
+    return width, height
+
+
+def _card_fits(cell: int, frame_shape) -> bool:
+    """Whether the two cards both stay on frame at this cell size.
+
+    The cards sit in the lower corners, so the limit is that they fit side by
+    side with a gap between them -- and inside the frame's height.  Anything
+    larger would push a card off screen or onto its twin.
+    """
+
+    height, width = frame_shape[:2]
+    card_w, card_h = _card_size(cell)
+    return (2 * card_w + 2 * _CARD_EDGE_MARGIN + _CARD_CENTER_GAP <= width
+            and card_h + _CARD_BOTTOM_MARGIN + _CARD_TOP_MARGIN <= height)
+
+
+def _cell_for_scale(scale: float) -> int:
+    """The cell size a scale asks for, before the frame gets a say."""
+
+    shown_scale = min(max(float(scale), 0.1), 2.0)
+    return int(round(_CARD_CELL_AT_DEFAULT_SCALE * shown_scale / 0.6))
+
+
+def _scale_for_cell(cell: int) -> float:
+    """The scale that draws the cards at ``cell`` -- ``_cell_for_scale`` inverted."""
+
+    return float(cell) * 0.6 / _CARD_CELL_AT_DEFAULT_SCALE
+
+
+def _card_cell(scale: float, frame_shape) -> int:
+    """Cell size in pixels for one card, clamped so both cards stay on frame."""
+
+    requested = _cell_for_scale(scale)
+    for cell in range(max(_CARD_CELL_MIN, requested), _CARD_CELL_MIN - 1, -1):
+        if _card_fits(cell, frame_shape):
+            return cell
+    return _CARD_CELL_MIN
+
+
+def tactile_cell_span(frame_shape) -> tuple[int, int]:
+    """The smallest and largest cell size the cards can be drawn at here.
+
+    Below the floor the per-cell numbers stop being legible, and above the
+    ceiling a card no longer fits beside its twin or within the frame's height
+    -- so on a 1280x720 canvas a card grows only about a quarter larger than
+    the default before it is against the frame, whatever size is asked for.
+    """
+
+    height, width = frame_shape[:2]
+    ceiling = min(width // _GRID_COLS, height // _GRID_ROWS)
+    for cell in range(max(_CARD_CELL_MIN, ceiling), _CARD_CELL_MIN - 1, -1):
+        if _card_fits(cell, frame_shape):
+            return _CARD_CELL_MIN, cell
+    return _CARD_CELL_MIN, _CARD_CELL_MIN
+
+
+def tactile_cell_for_scale(scale: float, frame_shape) -> int:
+    """The cell size the cards are drawn at for ``scale`` on this frame."""
+
+    return _card_cell(scale, frame_shape)
+
+
+def tactile_scale_for_cell(cell: int, frame_shape) -> float:
+    """The ``scale`` that draws the cards at ``cell``, held to what fits.
+
+    ``scale`` is the only size the rest of the viewer carries, so a resize
+    that wants a particular cell size has to express it as one.
+    """
+
+    smallest, largest = tactile_cell_span(frame_shape)
+    return _scale_for_cell(min(max(int(cell), smallest), largest))
+
+
+def _place_card(
+        frame_shape, side: str, card_w: int, card_h: int
+) -> tuple[int, int, int, int]:
+    """Where a card of this size lands: ``(x0, y0, x1, y1)`` in frame pixels.
+
+    The two cards are anchored to the bottom corners, so the left one grows
+    to the right and the right one to the left when the card gets bigger.
+    """
+
+    height, width = frame_shape[:2]
+    x0 = (_CARD_EDGE_MARGIN if side == "left"
+          else width - card_w - _CARD_EDGE_MARGIN)
+    y0 = height - _CARD_BOTTOM_MARGIN - card_h
+    return x0, y0, x0 + card_w, y0 + card_h
+
+
+def _grip_rect(card_rect, side: str) -> tuple[int, int, int, int]:
+    """The resize handle's box, beside a card's inner top corner.
+
+    "Inner" is the corner facing the middle of the frame -- the left card's
+    top-right, the right card's top-left -- because that is the edge the card
+    moves when it is resized.  The handle sits just clear of the card rather
+    than on it: the inside of that corner carries the side badge or the peak
+    reading, and the rest of the header is labels.
+    """
+
+    x0, y0, x1, _ = card_rect
+    left = (x1 + _CARD_GRIP_GAP if side == "left"
+            else x0 - _CARD_GRIP_GAP - _CARD_GRIP)
+    return left, y0, left + _CARD_GRIP, y0 + _CARD_GRIP
+
+
+def _drawable_sides(tactile_frames) -> tuple[str, ...]:
+    """The sides the overlay will actually paint a card for."""
+
+    drawable = []
+    for side in _SIDES:
+        value = tactile_frames.get(side)
+        if value is None:
+            continue
+        frame = np.asarray(value, dtype=np.float32).reshape(16, 16)
+        if np.isfinite(frame).any():
+            drawable.append(side)
+    return tuple(drawable)
+
+
+def tactile_card_rects(
+        frame_shape, tactile_frames, scale: float
+) -> dict[str, tuple[int, int, int, int]]:
+    """The box each card occupies right now, keyed by side.
+
+    Computed from the same size and placement math the renderer uses, so a
+    caller can hit-test without drawing a frame first.  A side with no card
+    drawn gets no entry: there is nothing on screen there.
+    """
+
+    cell = _card_cell(scale, frame_shape)
+    card_w, card_h = _card_size(cell)
+    return {
+        side: _place_card(frame_shape, side, card_w, card_h)
+        for side in _drawable_sides(tactile_frames)
+    }
+
+
+def tactile_grip_rects(
+        frame_shape, tactile_frames, scale: float
+) -> dict[str, tuple[int, int, int, int]]:
+    """The resize handles on screen right now, keyed by side.
+
+    These are the boxes ``draw_bimanual_tactile_overlay`` paints, widened by
+    ``_CARD_GRIP_SLOP`` so the cursor does not have to land on the last pixel.
+    """
+
+    # Rect coordinates are inclusive at both ends, so the left handle's reach
+    # stops one pixel short of the middle and the right one begins on it.
+    midpoint = frame_shape[1] // 2
+    handles = {}
+    for side, card_rect in tactile_card_rects(
+            frame_shape, tactile_frames, scale).items():
+        x0, y0, x1, y1 = _grip_rect(card_rect, side)
+        hit = [x0 - _CARD_GRIP_SLOP, y0 - _CARD_GRIP_SLOP,
+               x1 + _CARD_GRIP_SLOP, y1 + _CARD_GRIP_SLOP]
+        # The hit box may reach past the painted square, but not across the
+        # middle of the frame: at the largest card size the two would
+        # otherwise overlap, and a press has to land on one handle, not two.
+        if side == "left":
+            hit[2] = min(hit[2], midpoint - 1)
+        else:
+            hit[0] = max(hit[0], midpoint)
+        handles[side] = tuple(hit)
+    return handles
+
+
+def _draw_resize_grip(img: np.ndarray, side: str, card_rect) -> None:
+    """Paint the drag handle into a card's inner top corner.
+
+    A double-headed diagonal, aimed the way the corner actually travels: the
+    left card's inner corner moves right and up, the right card's moves left
+    and up.
+    """
+
+    x0, y0, x1, y1 = _grip_rect(card_rect, side)
+    accent = (240, 201, 76) if side == "left" else (84, 180, 255)
+    cv2.rectangle(img, (x0, y0), (x1, y1), (38, 31, 26), -1)
+    cv2.rectangle(img, (x0, y0), (x1, y1), accent, 1, cv2.LINE_AA)
+    if side == "left":
+        near, far = (x0 + 5, y1 - 5), (x1 - 5, y0 + 5)
+    else:
+        near, far = (x1 - 5, y1 - 5), (x0 + 5, y0 + 5)
+    middle = ((near[0] + far[0]) // 2, (near[1] + far[1]) // 2)
+    cv2.arrowedLine(img, middle, far, accent, 1, cv2.LINE_AA, tipLength=0.4)
+    cv2.arrowedLine(img, middle, near, accent, 1, cv2.LINE_AA, tipLength=0.4)
 
 
 def _display_matrix(values: np.ndarray, side: str) -> np.ndarray:
@@ -238,7 +484,8 @@ def _draw_cell_values(
         cell_colors: np.ndarray,
         grid_x: int,
         grid_y: int,
-        cell: int) -> None:
+        cell: int,
+        linear_fitted: bool = False) -> None:
     """Draw every mapped sensor value with size and contrast adaptation.
 
     Digits are baked once into small cached tiles and blitted as plain uint8
@@ -246,8 +493,12 @@ def _draw_cell_values(
     dominated the budget when the matrix and the full-hand mesh were shown."""
     for row in range(_GRID_ROWS):
         for col in range(_GRID_COLS):
-            label = str(int(round(float(displayed[row, col]))))
-            scale = 0.45 if cell >= 18 else 0.36
+            if linear_fitted:
+                label = (f"{float(displayed[row, col]):.2f}"
+                         if row < 4 else "--")
+            else:
+                label = str(int(round(float(displayed[row, col]))))
+            scale = (0.45 if cell >= 18 else 0.36) * _ui_factor(cell)
             (width, height), _ = cv2.getTextSize(label, _GLYPH_FONT, scale, 1)
             available = max(5, cell - 2)
             if width > available:
@@ -278,12 +529,21 @@ def _render_card_template(side: str, cell: int) -> tuple:
     if cached is not None:
         return cached
 
+    ui = _ui_factor(cell)
+    pad_x = int(round(_CARD_PAD_X * ui))
+    pad_top = int(round(_CARD_PAD_TOP * ui))
+    axis_left = int(round(_AXIS_LEFT * ui))
+    header_h = int(round(_CARD_HEADER * ui))
+    region_label_h = int(round(_REGION_LABEL_HEIGHT * ui))
+    x_tick_h = int(round(_X_TICK_HEIGHT * ui))
+    footer_h = int(round(_CARD_FOOTER * ui))
+    small = (0.25 if cell < 16 else 0.30) * ui
+
     grid_w = _GRID_COLS * cell
     grid_h = _GRID_ROWS * cell
-    card_w = _CARD_PAD_X + _AXIS_LEFT + grid_w + _CARD_PAD_X
-    grid_y = (_CARD_HEADER + _CARD_PAD_TOP
-              + _REGION_LABEL_HEIGHT + _X_TICK_HEIGHT)
-    card_h = grid_y + grid_h + _CARD_FOOTER
+    card_w = pad_x + axis_left + grid_w + pad_x
+    grid_y = header_h + pad_top + region_label_h + x_tick_h
+    card_h = grid_y + grid_h + footer_h
 
     top = np.array((55, 34, 13), np.float32)
     bottom = np.array((30, 20, 9), np.float32)
@@ -293,37 +553,41 @@ def _render_card_template(side: str, cell: int) -> tuple:
     card[...] = rows[:, None, :]
 
     side_accent = (240, 201, 76) if side == "left" else (84, 180, 255)
-    badge_center = (18, 17)
-    cv2.circle(card, badge_center, 9, side_accent, -1, cv2.LINE_AA)
+    badge_center = (int(round(18 * ui)), int(round(17 * ui)))
+    cv2.circle(card, badge_center, int(round(9 * ui)), side_accent, -1,
+               cv2.LINE_AA)
     cv2.putText(
-        card, "L" if side == "left" else "R", (13, 21),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.39, (15, 29, 48), 1, cv2.LINE_AA)
+        card, "L" if side == "left" else "R",
+        (int(round(13 * ui)), int(round(21 * ui))),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.39 * ui, (15, 29, 48), 1, cv2.LINE_AA)
     cv2.putText(
         card, "LEFT PRESSURE MAP" if side == "left" else "RIGHT PRESSURE MAP",
-        (34, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+        (int(round(34 * ui)), int(round(23 * ui))),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.43 * ui,
         (255, 242, 234), 1, cv2.LINE_AA)
 
-    cv2.line(card, (10, 33), (card_w - 11, 33), (88, 61, 43), 1, cv2.LINE_AA)
+    cv2.line(card, (pad_x, header_h - 1), (card_w - pad_x - 1, header_h - 1),
+             (88, 61, 43), 1, cv2.LINE_AA)
     cv2.line(card, (13, 1), (card_w - 14, 1), side_accent, 2, cv2.LINE_AA)
 
-    grid_x = _CARD_PAD_X + _AXIS_LEFT
+    grid_x = pad_x + axis_left
     region_at, bounds = _REGION_LAYOUT[side]
 
     # The left and right hand orders are horizontal mirrors of one another.
     ordered_fingers = _FINGER_ORDER[side]
-    label_baseline = _CARD_HEADER + _CARD_PAD_TOP + 12
+    label_baseline = header_h + pad_top + int(round(12 * ui))
     for name in ordered_fingers:
         col0, _, col1, _ = bounds[name]
         center_x = grid_x + int(round((col0 + col1) * cell / 2.0))
         _centered_text(
             card, _FINGER_SHORT[name], center_x, label_baseline,
-            0.31 if cell >= 16 else 0.25, _REGION_BGR[name])
+            (0.31 if cell >= 16 else 0.25) * ui, _REGION_BGR[name])
 
-    tick_baseline = grid_y - 5
+    tick_baseline = grid_y - int(round(5 * ui))
     for col in range(_GRID_COLS):
         _centered_text(
             card, str(col + 1), grid_x + col * cell + cell // 2,
-            tick_baseline, 0.25 if cell < 16 else 0.30, (180, 166, 151))
+            tick_baseline, small, (180, 166, 151))
 
     # Draw only the 195 mapped cells; inactive raw-matrix rows/columns are not
     # part of this compact visual. Live colors are painted in one operation.
@@ -334,9 +598,8 @@ def _render_card_template(side: str, cell: int) -> tuple:
         y1 = y0 + cell
         axis_value = 15 - display_row
         _centered_text(
-            card, str(axis_value), grid_x - 13,
-            y0 + cell // 2 + 4, 0.25 if cell < 16 else 0.30,
-            (180, 166, 151))
+            card, str(axis_value), grid_x - int(round(13 * ui)),
+            y0 + cell // 2 + 4, small, (180, 166, 151))
         for display_col in range(_GRID_COLS):
             x0 = grid_x + display_col * cell
             x1 = x0 + cell
@@ -347,11 +610,11 @@ def _render_card_template(side: str, cell: int) -> tuple:
 
     _draw_region_outlines(card, grid_x, grid_y, cell, bounds)
 
-    footer_y = grid_y + grid_h + 15
+    footer_y = grid_y + grid_h + int(round(15 * ui))
     cv2.putText(
         card, "ACTIVE MAP 15 x 13  /  PALM 15 x 9",
         (grid_x, footer_y), cv2.FONT_HERSHEY_SIMPLEX,
-        0.31 if cell >= 16 else 0.25, (199, 174, 156), 1, cv2.LINE_AA)
+        (0.31 if cell >= 16 else 0.25) * ui, (199, 174, 156), 1, cv2.LINE_AA)
 
     mask = _rounded_card_mask(card_h, card_w)
     inner = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
@@ -363,6 +626,8 @@ def _render_card_template(side: str, cell: int) -> tuple:
     cell_interior[1:-1, 1:-1] = True
     paint_mask = np.kron(region_at != "", cell_interior)
     cached = (card, mask, paint_mask, grid_x, grid_y, bounds)
+    if len(_TEMPLATE_CACHE) >= _TEMPLATE_CACHE_MAX:
+        _TEMPLATE_CACHE.pop(next(iter(_TEMPLATE_CACHE)))
     _TEMPLATE_CACHE[cache_key] = cached
     return cached
 
@@ -370,15 +635,11 @@ def _render_card_template(side: str, cell: int) -> tuple:
 def _render_card(
         frame: np.ndarray,
         side: str,
-        scale: float,
-        bands: tuple) -> tuple[np.ndarray, np.ndarray]:
+        cell: int,
+        bands: tuple,
+        linear_fitted: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Render one compact 15x13 mapping card from sanitized pressure data."""
 
-    shown_scale = min(max(float(scale), 0.1), 0.7)
-    # At the application's default scale (0.6), 21 px keeps the per-cell numbers
-    # readable without covering too much of the 3D hand view. The ] key can
-    # still grow the cards further when needed.
-    cell = max(11, int(round(21.0 * shown_scale / 0.6)))
     template, mask, paint_mask, grid_x, grid_y, bounds = (
         _render_card_template(side, cell))
     card = template.copy()
@@ -395,14 +656,21 @@ def _render_card(
 
     # Repaint just six outlines so anti-aliased edges remain crisp at any heat.
     _draw_region_outlines(card, grid_x, grid_y, cell, bounds)
-    _draw_cell_values(card, displayed, cell_colors, grid_x, grid_y, cell)
+    _draw_cell_values(
+        card, displayed, cell_colors, grid_x, grid_y, cell,
+        linear_fitted=linear_fitted)
     if card.shape[1] >= 260:
-        peak_text = f"MAX {peak:.0f}"
+        ui = _ui_factor(cell)
+        peak_text = (f"MAX {peak:.2f} N" if linear_fitted
+                     else f"MAX {peak:.0f}")
+        peak_scale = 0.36 * ui
         (peak_w, _), _ = cv2.getTextSize(
-            peak_text, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
+            peak_text, cv2.FONT_HERSHEY_SIMPLEX, peak_scale, 1)
         cv2.putText(
-            card, peak_text, (card.shape[1] - peak_w - 11, 22),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (199, 174, 156), 1,
+            card, peak_text,
+            (card.shape[1] - peak_w - int(round(11 * ui)),
+             int(round(22 * ui))),
+            cv2.FONT_HERSHEY_SIMPLEX, peak_scale, (199, 174, 156), 1,
             cv2.LINE_AA)
     return card, mask
 
@@ -412,7 +680,8 @@ def draw_bimanual_tactile_overlay(
         tactile_frames: dict[str, np.ndarray | None],
         threshold: float = 0.0,
         scale: float = 0.6,
-        baseline_corrected: bool = True) -> np.ndarray:
+        baseline_corrected: bool = True,
+        linear_fitted: bool = False) -> np.ndarray:
     """Draw compact active-region pressure cards on a 1280x720 BGR frame.
 
     ``baseline_corrected`` selects the fixed colour scale: the corrected
@@ -420,37 +689,52 @@ def draw_bimanual_tactile_overlay(
     """
 
     bands = (
-        _PRESSURE_BANDS_CORRECTED if baseline_corrected
-        else _PRESSURE_BANDS_RAW)
-    for side in _SIDES:
-        value = tactile_frames.get(side)
-        if value is None:
-            continue
-        frame = np.asarray(value, dtype=np.float32).reshape(16, 16)
-        if not np.isfinite(frame).any():
-            continue
+        _PRESSURE_BANDS_FORCE_N
+        if linear_fitted
+        else (
+            _PRESSURE_BANDS_CORRECTED if baseline_corrected
+            else _PRESSURE_BANDS_RAW
+        )
+    )
+    for side in _drawable_sides(tactile_frames):
+        frame = np.asarray(
+            tactile_frames[side], dtype=np.float32).reshape(16, 16)
         frame = np.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
         if threshold > 0:
             frame = np.where(frame < float(threshold), 0.0, frame)
+        if linear_fitted:
+            frame = np.nan_to_num(
+                fit_finger_force_matrix(frame, side),
+                nan=0.0, posinf=0.0, neginf=0.0)
 
-        cache_key = (side, frame.tobytes(), float(threshold), float(scale),
-                     baseline_corrected)
+        # The cell size depends on the frame as well as on the scale, so the
+        # frame shape joins the cache key: the same scale on a smaller canvas
+        # would otherwise reuse a card too wide for it.
+        cell = _card_cell(scale, img.shape)
+        cache_key = (side, frame.tobytes(), float(threshold), cell,
+                     baseline_corrected, linear_fitted)
         cached = _CARD_CACHE.get(cache_key)
         if cached is None:
-            cached = _render_card(frame, side, scale, bands)
+            cached = _render_card(
+                frame, side, cell, bands, linear_fitted=linear_fitted)
             if len(_CARD_CACHE) >= _CARD_CACHE_MAX:
                 _CARD_CACHE.pop(next(iter(_CARD_CACHE)))
             _CARD_CACHE[cache_key] = cached
         card, mask = cached
 
         card_h, card_w = card.shape[:2]
-        x0 = 12 if side == "left" else img.shape[1] - card_w - 12
-        y0 = img.shape[0] - _CARD_BOTTOM_MARGIN - card_h
+        card_rect = _place_card(img.shape, side, card_w, card_h)
+        x0, y0, _, _ = card_rect
         roi = img[y0:y0 + card_h, x0:x0 + card_w]
         # The reference uses opaque navy panels. OpenCV's masked copy keeps the
         # rounded corners while avoiding two full-frame float conversions.
         cv2.copyTo(card, mask, roi)
+        _draw_resize_grip(img, side, card_rect)
     return img
 
 
-__all__ = ["draw_bimanual_tactile_overlay"]
+__all__ = [
+    "draw_bimanual_tactile_overlay", "tactile_card_rects",
+    "tactile_cell_for_scale", "tactile_cell_span", "tactile_grip_rects",
+    "tactile_scale_for_cell",
+]

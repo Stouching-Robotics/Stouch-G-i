@@ -127,7 +127,9 @@ def select_calibration_files(
 
     dialog = QDialog()
     dialog.setWindowTitle(f"{title} V{APP_VERSION}")
-    dialog.setMinimumWidth(760)
+    # The fields can shrink and their labels wrap, so avoid forcing a wide
+    # desktop-only dialog on 1366px laptops or split-screen use.
+    dialog.setMinimumWidth(520)
 
     root = QVBoxLayout(dialog)
     intro = QLabel("Choose calibration JSON before opening the live viewer.")

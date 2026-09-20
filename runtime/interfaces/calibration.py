@@ -16,6 +16,9 @@ class ImuCalibrator:
                  registry: Path | str | None = None,
                  config: Path | str | None = None,
                  startup_timeout: float = 30.0):
+        # Calibration reads IMU, tactile and status frames only; the type-0x05
+        # magnetometer telemetry is not consumed here and :meth:`connect` never
+        # waits for it.  The live viewer's own receiver is what caches 0x05.
         self._impl = _Engine(
             side, serial_port, registry, config, startup_timeout)
 

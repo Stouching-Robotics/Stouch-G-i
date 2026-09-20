@@ -46,7 +46,7 @@ from common.types import (
     TactileFrame,
 )
 
-__version__ = "2.0.2"
+__version__ = "2.0.6"
 
 
 def get_version() -> str:
