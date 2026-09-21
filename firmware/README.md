@@ -2,8 +2,29 @@
 
 本 SDK 对接的硬件:STM32 灵巧手,16×BNO055 IMU + 16×16 触觉压力矩阵 → CH9438 → USB CDC。
 
-当前固件版本: **v1.2.11**
+当前固件版本: **v1.2.14**
 
+> v1.2.14 变更: **帧结构与 v1.2.13 一致,上位机无需同步改动。**
+>   - 矩阵采集改为 DMA 完成中断里接力（一行内 4 次转换背靠背）,矩阵稳定 60Hz（此前 55Hz）。
+>   - 开机改为 100ms 上电窗口 + 缺路抢答重试两轮,慢的通道交给运行期重试。
+>   - 恢复判据补齐: 只有帧头和数据都干净才清重初始化计数,避免"帧头正常但数据全 0"的通道被误判成恢复。
+>   - CH9438 寄存器访问按手册 8.7 加 3µs 间隔;清 FIFO 改为有界,运行期不再 Delay。
+>   - 新增 `ch9438_read_fifo_counted()`,省掉每路重复数 FIFO 的 SPI 事务。
+>   - `0x01` 状态帧回到 **3 行**: `9438=<掩码>` / `055=<4位hex掩码>` / ADC `OK|FAILED`。
+> v1.2.13 变更: **帧结构有改动，上位机需要同步。**
+>   - 新增 `0x05` 磁力计帧: `valid_mask` 2B + 16 路 `CALIB_STAT` = 18B, 0.5Hz, 顺序为**物理 IMU 0..15**（`0x02` 是关节序, 下标含义不同）。bit i = 本 2 秒窗口内读到过第 i 路。判磁力计只看 `CALIB_STAT & 0x03`（`bit[1:0]`=MAG, `[3:2]`=ACC, `[5:4]`=GYR, `[7:6]`=SYS）。标定等级搭在四元数读命令里顺带取回, 磁力计不再单独占用 UART。
+>   - `seq` 不再借用 bit15: 恢复为完整 16 位序号, 磁力计就绪状态改由 `0x05` 帧表达。SDK 侧 `common/usb_cdc.py` 的 `SEQUENCE_COUNTER_MASK = 0x7FFF` / `MAGNETOMETER_NOT_READY_BIT = 0x8000` 若还在用需去掉, 丢帧间隔改用 `(seq - prev) & 0xFFFF`。
+>   - 开机 `0x01` 状态帧改为**定长 4 行**, 新增 `ini=<第一轮就绪>,<补完最终>,<读不到CHIP_ID的通道>`（三处 4 位 hex）。
+>   - 修复冷启动时 IMU 初始化的缺陷: `bno055_init` 不再因"当前模式已是 NDOF"跳过配置（芯片刚上电时会读到 NDOF 但融合未启动, 导致该路被判失败且无人重新初始化, 一路永久消失）; 开机顺序改为 700ms 上电窗口 → 读 CHIP_ID → 统一软复位 + 650ms → 并行初始化 → 缺的通道补两轮。
+>   - 修复"全 0 四元数被当成有效帧": BNO055 未配置时仍会回帧头正确、数据全 0 的响应, 旧判据只看帧头, 该路因此永不累计失败、永不触发重初始化。现在按 norm² 校验数据有效性。
+>   - 下线通道不再永久拉黑, 每 30 秒放回复活重试。
+>   - 开机时间: 正常约 3 秒, 需要补轮时约 4 秒。
+> v1.2.12 变更: 消除冗余代码、整理项目结构、消除隐患代码。**帧结构与 v1.2.11 完全一致,上位机无需同步改动。**
+>   - 修复 bootloader **缺失中断服务函数**（`SysTick_Handler` / `USB_LP_IRQHandler`）的隐患:此前重新编译出的 bootloader 会因中断向量落到 `Default_Handler`(`b .`) 而完全无法枚举。出厂镜像不受影响,已发布的重编镜像必须更新。bootloader 21028 → 19700 B。
+>   - 删除 `printf` 空宏与其全部 19 处死打印,链接选项去掉 `-u _printf_float`:APP Flash 50964 → **36800 B**,CCMRAM 8048 → 6188 B。
+>   - 开机 `0x01` 状态帧改为**定长 3 行**:`9438=<掩码>` / `055=<4 位 hex 掩码>` / ADC `OK|FAILED`;逐路 BNO055 明细与 CH9438 版本行移除（哪一路无效由每帧 `0x02` 的 `valid_mask` 表达,开机未起来的看 `055` 掩码的 0 位,版本由帧头 3B 携带）。
+>   - 源码按功能域重组为 `Core/{Inc,Src}/{Board,Imu,Matrix,Usb,System}`,`main.c` 只保留 `main()` 与中断服务函数;各外设 MSP 下放到所属模块。
+>   - 实测:矩阵流稳定 60.00 Hz;ping 往返 184~359 µs(亚毫秒)。
 > v1.2.11 变更: 增加 ping 延迟测量；main.c 重构；手模式两按钮。
 > v1.2.10 变更: 帧结构瘦身（去除无效带宽占用）；标定程序自动识别左右手；dongle 重启按钮。
 > v1.2.8 变更: 修复 IMU 掉线重初始化退避不符合设计的 bug；进一步降低开机时间（实测约 2.2 秒）。
@@ -17,28 +38,34 @@
 > v1.2.0 变更: 降低开机时间、工作状态绿灯改为呼吸灯。bootloader 内容与版本未修改。
 > v1.1.1 变更: 消除偶发性大范围 IMU 丢包(BNO055 BUS_OVER_RUN 重试时序)、移除蓝牙 BLE/SPP 模块以降低 RAM 占用。
 
-固件为 OTA 双区设计,分两个镜像独立烧录:
-
-> 本仓库只分发原始 `.bin` 镜像,不分发 Intel HEX。用 STM32CubeProgrammer 等工具烧录 `.bin` 时,
-> 手动填写下表中的起始地址即可,与 `.hex` 烧录等效。
+固件为 OTA 双区设计,分两个 `.bin` 裸镜像独立烧录（`.bin` 不含地址信息,**烧录时必须带基地址**):
 
 | 文件 | 烧录地址 | 说明 |
 |---|---|---|
 | `bootloader.bin` | `0x08000000` (32KB) | Bootloader,出厂烧一次、运行期不擦,负责 OTA 升级 APP |
-| `stm32_demostm32_imu_usb_left.bin` | `0x08008000` (96KB) | APP 固件（左手序）,特征字符串 `IMU_USB` |
-| `stm32_demostm32_imu_usb_right.bin` | `0x08008000` (96KB) | APP 固件（右手序）,特征字符串 `IMU_USB` |
+| `stm32_imu_usb_left.bin` | `0x08008000` (96KB) | APP 固件（左手序）,特征字符串 `IMU_USB` |
+| `stm32_imu_usb_right.bin` | `0x08008000` (96KB) | APP 固件（右手序）,特征字符串 `IMU_USB` |
 
-左右手 APP 均为 **v1.2.11**,固件版本串分别为 `1.2.111`(左手) 与 `1.2.112`(右手)。
+左右手由编译期宏 `HAND_LEFT`/`HAND_RIGHT` 决定,帧头第 3 个版本字节 = `patch×10 + 手型码`(左手 141 / 右手 142),主机据此区分左右手。
 
 ## 烧录顺序
 
 1. 先烧 `bootloader.bin`(地址 `0x08000000`)
-2. 再烧对应手的 APP：`stm32_demostm32_imu_usb_left.bin` 或 `stm32_demostm32_imu_usb_right.bin`(地址 `0x08008000`)
+2. 再烧对应手的 APP：`stm32_imu_usb_left.bin` 或 `stm32_imu_usb_right.bin`(地址 `0x08008000`)
+
+参考命令(DAP / pyOCD;ST-Link 用 `STM32_Programmer_CLI -c port=SWD -w <bin> <addr> -v -rst`):
+
+```bash
+pyocd flash --pack tools/packs/Keil.STM32G4xx_DFP.2.2.0.pack -t stm32g431rbtx \
+    --base-address 0x08008000 stm32_imu_usb_right.bin
+```
 
 > 若设备出厂已烧好 bootloader,只需烧 APP 即可。
+> APP 区(96KB,`0x08008000`~`0x0801FFFF`)也可用 OTA 升级(`ota_upgrade.py`),无需拆机。
 > 本 SDK 的 `glove_io/usb_protocol.py` 按 VID `0483` / PID `5740` 对接 APP 固件。
 
 ## 归档
 
-- **BLE 无线传输变体**(特征字符串 `MATRIX_BLE`) — 同一硬件平台的变体。SDK 代码只对接 USB CDC,
-  不使用该版本,故未随包分发。如需请联系技术支持。
+- **`archive/stm32_demostm32_matrix_ble.hex`** — 同一硬件平台的 BLE 无线传输变体
+  (特征字符串 `MATRIX_BLE`)。SDK 代码只对接 USB CDC,不使用该版本。
+  该文件**不随发布包分发**(发布包的 `firmware/` 只含 `.bin`),仅留在源码树备查。

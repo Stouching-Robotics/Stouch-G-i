@@ -46,7 +46,7 @@ from common.types import (
     TactileFrame,
 )
 
-__version__ = "2.0.6"
+__version__ = "2.0.7"
 
 
 def get_version() -> str:
@@ -66,21 +66,21 @@ _INTERFACE_NAMES = (
     "RecordingReplay",
 )
 _INTERFACE_MODULES = {
-    "RawImuStream": "runtime.interfaces.sensors",
-    "SensorStream": "runtime.interfaces.sensors",
-    "TactileStream": "runtime.interfaces.sensors",
-    "DeviceManager": "runtime.interfaces.device",
-    "HandSolver": "runtime.interfaces.solver",
-    "Glove": "runtime.interfaces.glove",
-    "BimanualGlove": "runtime.interfaces.bimanual",
-    "ImuCalibrator": "runtime.interfaces.calibration",
-    "RecordingReplay": "runtime.interfaces.replay",
+    "RawImuStream": "sdk.interfaces.sensors",
+    "SensorStream": "sdk.interfaces.sensors",
+    "TactileStream": "sdk.interfaces.sensors",
+    "DeviceManager": "sdk.interfaces.device",
+    "HandSolver": "sdk.interfaces.solver",
+    "Glove": "sdk.interfaces.glove",
+    "BimanualGlove": "sdk.interfaces.bimanual",
+    "ImuCalibrator": "sdk.interfaces.calibration",
+    "RecordingReplay": "sdk.interfaces.replay",
 }
 _LEGACY_STREAM_NAMES = {
-    "ImuStream": ("runtime.compat.imu", "ImuStream"),
-    "PhysicalFrame": ("runtime.compat.imu", "PhysicalFrame"),
-    "StreamImuFrame": ("runtime.compat.imu", "ImuFrame"),
-    "StreamTactileFrame": ("runtime.compat.tactile", "TactileFrame"),
+    "ImuStream": ("sdk.compat.imu", "ImuStream"),
+    "PhysicalFrame": ("sdk.compat.imu", "PhysicalFrame"),
+    "StreamImuFrame": ("sdk.compat.imu", "ImuFrame"),
+    "StreamTactileFrame": ("sdk.compat.tactile", "TactileFrame"),
 }
 _DEPRECATED_KEYPOINT_NAMES = {
     "KeypointsFrame",
@@ -125,10 +125,10 @@ def __getattr__(name: str):
         import warnings
         warnings.warn(
             f"runtime.{name} is deprecated; use "
-            f"runtime.compat.keypoints.{name}",
+            f"sdk.compat.keypoints.{name}",
             DeprecationWarning,
             stacklevel=2,
         )
-        from runtime.compat import keypoints
+        from sdk.compat import keypoints
         return getattr(keypoints, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

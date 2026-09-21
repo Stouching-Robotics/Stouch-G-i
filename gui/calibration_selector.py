@@ -60,7 +60,10 @@ def discover_calibration_files(directory: Path, side: str) -> list[Path]:
 
 
 def _label(path: Path) -> str:
-    modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, ValueError, OverflowError):
+        modified = "?"
     return f"{path.name}    [{modified}]"
 
 

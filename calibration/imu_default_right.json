@@ -25,7 +25,7 @@
   ],
   "usb_vid": 1155,
   "usb_pid": 22336,
-  "usb_serial": "206C376F3032",
+  "usb_serial": "",
   "fps": 80,
   "param_inst_calib": {
     "metadata": {

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from runtime.glove import GloveEngine as _Engine
+from sdk.glove import GloveEngine as _Engine
 from common.types import (
     DeviceHealth, GloveConfig, HandFrame,
     RecordingResult, RecordingStatus)

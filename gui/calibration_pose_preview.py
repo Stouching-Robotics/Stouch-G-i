@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from algorithm.lite.hand import HandNumpy
+from algorithm.lite.hand import AxisLayerFKNumPy, HandNumpy
 from gui.glove_21_live_3d import (
     Camera,
     align_left_to_right_reference,
@@ -34,15 +34,27 @@ else:
     BUNDLE_ROOT = PROJECT_ROOT = _sdk_root(Path(__file__).resolve().parent)
 PREVIEW_WIDTH = 660
 PREVIEW_HEIGHT = 300
+# Approved static demo images for the fist calibration steps (rendered with
+# the axis-layer fist pose: four fingers curled, thumb fully extended).
+# The fist steps display these instead of the runtime render so the demo is
+# pixel-identical everywhere; the dynamic renderer stays as fallback.
+_FIST_STATIC_DIR = BUNDLE_ROOT / "assets" / "calibration_previews"
 _CONTACT_NAMES = ("index", "middle", "ring", "little")
-# Fist preview: four-finger flexion in degrees (MANO pose order 0..12; thumb
-# 13..15 stays relaxed).  Bend is positive flexion along the anatomy Z axis,
-# matching the runtime's ``as_euler("XYZ")`` bend convention.
-_FIST_BENDS = {
-    1: 90.0, 2: 100.0, 3: 80.0,     # index MCP/PIP/DIP
-    4: 90.0, 5: 100.0, 6: 80.0,     # middle
-    7: 90.0, 8: 100.0, 9: 80.0,     # little
-    10: 90.0, 11: 100.0, 12: 80.0,  # ring
+# Fist preview: four-finger flexion expressed as anatomy-aligned Euler angles
+# (twist X, spread Y, bend Z in degrees, MANO pose order 0..12; thumb 13..15
+# stays relaxed).  The angles are converted to MANO rotvecs through
+# ``AxisLayerFKNumPy.compose`` so bend is positive flexion along each joint's
+# anatomy Z axis, matching the runtime's ``as_euler("XYZ")`` bend convention
+# (bending directly about the MANO-local Z gives each finger a different,
+# unnatural curl direction).  MCP ~80 / PIP ~100 / DIP ~60 deg with a slight
+# proximal spread reads as a natural relaxed fist.
+_FIST_EE_DEG = {
+    1: (0.0, 2.0, 80.0), 2: (0.0, 0.0, 100.0), 3: (0.0, 0.0, 62.0),   # index
+    4: (0.0, 0.0, 82.0), 5: (0.0, 0.0, 100.0), 6: (0.0, 0.0, 62.0),   # middle
+    7: (0.0, -2.0, 84.0), 8: (0.0, 0.0, 102.0), 9: (0.0, 0.0, 64.0),  # little
+    10: (0.0, 0.0, 82.0), 11: (0.0, 0.0, 100.0), 12: (0.0, 0.0, 62.0),  # ring
+    # Thumb fully extended straight alongside the curled fingers.
+    13: (0.0, 0.0, 0.0), 14: (0.0, 0.0, 0.0), 15: (0.0, 0.0, 0.0),
 }
 
 # The 21-point live 3D view uses yaw=270, elev=8 and roll=240 together with
@@ -504,12 +516,17 @@ class CalibrationPosePreview:
             }
 
     def _build_fist(self, side: str) -> tuple[np.ndarray, np.ndarray]:
-        """Curl the four fingers (thumb relaxed) into a fist preview pose."""
+        """Curl the four fingers (thumb relaxed) into a fist preview pose.
+
+        Anatomy-aligned Euler angles are composed into MANO rotvecs via the
+        axis layer so every finger flexes about its own anatomical bend axis.
+        """
         angles = np.zeros((16, 3), dtype=np.float64)
-        for joint, degrees in _FIST_BENDS.items():
-            angles[joint] = R.from_euler(
-                "XYZ", [0.0, 0.0, np.deg2rad(degrees)]).as_rotvec()
-        output = self._models[side].forward(angles)
+        for joint, degrees in _FIST_EE_DEG.items():
+            angles[joint] = np.deg2rad(degrees)
+        axis = AxisLayerFKNumPy(side=side, mano=self._models[side])
+        pose = axis.compose(angles)
+        output = self._models[side].forward(pose)
         return (
             self._align(side, output.joints),
             self._align_mesh(side, output.verts, output.joints[0]),
@@ -573,11 +590,28 @@ class CalibrationPosePreview:
             return self._fist_mesh[side].copy()
         return base.copy()
 
+    def _static_fist_image(self, side: str) -> np.ndarray | None:
+        """Load the approved fist demo image for one side (BGR 660x300)."""
+        path = _FIST_STATIC_DIR / f"fist_{side}.png"
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        if image.shape[:2] != (PREVIEW_HEIGHT, PREVIEW_WIDTH):
+            image = cv2.resize(
+                image, (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(image)
+
     def render_bgr(self, side: str, step_index: int) -> np.ndarray:
         key = (str(side).lower(), int(step_index))
         cached = self._image_cache.get(key)
         if cached is not None:
             return cached
+        if key[1] in (13, 14):
+            static = self._static_fist_image(key[0])
+            if static is not None:
+                self._image_cache[key] = static
+                return static
         joints = self.joints_for_step(*key)
         mesh = self.mesh_for_step(*key)
         displayed = joints

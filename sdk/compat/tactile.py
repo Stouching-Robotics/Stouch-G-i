@@ -1,7 +1,7 @@
-"""runtime.compat.tactile — 公开的触觉传感器数据接口（纯源码，不加密）。
+"""sdk.compat.tactile — 公开的触觉传感器数据接口（纯源码，不加密）。
 
 ``TactileStream`` 产出 16×16 触觉压力矩阵帧。两种用法：
-  - 复用已有的 :class:`runtime.compat.imu.ImuStream`（``TactileStream(imu=stream)``，
+  - 复用已有的 :class:`sdk.compat.imu.ImuStream`（``TactileStream(imu=stream)``，
     与 IMU 共享同一接收线程，避免同一串口双线程）；
   - 独立打开串口（``TactileStream(serial_port=...)``，只消费触觉）。
 

@@ -36,12 +36,10 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
-import math
 import os
 import pickle
 from pathlib import Path
 import sys
-import threading
 import time
 import types
 import warnings
@@ -70,6 +68,7 @@ from gui.calibration_selector import select_calibration_files  # noqa: E402
 from gui.qt_viewer import (  # noqa: E402
     DEFAULT_TACTILE_THRESHOLD, QtCanvas, ensure_qapp, pump_events)
 from gui.rendering.tactile import render_hand  # noqa: E402
+from common.frame_pacing import recent_batch  # noqa: E402
 from common.i18n import L, is_en, set_lang  # noqa: E402
 from glove_io.recording import (  # noqa: E402
     JointPositionSmoother,
@@ -81,7 +80,7 @@ from glove_io.recording import (  # noqa: E402
 from glove_io.session import (  # noqa: E402
     update_session_metadata, view_state_metadata, write_session_metadata)
 from glove_io.tactile_processing import TactilePreprocessor  # noqa: E402
-from runtime import (  # noqa: E402
+from sdk import (  # noqa: E402
     DeviceManager, HandSolver, RawImuStream, get_version)
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
@@ -97,7 +96,17 @@ VIEW3D_CONFIG_PATH = PROJECT_ROOT / "config" / "view_config_3d.json"
 # --------------------------------------------------------------------------
 # Rendering (inlined from render_21_points.py; numpy+cv2 only, no D435/stereo_s80m deps)
 # --------------------------------------------------------------------------
-N_HANDS, N_KPTS = 2, 21
+N_HANDS = 2
+# W/H are the *design baseline*, not the live canvas size.  The live viewer
+# rasterises at the window's own pixel size (see gui/qt_viewer.py's
+# canvas_pixel_size_for), so every absolute pixel value in the drawing code --
+# font scales, thicknesses, card sizes, margins -- stays quoted at this
+# baseline and does not scale with the canvas.  Only edge- and centre-relative
+# anchors follow the live size.
+#
+# They must stay module constants: calibration_pose_preview builds Camera()
+# directly at ten sites and relies on this default, and the offline replay
+# writer has its own separate pair.
 W, H = 1280, 720
 FOV_DEG = 50.0                                   # vertical field of view
 # How far the fixed 2D tactile overlay may be scaled: the keyboard steps and
@@ -122,8 +131,6 @@ FINGER_BGR = [
     (255, 120, 255),   # 4 pinky  purple
     (210, 175, 150),   # 5 metacarpal light steel blue (readable on dark blue background)
 ]
-FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
-DISPLAY_MODES = (("bones", "手骨"), ("hand", "完整手"))
 HAND_MESH_BGR = (215, 200, 185)
 
 
@@ -225,9 +232,15 @@ class Camera:
     pan_px is the image-space offset from drag-panning.  The three rotations
     are: yaw about the world vertical axis, elev about the horizontal axis,
     and roll about the view (fwd) axis.
+
+    size is the canvas this camera projects into.  It defaults to the design
+    baseline so offscreen callers (calibration_pose_preview, the replay
+    writer) are unaffected; the live viewer passes its current canvas.
     """
 
-    def __init__(self, yaw_deg, elev_deg, dist, roll_deg=0.0, pan_px=(0.0, 0.0)):
+    def __init__(self, yaw_deg, elev_deg, dist, roll_deg=0.0, pan_px=(0.0, 0.0),
+                 size: tuple[int, int] = (W, H)):
+        self._w, self._h = int(size[0]), int(size[1])
         yaw, elev = np.deg2rad(yaw_deg), np.deg2rad(elev_deg)
         roll = np.deg2rad(roll_deg)
         cp = np.array([dist * np.cos(elev) * np.sin(yaw),
@@ -243,7 +256,10 @@ class Camera:
         r0, u0 = self.right, self.up
         self.right = r0 * cos_r + u0 * sin_r
         self.up = -r0 * sin_r + u0 * cos_r
-        self.f = (H / 2) / np.tan(np.deg2rad(FOV_DEG) / 2)
+        # Focal length in pixels: scaling it with the canvas height is what
+        # makes the 3D content keep the same *fraction* of the frame at any
+        # window size, and therefore what makes the view resolution-independent.
+        self.f = (self._h / 2) / np.tan(np.deg2rad(FOV_DEG) / 2)
         self.pan_px = [float(pan_px[0]), float(pan_px[1])]
 
     def project(self, pts3d):
@@ -252,8 +268,15 @@ class Camera:
         z = v @ self.fwd
         x = v @ self.right
         y = v @ self.up
-        u = self.f * x / z + W / 2
-        vv = H / 2 - self.f * y / z
+        u = self.f * x / z + self._w / 2
+        vv = self._h / 2 - self.f * y / z
+        # pan_px stays in raw canvas pixels and is deliberately NOT normalised
+        # by the canvas size: both the centre above and the offset here are in
+        # the same space, so resizing the window leaves the scene exactly where
+        # it looks like it is instead of drifting outward as the window grows.
+        # The cost is cosmetic -- a pan saved at one window size is a different
+        # fraction of the frame at another -- and pan is a manual affordance
+        # that defaults to (0, 0).
         u += self.pan_px[0]
         vv += self.pan_px[1]
         return np.stack([u, vv], -1), z
@@ -338,42 +361,16 @@ def place_hands_at_wrist_anchors(
     return slots
 
 
-def _fit_dist(kpts) -> float:
-    """Pick a grid radius from the per-frame hand scale so the grid hugs the hand."""
-    v = kpts[np.isfinite(kpts).all(axis=-1)]
-    if len(v) == 0:
-        return 0.5
-    r = float(np.abs(v).max())
-    return max(0.25, r * 2.6 + 0.1)
-
-
-def _bg() -> np.ndarray:
+def _bg(w: int = W, h: int = H) -> np.ndarray:
     # Dark navy-blue vertical gradient in the style of modelling software.
     # Still a single vectorized row op, so the palette change costs no frame time.
-    t = np.linspace(0.0, 1.0, H, dtype=np.float32)
+    t = np.linspace(0.0, 1.0, h, dtype=np.float32)
     top = np.array([54, 40, 30], np.float32)      # BGR: upper edge
     bottom = np.array([26, 17, 13], np.float32)   # BGR: lower edge
     grad = (top[None, :] + (bottom - top)[None, :] * t[:, None]).astype(np.uint8)
-    img = np.empty((H, W, 3), np.uint8)
+    img = np.empty((h, w, 3), np.uint8)
     img[...] = grad[:, None, :]
     return img
-
-
-def _grid(img, cam, r: float, basis: np.ndarray | None = None) -> None:
-    """Draw RGB world axes at the origin (the ground lattice is hidden)."""
-    grid_basis = (np.eye(3, dtype=float) if basis is None
-                  else np.asarray(basis, dtype=float).reshape(3, 3))
-    axis_x, axis_y, axis_z = (
-        grid_basis[:, 0], grid_basis[:, 1], grid_basis[:, 2])
-    # Axes (BGR): X red, Y green, Z blue
-    origin = np.zeros((3,), np.float32)
-    for axis, col in [(axis_x * r, (70, 90, 255)),
-                      (axis_y * r, (70, 255, 110)),
-                      (axis_z * r, (255, 130, 90))]:
-        pts, z = cam.project(np.stack([origin, axis]))
-        if (z > 0).all():
-            cv2.line(img, tuple(pts[0].astype(int)), tuple(pts[1].astype(int)),
-                     col, 2, cv2.LINE_AA)
 
 
 def _draw_hand(img, cam, kpts, hand_idx) -> None:
@@ -503,15 +500,25 @@ def render_frame_live(
         grid_basis: np.ndarray | None = None,
         mesh_slots: list[np.ndarray | None] | None = None,
         mesh_faces: np.ndarray | None = None,
-        display_mode: str = "bones") -> np.ndarray:
+        display_mode: str = "bones",
+        size: tuple[int, int] = (W, H)) -> np.ndarray:
     """Render one live frame: background + ground grid + left/right hand slots + HUD.
 
     grid_r: grid/axes radius in metres.  When None it is auto-fitted to the
     current frame's hand scale (for offline batch use); live mode must pass a
     fixed value (scaled with camera dist), otherwise the grid zooms along with
     hand motion and looks like "auto-zoom".
+
+    size: the canvas to rasterise into, which must be the size the camera was
+    built for.  Defaults to the design baseline so offscreen callers are
+    unaffected.  Only the background takes it: the title and HUD keep their
+    absolute pixel size and offsets, because they are UI chrome rather than
+    content -- everything else in the interface (the orbit pad, the baseline
+    banner, the tactile cards) is fixed-size too, and on a high-DPI display a
+    size that grew with the canvas would render far too large.
     """
-    img = _bg()
+    w, h = int(size[0]), int(size[1])
+    img = _bg(w, h)
     # The RGB world axes (and the hidden ground lattice) are not drawn: the
     # live background is plain, only the hands and HUD are rendered.
     display_mode = display_mode if display_mode in ("bones", "hand") else "bones"
@@ -595,7 +602,9 @@ class Live3DViewer:
     projection still uses the lite script's fixed camera.
     """
 
-    # Right-drag rotation sensitivity: dragging the full window width (1280 px) ~= 360° yaw
+    # Right-drag rotation sensitivity: dragging the full canvas width ~= 360°
+    # yaw.  `_refresh_canvas_size` shadows this per instance once the real
+    # canvas size is known; the class value is the design-baseline default.
     ORBIT_DEG_PER_PX = 360.0 / W
     MODEL_CONTROL_SENSITIVITIES = (
         ("fine", 3.0, 0.75),
@@ -680,6 +689,10 @@ class Live3DViewer:
         self.tactile_calibrating = False
         self.tactile_scale = 0.6
         self.tactile_threshold = DEFAULT_TACTILE_THRESHOLD  # cells below it are zeroed
+        # Live canvas size.  Seeded with the design baseline so the first _draw
+        # below is exactly what it always was; _refresh_canvas_size() then
+        # takes over from the widget's real geometry.
+        self.canvas_w, self.canvas_h = W, H
 
         ensure_qapp()
         # Window title bar carries host + SDK versions (e.g.
@@ -698,12 +711,37 @@ class Live3DViewer:
             show_orientation_button=show_orientation_button,
             show_selector_button=show_selector_button,
             show_dongle_reboot_button=show_dongle_reboot_button)
+        self._refresh_canvas_size()
         self._canvas = self._draw()
         self._qcanvas.set_canvas(self._canvas)
 
+    def _refresh_canvas_size(self) -> bool:
+        """Adopt the window's current pixel size as the render canvas size.
+
+        Polled from tick() rather than pushed from Qt's resize event: the size
+        is a cached getter so this is free at the tick rate, and it also covers
+        the first frame and a devicePixelRatio change, neither of which is
+        guaranteed to arrive as a resize of this widget.
+
+        Returns True when the size changed, which means a redraw is owed --
+        without that, an idle glove stream would leave the window showing the
+        previous frame stretched by Qt's fit-to-window blit.
+        """
+        size = self._qcanvas.canvas_pixel_size()
+        if size == (self.canvas_w, self.canvas_h):
+            return False
+        self.canvas_w, self.canvas_h = size
+        # Rotation sensitivity is per canvas pixel, matching the coordinates
+        # _on_mouse receives (QtCanvas maps pointer positions into canvas
+        # space), so a full-width drag stays a full 360 degree turn.
+        self.ORBIT_DEG_PER_PX = 360.0 / max(1, self.canvas_w)
+        self._redraw_requested = True
+        return True
+
     def _camera(self) -> Camera:
         cam = Camera(self.view.yaw, self.view.elev, self.view.dist,
-                     roll_deg=self.view.roll)
+                     roll_deg=self.view.roll,
+                     size=(self.canvas_w, self.canvas_h))
         cam.pan_px = list(self.view.pan_px)
         return cam
 
@@ -930,6 +968,9 @@ class Live3DViewer:
         return None
 
     def _draw(self) -> np.ndarray:
+        # One size for the whole frame, so the camera and the text anchors
+        # below cannot disagree if a resize lands mid-draw.
+        w, h = self.canvas_w, self.canvas_h
         # Grid radius scales only with camera dist (wheel-controlled), not with the per-frame hand scale
         grid_r = max(0.1, self.view.dist * 0.5)
         img = render_frame_live(
@@ -939,15 +980,17 @@ class Live3DViewer:
             grid_r=grid_r, grid_basis=self._grid_basis(),
             mesh_slots=self._controlled_display_mesh_slots(),
             mesh_faces=self._mesh_faces,
-            display_mode=self.display_mode)
+            display_mode=self.display_mode, size=(w, h))
+        # Bottom-anchored: only the distance from the edge follows the canvas,
+        # the font size does not (see render_frame_live on size).
         put_text(img, L(
             "方向盘/外圈=旋转手模 中键拖=旋转相机 滚轮=缩放 左键拖=平移 "
             "r=复位 v=保存 [ / ]=触觉大小 q=退出",
             "pad/ring=rotate model M-drag=rotate camera wheel=zoom L-drag=pan "
             "r=reset v=save [ / ]=tactile size q=quit"),
-            (16, H - 40), 0.45, (200, 195, 185), 1)
+            (16, h - 40), 0.45, (200, 195, 185), 1)
         put_text(img, L("3D 单位: 米; 腕部相对", "3D units: metres; wrist-relative"),
-                 (16, H - 16), 0.55, (200, 195, 185), 1)
+                 (16, h - 16), 0.55, (200, 195, 185), 1)
         self._draw_tactile(img)
         return img
 
@@ -988,10 +1031,13 @@ class Live3DViewer:
 
     def _draw_tactile(self, img: np.ndarray) -> None:
         """Fixed 2D tactile overlay at the lower-left corner: never rotates, only resizes."""
+        # Anchors come from the buffer being drawn into rather than from
+        # self.canvas_h, so they cannot disagree with it.
+        h = img.shape[0]
         if self.tactile_frame is None:
             if self.tactile_calibrating:
                 put_text(img, L("触觉正在校零 - 请勿触碰", "Tactile zeroing - do not touch"),
-                         (12, H - 62), 0.5, (0, 0, 255), 1)
+                         (12, h - 62), 0.5, (0, 0, 255), 1)
             return
         frame = self.tactile_frame
         if self.tactile_threshold > 0:
@@ -999,11 +1045,16 @@ class Live3DViewer:
         hand_img = render_hand(
             frame, mirror=self.hand_side == "left",
             side=self.hand_side)
+        # tactile_scale is an absolute card size, deliberately not scaled with
+        # the canvas: it is a round trip through tactile_overlay's cell<->scale
+        # maths, which the grip hit-test and the drag in the bimanual viewers
+        # have to invert, and scaling it in one place would detach the handle
+        # from the card.
         s = self.tactile_scale
         tw = max(1, int(round(hand_img.shape[1] * s)))
         th = max(1, int(round(hand_img.shape[0] * s)))
         scaled = cv2.resize(hand_img, (tw, th), interpolation=cv2.INTER_LINEAR)
-        x0, y0 = 12, H - 60 - th
+        x0, y0 = 12, h - 60 - th
         img[y0:y0 + th, x0:x0 + tw] = scaled
         cv2.rectangle(img, (x0, y0), (x0 + tw, y0 + th), (120, 130, 150), 1)
         put_text(img, L(f"触觉 x{s:.1f}  [ / ] 缩放", f"Tactile x{s:.1f}  [ / ] resize"),
@@ -1040,6 +1091,9 @@ class Live3DViewer:
         if self.exit_requested:
             return False
         now = time.monotonic()
+        # Adopt a window resize before deciding whether to redraw, so the frame
+        # about to be produced is already at the new size.
+        self._refresh_canvas_size()
         if self._last_tick_s is None:
             self._last_tick_s = now
         if self.rotating:
@@ -1363,12 +1417,18 @@ def main(argv=None) -> int:
             if sensor_stream is not None:
                 samples = sensor_stream.poll()
                 # Real-time display must track the newest frame, not replay the
-                # buffered backlog.  Solving + recording is slower than the 80 fps
-                # USB rate, so the queue fills and poll() can return up to 256 stale
-                # frames; processing them FIFO makes the view lag by the queue depth
-                # (~3 s).  Keep only the latest frame and drop the rest.
+                # buffered backlog.  Solving + recording can be slower than the
+                # device rate, so the 256-deep queue can fill and poll() can hand
+                # over a genuine backlog; processing that FIFO makes the view lag
+                # by the queue depth.  Drop the stale part and keep the rest.
+                #
+                # Keeping only the last frame (what this did before) also threw
+                # away the frames a poll legitimately carries: a Bluetooth dongle
+                # hands over one batch per RF event, so a poll of several current
+                # frames became one, and the rate the view tracked was the batch
+                # rate rather than the frame rate.
                 if samples:
-                    samples = samples[-1:]
+                    samples = recent_batch(samples)
             elif time.monotonic() >= next_demo_s:
                 base = solver.neutral_imu_xyzw
                 quaternions = base.copy()

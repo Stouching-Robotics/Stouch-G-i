@@ -1,4 +1,4 @@
-"""runtime.compat.keypoints — 公开的 21 个手部关键点接口（纯源码，不加密）。
+"""sdk.compat.keypoints — 公开的 21 个手部关键点接口（纯源码，不加密）。
 
 这是明文程序与**加密的 FK 解算核心**之间的唯一闸口：
   - :func:`create_solver` 构造 16 IMU → 21 关键点的解算器（内部调用加密核心）；
@@ -72,7 +72,7 @@ class KeypointSolver:
 
     # -- SDK 便捷：直接吃 ImuFrame -----------------------------------------
     def solve_frame(self, imu_frame) -> KeypointsFrame:
-        """输入 :class:`runtime.compat.imu.ImuFrame`，输出 :class:`KeypointsFrame`。"""
+        """输入 :class:`sdk.compat.imu.ImuFrame`，输出 :class:`KeypointsFrame`。"""
         rotation = imu_frame.to_rotation()
         if imu_frame.sensor_age_s is not None and imu_frame.sensor_age_s.size:
             mask = ~np.isfinite(imu_frame.sensor_age_s)

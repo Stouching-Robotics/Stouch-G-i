@@ -86,7 +86,7 @@ from gui.calibration_pose_preview import (  # noqa: E402
     PREVIEW_HEIGHT,
     PREVIEW_WIDTH,
 )
-from runtime import get_version  # noqa: E402
+from sdk import get_version  # noqa: E402
 
 
 @dataclass(frozen=True)

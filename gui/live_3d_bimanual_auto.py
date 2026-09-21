@@ -64,7 +64,7 @@ from gui.calibration_bindings import (  # noqa: E402
 )
 from gui.calibration_selector import select_calibration_files  # noqa: E402
 from gui.live_3d import (  # noqa: E402
-    H, W, TACTILE_SCALE_MAX, TACTILE_SCALE_MIN,
+    TACTILE_SCALE_MAX, TACTILE_SCALE_MIN,
     Live3DViewer, LiveViewState, VIEW3D_CONFIG_PATH,
     align_left_to_right_reference, apply_hand_display_rotation,
     hand_display_basis, _latest_solver_mesh_vertices,
@@ -92,7 +92,7 @@ from glove_io.device_registry import (  # noqa: E402
     detect_unbound_glove_links, link_kind_for_device, set_glove_serial,
 )
 from glove_io.tactile_processing import TactilePreprocessor  # noqa: E402
-from runtime import (  # noqa: E402
+from sdk import (  # noqa: E402
     DeviceManager, DeviceNotFoundError, HandSolver, RawImuStream,
     get_version)
 from common.frame_pacing import recent_batch  # noqa: E402
@@ -994,25 +994,6 @@ class PublishedHandState:
         self.latency = None
 
 
-# render_hand draws ~256 cell texts per panel; the tactile stream only updates
-# at ~70 Hz while the live view redraws at the preview fps, so cache the panel
-# per (side, data, threshold) and only resize/draw it.
-_TACTILE_PANEL_CACHE: dict[tuple, np.ndarray] = {}
-_TACTILE_PANEL_CACHE_MAX = 8
-
-# ``render_hand`` intentionally returns an 800 px-wide compatibility canvas,
-# while the actual fingers and palm occupy only its middle ~300 px.  Keeping
-# that empty area in the bimanual overlay made both maps look tiny and blurry.
-# Crop only the presentation canvas here (never the sensor data/mapping), then
-# give the useful content a little more room inside a compact card.
-_TACTILE_CONTENT_X0 = 220
-_TACTILE_CONTENT_X1 = 580
-_TACTILE_CONTENT_ZOOM = 1.5
-_TACTILE_CARD_PAD = 9
-_TACTILE_CARD_HEADER = 34
-_TACTILE_CARD_BOTTOM_MARGIN = 60
-
-
 def _rounded_card_mask(height: int, width: int, radius: int = 12) -> np.ndarray:
     """Return an antialiased-looking uint8 mask for a small rounded card."""
 
@@ -1027,82 +1008,6 @@ def _rounded_card_mask(height: int, width: int, radius: int = 12) -> np.ndarray:
             (width - radius - 1, height - radius - 1)):
         cv2.circle(mask, center, radius, 255, -1, cv2.LINE_AA)
     return mask
-
-
-def _draw_tactile_card(
-        img: np.ndarray,
-        panel: np.ndarray,
-        side: str,
-        peak: float,
-        x0: int,
-        y0: int) -> None:
-    """Composite one compact tactile panel without altering its cell mapping."""
-
-    panel_h, panel_w = panel.shape[:2]
-    card_w = panel_w + 2 * _TACTILE_CARD_PAD
-    card_h = _TACTILE_CARD_HEADER + panel_h + _TACTILE_CARD_PAD
-    accent = ((255, 180, 80) if side == "left" else (80, 180, 255))
-
-    # A restrained vertical gradient separates the maps from the 3D scene but
-    # keeps them in the same navy UI palette.
-    top = np.array((48, 38, 33), np.float32)
-    bottom = np.array((31, 25, 23), np.float32)
-    mix = np.linspace(0.0, 1.0, card_h, dtype=np.float32)[:, None]
-    rows = (top[None, :] + (bottom - top)[None, :] * mix).astype(np.uint8)
-    card = np.empty((card_h, card_w, 3), np.uint8)
-    card[...] = rows[:, None, :]
-
-    # The compatibility renderer uses a flat fill around the cells.  Replace
-    # only that exact fill so its inner panel blends cleanly into this card;
-    # sensor colors, borders, labels and values are left byte-for-byte intact.
-    shown = panel.copy()
-    old_background = np.array((40, 30, 24), np.int16)
-    is_background = np.max(
-        np.abs(shown.astype(np.int16) - old_background[None, None, :]),
-        axis=2,
-    ) <= 2
-    shown[is_background] = (35, 28, 25)
-    py = _TACTILE_CARD_HEADER
-    px = _TACTILE_CARD_PAD
-    card[py:py + panel_h, px:px + panel_w] = shown
-
-    # Side badge, localized title, live peak, and subtle separators make the
-    # two maps readable at a glance without adding controls or changing data.
-    badge_center = (18, 17)
-    cv2.circle(card, badge_center, 9, accent, -1, cv2.LINE_AA)
-    cv2.putText(
-        card, "L" if side == "left" else "R", (13, 21),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.39, (20, 25, 32), 1, cv2.LINE_AA)
-    put_text(
-        card,
-        "LEFT PALM MAP" if side == "left" else "RIGHT PALM MAP",
-        (34, 23), 0.46, (238, 239, 244), 1)
-    if card_w >= 285:
-        peak_text = f"MAX {max(0.0, float(peak)):.0f}"
-        (peak_w, _), _ = cv2.getTextSize(
-            peak_text, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-        cv2.putText(
-            card, peak_text, (card_w - peak_w - 12, 22),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (174, 184, 201), 1,
-            cv2.LINE_AA)
-    cv2.line(
-        card, (10, _TACTILE_CARD_HEADER - 1),
-        (card_w - 11, _TACTILE_CARD_HEADER - 1), (78, 69, 64), 1,
-        cv2.LINE_AA)
-    cv2.line(card, (13, 1), (card_w - 14, 1), accent, 2, cv2.LINE_AA)
-
-    mask = _rounded_card_mask(card_h, card_w)
-    # Derive a one-pixel border from the same rounded mask, so corners remain
-    # smooth instead of falling back to a square cv2.rectangle outline.
-    inner = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
-    border = mask > inner
-    card[border] = np.asarray((92, 83, 80), np.uint8)
-    card[1:3, 13:card_w - 13] = accent
-
-    roi = img[y0:y0 + card_h, x0:x0 + card_w]
-    alpha = (mask.astype(np.float32) * (0.96 / 255.0))[..., None]
-    blended = roi.astype(np.float32) * (1.0 - alpha) + card.astype(np.float32) * alpha
-    roi[...] = np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def draw_bimanual_tactile_overlay(
@@ -1411,17 +1316,47 @@ class BimanualViewer(Live3DViewer):
                         f"最大间隔 {health.get('gap_max_s', 0.0):.2f}s",
                         f"Batched {burst_mean:.1f} frames/poll  "
                         f"max gap {health.get('gap_max_s', 0.0):.2f}s"))
-            # The pose on screen is the last good one for this hand, not this
-            # frame's: say so, or a frozen hand looks like a tracking failure.
-            if status.get("stale"):
+            # The link-loss readout is deliberately not shown: ``dropped`` is
+            # still counted and is still what the dual-dongle interference
+            # warning below is judged from, it is just no longer a HUD row.
+            recoveries = int(health.get("recoveries") or 0)
+            if recoveries:
                 lines.append(
                     f"{side_name}: "
-                    + L("数据陈旧，姿态停在上一帧",
-                        "STALE -- pose held at the last frame"))
+                    + L(f"蓝牙链路已自动恢复 {recoveries} 次",
+                        f"Bluetooth link auto-recovered {recoveries} time(s)"))
+            # The stale-pose readout is deliberately not shown either:
+            # ``status["stale"]`` still marks the frame, it is just no longer a
+            # HUD row.
             # The magnetometer calibration readout is deliberately not shown:
             # the per-IMU levels and the "x/16 calibrated" count stay in the
             # monitor and remain what the prompt card is judged from, they are
             # just no longer a HUD row.
+        bluetooth = [
+            self.side_status[side] for side in ("left", "right")
+            if self.side_status[side].get("connected")
+            and self.side_status[side].get("link") == "bluetooth"
+        ]
+        if len(bluetooth) == 2:
+            device_rates = [float(item.get("device_fps") or 0.0)
+                            for item in bluetooth]
+            loss_rates = []
+            for item in bluetooth:
+                health = item.get("link_health") or {}
+                dropped = int(health.get("dropped") or 0)
+                sent = int(health.get("frames") or 0) + dropped
+                loss_rates.append(dropped / sent if sent else 0.0)
+            # Verified signature on the real pair: either hand alone is 60 Hz
+            # with zero loss, while together one stays near 60 and the other
+            # accumulates CRC/sequence loss.  Say what that means rather than
+            # presenting it as an unexplained low solver rate.
+            if (min(device_rates, default=60.0) < 40.0
+                    and max(loss_rates, default=0.0) >= 0.10):
+                lines.append(L(
+                    "检测到双蓝牙接收器互扰：请将两个接收器拉开，"
+                    "或插到不同 USB 控制器",
+                    "Dual Bluetooth receiver interference detected: separate "
+                    "the dongles or use different USB controllers"))
         if self._dongle_reboot_status:
             lines.append(
                 L("Dongle: ", "Dongle: ") + self._dongle_reboot_status)
@@ -1766,7 +1701,7 @@ class BimanualViewer(Live3DViewer):
         # clipping at the historical 620 px -- and if a line still cannot fit,
         # shrink that line: the card is centred, so an over-wide one would start
         # at a negative x and spill off the left edge.
-        max_w = W - 32
+        max_w = self.canvas_w - 32
         if title_w + 48 > max_w:
             title_scale *= (max_w - 48) / title_w
             title_w, title_h = text_size(title, title_scale, 2)
@@ -1775,7 +1710,7 @@ class BimanualViewer(Live3DViewer):
             subtitle_w, _ = text_size(subtitle, subtitle_scale, 1)
         card_w = max(620, title_w + 48, subtitle_w + 48)
         card_h = 112
-        x0 = (W - card_w) // 2
+        x0 = (self.canvas_w - card_w) // 2
         y0 = 168 if not self._startup_alignment_completed else 28
         x1, y1 = x0 + card_w, y0 + card_h
         roi = img[y0:y1, x0:x1]
@@ -1796,7 +1731,7 @@ class BimanualViewer(Live3DViewer):
             return
 
         card_w, card_h = 640, 126
-        x0 = (W - card_w) // 2
+        x0 = (self.canvas_w - card_w) // 2
         y0 = 28
         x1, y1 = x0 + card_w, y0 + card_h
         roi = img[y0:y1, x0:x1]
@@ -1832,9 +1767,10 @@ class BimanualViewer(Live3DViewer):
             (x0 + (card_w - subtitle_w) // 2, y0 + 96),
             subtitle_scale, (220, 211, 198), 1)
 
-    @staticmethod
-    def _record_button_rect() -> tuple[int, int, int, int]:
-        return W - 305, 18, W - 22, 66
+    def _record_button_rect(self) -> tuple[int, int, int, int]:
+        # Right-anchored, so it tracks the canvas width.  Draw and hit-test
+        # both go through here, which is what keeps them in agreement.
+        return self.canvas_w - 305, 18, self.canvas_w - 22, 66
 
     def _draw_record_button(self, img: np.ndarray) -> None:
         x0, y0, x1, y1 = self._record_button_rect()
@@ -1888,7 +1824,10 @@ class BimanualViewer(Live3DViewer):
         frames = self._resizable_tactile_frames()
         if not frames:
             return None
-        shape = (H, W)
+        # Must be the canvas the overlay was actually drawn into -- the overlay
+        # is rendered from the real buffer's shape -- or the handles would be
+        # computed for one size and drawn at another, and stop responding.
+        shape = (self.canvas_h, self.canvas_w)
         handles = tactile_grip_rects(shape, frames, self.tactile_scale)
         cards = tactile_card_rects(shape, frames, self.tactile_scale)
         start_cell = tactile_cell_for_scale(self.tactile_scale, shape)
@@ -1929,7 +1868,7 @@ class BimanualViewer(Live3DViewer):
         )
         cell = int(round(drag["start_cell"] * ratio))
         scale = float(np.clip(
-            tactile_scale_for_cell(cell, (H, W)),
+            tactile_scale_for_cell(cell, (self.canvas_h, self.canvas_w)),
             TACTILE_SCALE_MIN, TACTILE_SCALE_MAX))
         if scale == self.tactile_scale:
             return
@@ -2159,11 +2098,15 @@ class BimanualViewer(Live3DViewer):
         return L("触觉面板", "Tactile panel")
 
     def _tactile_panel_mode_options(self) -> list[tuple[str, str]]:
+        # "linear_matrix" (分区线性拟合) is deliberately kept out of the menu:
+        # the feature is whole -- the guard in ``_on_tactile_panel_mode``,
+        # ``_resizable_tactile_frames`` and the draw branch all still answer to
+        # it -- it is simply not offered.  Putting the one entry back below is
+        # the whole of re-enabling it.
         return [
             ("off", L("关闭", "Off")),
             ("force", L("力变化趋势", "Force trends")),
             ("matrix", L("压力矩阵", "Pressure matrix")),
-            ("linear_matrix", L("分区线性拟合 (N)", "Regional linear fit (N)")),
         ]
 
     def _on_tactile_panel_mode(self, mode: str) -> None:
@@ -2252,13 +2195,6 @@ class BimanualViewer(Live3DViewer):
             _draw_force_trend_overlay(
                 img, self._force_curve_snapshot(), self.present_sides,
                 self.tactile_scale)
-
-
-def _joints_or_nan(runtime) -> np.ndarray:
-    value = runtime.latest_joints
-    if value is None:
-        return np.full((21, 3), np.nan, np.float32)
-    return np.asarray(value, np.float32).reshape(21, 3)
 
 
 def _synthesize_single_hand_bases(initial: np.ndarray) -> np.ndarray:
@@ -2512,6 +2448,10 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
                 # Tactile is a live overlay, not a history playback.  Publishing
                 # only the newest sample prevents stale pressure frames from
                 # delaying the latency-sensitive IMU solve after a USB backlog.
+                # Unlike the IMU frames below, keeping one here loses nothing a
+                # consumer could have seen: ``latest_tactile`` is replaced by
+                # each frame and the overlay redraws from it, so earlier frames
+                # of the same poll would only be overwritten.
                 tactile_frames = tactile_frames[-1:]
             for tactile_frame in tactile_frames:
                 saw_data = True
@@ -2541,14 +2481,13 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
                 # grouped the frames is the whole point, and it is only visible
                 # on the raw poll result.
                 link_health.observe(arrival, len(raw_frames))
-                # Real-time: drop the part of the batch that has fallen behind,
-                # so solved output never lags the USB rate, but keep the frames
-                # that are still current.  Collapsing a whole batch to its last
+                # Real-time: drop only the part of the batch that is history by
+                # now, keep the rest.  Collapsing a whole batch to its last
                 # frame (what this did before) made a bursty link's solved rate
                 # equal its batch rate; the device-time credit accumulator below
                 # is what throttles the rate, and it cannot throttle frames that
                 # were discarded before it ever saw them.
-                raw_frames = recent_batch(raw_frames, solve_rate)
+                raw_frames = recent_batch(raw_frames)
             for raw_frame in raw_frames:
                 if raw_frame.sequence == runtime.last_seq:
                     continue
@@ -2720,9 +2659,17 @@ def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
                     # ``None`` on firmware older than v1.2.11.
                     "latency": getattr(runtime.stream, "latency", None),
                     # Plain dict of numbers: this crosses the process queue.
+                    # ``link_errors`` counts bytes the parser rejected,
+                    # ``link_drops`` frames the link never delivered; neither
+                    # rises for frames this loop deliberately discards, so
+                    # together they say where the frames went.
                     "link_health": link_health.snapshot(
-                        now, dict(getattr(runtime.stream, "link_errors", None)
-                                  or {})),
+                        now, {
+                            **(getattr(runtime.stream, "link_errors", None)
+                               or {}),
+                            **(getattr(runtime.stream, "link_drops", None)
+                               or {}),
+                        }),
                 })
             if not saw_data:
                 stop_event.wait(0.001)
@@ -2937,8 +2884,6 @@ def _parse_args(argv=None):
         help="Start recording when data is ready; default waits for the GUI button")
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--max-frames", type=int, default=0)
-    parser.add_argument("--allow-uncalibrated", action="store_true",
-                        help="Deprecated compatibility option; both calibrations are required")
     args = parser.parse_args(argv)
     if args.no_save and args.record_on_start:
         parser.error("--no-save and --record-on-start cannot be combined")
@@ -3167,6 +3112,13 @@ def _run_live_session(args) -> int | str:
             "channel_to_hand": config.channel_to_hand,
         }
 
+    if runtime_backend is None:
+        # No glove connected: the pipeline label and recording metadata below
+        # still need a backend name. hand_pinky_plus_2mm is the fixed local
+        # backend (algorithm/runtime_backend.py), so default to it rather than
+        # dereferencing None.
+        runtime_backend = {"backend": "hand_pinky_plus_2mm"}
+
     print(f"Left IMU calibration: {calib_paths['left'].resolve()}")
     print(f"Right IMU calibration: {calib_paths['right'].resolve()}")
 
@@ -3243,6 +3195,12 @@ def _run_live_session(args) -> int | str:
     # cumulative, so the interesting number is the per-second delta.
     prev_link_errors: dict[str, dict[str, int] | None] = {
         side: None for side in present_sides}
+    # Sequence-gap loss, kept apart from the parser errors above: those two are
+    # different faults (bytes rejected in the parser vs frames the link never
+    # delivered) and the whole point of printing both per second is that they
+    # have different fixes.
+    prev_link_drops: dict[str, dict[str, int] | None] = {
+        side: None for side in present_sides}
     session_result: int | str = 0
     try:
         # One solver process per hand: each owns its USB stream, tactile
@@ -3297,17 +3255,34 @@ def _run_live_session(args) -> int | str:
                                     "discarded_bytes")}
                     previous = prev_link_errors[side] or errors
                     prev_link_errors[side] = errors
+                    loss = {
+                        key: int(health.get(key) or 0)
+                        for key in ("frames", "dropped")}
+                    previous_loss = prev_link_drops[side] or loss
+                    prev_link_drops[side] = loss
+                    latency = snap[side].get("latency")
+                    # ``None`` on firmware older than v1.2.11, which does not
+                    # answer the probe; a dash says so rather than 0 ms.
+                    latency_text = ("--" if latency is None
+                                    else f"{latency.rtt_ms:.2f}ms")
                     # English, like every other terminal line in this file; the
                     # on-screen HUD is what carries the bilingual labels.
+                    # ``loss+`` is frames the device sent that never arrived, in
+                    # the same whole-device unit as ``fram+``; ``dropped+`` is
+                    # bytes the parser binned, and the two are unrelated.
                     print(
                         f"[{side}] FPS {snap[side]['fps']:5.1f}  "
                         f"DEV {snap[side]['device_fps']:5.1f} Hz  "
                         f"burst {float(health.get('burst_mean') or 0.0):4.1f}"
                         f"/poll (max {int(health.get('burst_max') or 0)})  "
                         f"gap<={float(health.get('gap_max_s') or 0.0):.3f}s  "
+                        f"fram+{loss['frames'] - previous_loss['frames']} "
+                        f"loss+{loss['dropped'] - previous_loss['dropped']} "
                         f"crc+{errors['crc_errors'] - previous['crc_errors']} "
                         f"len+{errors['length_errors'] - previous['length_errors']} "
-                        f"dropped+{errors['discarded_bytes'] - previous['discarded_bytes']}B",
+                        f"dropped+{errors['discarded_bytes'] - previous['discarded_bytes']}B  "
+                        f"recoveries {int(health.get('recoveries') or 0)}  "
+                        f"lat {latency_text}",
                         flush=True)
             if viewer:
                 # Tactile frames arrive at ~70 Hz from the hand processes;
@@ -3436,13 +3411,6 @@ def _run_live_session(args) -> int | str:
                     print(
                         f"Automatic adaptive recording started: {recording_session.output_path}")
                 if not args.no_display:
-                    backend_labels = {
-                        "hand_pinky_plus_2mm": "HAND pinky +2 mm LOCAL",
-                        "retargeted_direct": "measured direct / calibrated HAND orientation",
-                        "fitted_direct": "fitted project direct FK",
-                        "direct_fk": "direct FK",
-                    }
-                    backend_labels[runtime_backend["backend"]]  # validate backend name
                     viewer = BimanualViewer(
                         view_state, initial,
                         "Stouch Glove",

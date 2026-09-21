@@ -32,7 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from common.usb_cdc import (  # noqa: E402
     DEFAULT_CHANNEL_TO_HAND, remap_physical_to_hand,
     validate_channel_to_hand)
-from runtime import DeviceManager, RawImuStream  # noqa: E402
+from sdk import DeviceManager, RawImuStream  # noqa: E402
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
 
@@ -117,7 +117,13 @@ class SideReader(threading.Thread):
                     continue
                 # The display repaints at most once per --refresh interval,
                 # so remapping one frame per poll is enough at full stream
-                # rate; the rest just contribute to the frame counter.
+                # rate; the rest just contribute to the frame counter.  This is
+                # the one place keeping only the newest frame is correct rather
+                # than a loss -- the output of this poll *is* a single snapshot,
+                # so remapping the older frames would produce values that are
+                # overwritten before anything can read them.  (The live-3D
+                # entries, which solve and accumulate, use
+                # ``common.frame_pacing.recent_batch`` instead.)
                 frame = frames[-1]
                 valid_bits = sum(
                     (1 << index) for index, valid in

@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,9 +32,10 @@ DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
 if str(BUNDLE_ROOT) not in sys.path:
     sys.path.insert(0, str(BUNDLE_ROOT))
 
+from common.frame_pacing import recent_batch  # noqa: E402
 from gui.calibration_selector import select_calibration_files  # noqa: E402
 from gui.live_3d import (  # noqa: E402
-    H, W, Live3DViewer, LiveViewState, VIEW3D_CONFIG_PATH,
+    Live3DViewer, LiveViewState, VIEW3D_CONFIG_PATH,
     align_left_to_right_reference, apply_hand_display_rotation,
     hand_display_basis, _latest_solver_mesh_vertices,
     place_hands_at_wrist_anchors)
@@ -51,7 +51,7 @@ from glove_io.session import (  # noqa: E402
     session_metadata_path, update_session_metadata,
     view_state_metadata, write_session_metadata)
 from glove_io.tactile_processing import TactilePreprocessor  # noqa: E402
-from runtime import DeviceManager, HandSolver, RawImuStream  # noqa: E402
+from sdk import DeviceManager, HandSolver, RawImuStream  # noqa: E402
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
 DEFAULT_GEOMETRY_PATH = (
@@ -575,9 +575,10 @@ class BimanualViewer(Live3DViewer):
         self._draw_record_button(img)
         return img
 
-    @staticmethod
-    def _record_button_rect() -> tuple[int, int, int, int]:
-        return W - 305, 18, W - 22, 66
+    def _record_button_rect(self) -> tuple[int, int, int, int]:
+        # Right-anchored, so it tracks the canvas width.  Draw and hit-test
+        # both go through here, which is what keeps them in agreement.
+        return self.canvas_w - 305, 18, self.canvas_w - 22, 66
 
     def _draw_record_button(self, img: np.ndarray) -> None:
         x0, y0, x1, y1 = self._record_button_rect()
@@ -896,9 +897,14 @@ def main(argv=None):
                     device_samples[side] = [
                         sample for sample in device_samples[side]
                         if now - sample[0] <= 1.0]
-                    # Real-time: drop the buffered backlog and keep only the
-                    # newest frame, so the view never lags behind the USB rate.
-                    raw_frames = raw_frames[-1:]
+                    # Real-time: drop the part of the poll that is history by
+                    # now, keep the rest, so the view never lags the USB rate
+                    # without paying for it in frames the link delivered fine.
+                    # A Bluetooth dongle hands over a whole batch per RF event,
+                    # and keeping only its newest frame made this entry's rate
+                    # equal the batch rate.  There is no rate limiter here, so
+                    # every frame kept below is also solved.
+                    raw_frames = recent_batch(raw_frames)
                 for raw_frame in raw_frames:
                     if raw_frame.sequence == runtime.last_seq:
                         continue

@@ -7,47 +7,6 @@ class MoCapHandStateEnum(str, Enum):
     EXITED = "exited"
 
 
-class MoCapTrackerStateEnum(str, Enum):
-    UNCONNECTED = "unconnected"
-    CONNECTED = "connected"
-    EXITED = "exited"
-
-
-class MoCapStateEnum(str, Enum):
-    INITIALIZED = "initialized"
-    UNCONNECTED = "unconnected"
-    CONNECTED = "connected"
-    RUNNING = "running"
-    EXITED = "exited"
-    FINALIZED = "finalized"
-
-
-class MoCapThreadPluginEnum(str, Enum):
-    SYNC_LOCAL = "sync.local"
-    LEFT_HAND_RPC = "left_hand.rpc"
-    RIGHT_HAND_RPC = "right_hand.rpc"
-    WRIST_TRACKER_SDK = "wrist_tracker.sdk"
-    RFU_CTRL_LOCAL = "rfu_control.local"
-    RFU_RETARGET_LOCAL = "rfu_retarget.local"
-    RECORDING_LOCAL = "recording.local"
-    PRESSURE_SENSOR_WIFI = "pressure_sensor.wifi"
-    PRESSURE_SENSOR_USB = "pressure_sensor.usb"
-
-    @staticmethod
-    def from_hand_id(v):
-        if v == MoCapHandIDEnum.RIGHT:
-            return MoCapThreadPluginEnum.RIGHT_HAND_RPC
-        elif v == MoCapHandIDEnum.LEFT:
-            return MoCapThreadPluginEnum.LEFT_HAND_RPC
-        else:
-            raise ValueError(f"Unknown hand_id: {v}")
-
-
-class MoCapProcessPluginEnum(str, Enum):
-    GUI_LOCAL = "gui.local"
-    OPTIMIZE_SHAPE_LOCAL = "optimize.shape.local"
-
-
 class MoCapCalibrateRootType(str, Enum):
     HORIZONTAL = "horizontal"      # 基准：手掌摊平、手背朝上
     VERTICAL_UP = "vertical_up"    # 绕横掌轴（MANO Z）抬起 90°
@@ -126,11 +85,3 @@ class MoCapHandIDEnum(str, Enum):
     LEFT = 'left'
     RIGHT = 'right'
     SPIKE = 'spike'
-
-
-class MoCapFingerType(str, Enum):
-    THUMB = "thumb"
-    INDEX = "index"
-    MIDDLE = "middle"
-    RING = "ring"
-    LITTLE = "little"

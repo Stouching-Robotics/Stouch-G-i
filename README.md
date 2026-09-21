@@ -2,7 +2,7 @@
 
 本工具包用于 STM32 数据手套的设备识别、IMU/触觉数据采集、姿态标定、21 关键点求解、3D 实时显示、录制与回放。
 
-当前 SDK 版本：`2.0.6`
+当前 SDK 版本：`2.0.7`
 
 > 支持平台：**Windows x86_64 / Linux x86_64 + Python 3.10**
 
@@ -24,7 +24,7 @@ SDK/
 ├── requirements.txt             # Python 3.10 依赖
 ├── download_mano.py             # 下载并安装 MANO 手部模型
 ├── 99-stm32-glove.rules         # Linux udev 串口权限规则
-├── runtime/                     # 对外 Python SDK 接口
+├── sdk/                         # 对外 Python SDK 接口
 ├── glove_io/                    # 串口、协议、录制与回放
 ├── algorithm/                   # 标定与求解核心
 ├── gui/                         # 标定、实时显示和回放程序
@@ -53,7 +53,7 @@ py -3.10 -m venv C:\venvs\stouch_glove
 C:\venvs\stouch_glove\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-python -c "import runtime; print(runtime.get_version())"
+python -c "import sdk; print(sdk.get_version())"
 ```
 
 如 `chumpy==0.70` 构建失败：
@@ -75,7 +75,7 @@ python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -c "import runtime; print(runtime.get_version())"
+python -c "import sdk; print(sdk.get_version())"
 
 sudo cp 99-stm32-glove.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
@@ -152,10 +152,10 @@ Windows 和 Linux 的命令相同：
 
 ## Python SDK
 
-所有公开接口都可以直接从 `runtime` 导入：
+所有公开接口都可以直接从 `sdk` 导入：
 
 ```python
-from runtime import (
+from sdk import (
     DeviceManager,
     RawImuStream,
     TactileStream,
@@ -200,7 +200,7 @@ from runtime import (
 默认使用 `config/glove_devices.json` 保存绑定关系。`resolve_port()` 返回 `(串口名称, USB序列号)`。
 
 ```python
-from runtime import DeviceManager
+from sdk import DeviceManager
 
 devices = DeviceManager()
 
@@ -234,7 +234,7 @@ print(bindings.left_port, bindings.right_port)
 下面的示例让 IMU 和触觉共用同一个串口连接：
 
 ```python
-from runtime import DeviceManager, RawImuStream
+from sdk import DeviceManager, RawImuStream
 
 port, _ = DeviceManager().resolve_port("right")
 
@@ -263,7 +263,7 @@ with RawImuStream(serial_port=port) as imu_stream:
 `HandSolver` 不负责打开串口，它只负责把 `RawImuFrame` 或 NumPy 四元数数组转换为手部关键点，因此也可以处理已保存的 IMU 数据。
 
 ```python
-from runtime import HandSolver
+from sdk import HandSolver
 
 solver = HandSolver(
     side="right",
@@ -283,7 +283,7 @@ print(keypoints.valid_mask)      # 16 路 IMU 有效状态
 一般的单手应用建议直接使用 `Glove`。它会根据设备绑定打开对应手套，并把 IMU、21 关键点、触觉和状态放在同一个 `HandFrame` 中。
 
 ```python
-from runtime import Glove, GloveConfig
+from sdk import Glove, GloveConfig
 
 config = GloveConfig(
     side="right",
@@ -313,7 +313,7 @@ with Glove(config) as glove:
 ### 5. BimanualGlove：双手同步接口
 
 ```python
-from runtime import BimanualConfig, BimanualGlove, GloveConfig
+from sdk import BimanualConfig, BimanualGlove, GloveConfig
 
 left = GloveConfig(
     side="left",
@@ -338,7 +338,7 @@ with BimanualGlove(BimanualConfig(left=left, right=right)) as gloves:
 `ImuCalibrator` 将标定过程拆分为多个步骤。应用程序应展示每一步的 `title`，提示用户完成对应动作后再调用 `run_step()`。
 
 ```python
-from runtime import ImuCalibrator
+from sdk import ImuCalibrator
 
 with ImuCalibrator(side="right") as calibrator:
     health = calibrator.connect()
@@ -365,7 +365,7 @@ with ImuCalibrator(side="right") as calibrator:
 ### 7. RecordingReplay：录制文件检查与回放
 
 ```python
-from runtime import RecordingReplay
+from sdk import RecordingReplay
 
 replay = RecordingReplay()
 info = replay.inspect("data/example/chunk-000.parquet")
@@ -385,10 +385,10 @@ print(result.output_path, result.frame_count)
 
 ### 异常处理与资源释放
 
-常用异常也从 `runtime` 导出，例如：
+常用异常也从 `sdk` 导出，例如：
 
 ```python
-from runtime import DeviceNotFoundError, StreamTimeoutError
+from sdk import DeviceNotFoundError, StreamTimeoutError
 
 try:
     frame = glove.read(timeout=1.0)

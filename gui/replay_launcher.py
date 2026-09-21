@@ -49,10 +49,9 @@ _VIDEO_RE = re.compile(r"^Video: (.+?) \(\d+ frames at ")
 
 
 def _default_data_root() -> Path:
-    if getattr(sys, "frozen", False):
-        # Portable layout: recordings live next to the exe.
-        return Path(sys.executable).resolve().parent / "data"
-    return Path(__file__).resolve().parent.parent.parent / "data"
+    # PROJECT_ROOT is the exe directory when frozen and the SDK root otherwise;
+    # recordings live under <root>/data in both cases.
+    return PROJECT_ROOT / "data"
 
 
 def discover_sessions(data_root: Path) -> list[dict]:
@@ -71,11 +70,15 @@ def discover_sessions(data_root: Path) -> list[dict]:
                 rel = parquet.relative_to(root)
             except ValueError:
                 rel = parquet
+            try:
+                ts_label = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, ValueError, OverflowError):
+                ts_label = "?"
             found.append({
                 "parquet": parquet,
                 "folder": parquet.parent,
                 "mtime": mtime,
-                "label": f"{rel}    [{datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M:%S}]",
+                "label": f"{rel}    [{ts_label}]",
             })
     found.sort(key=lambda session: session["mtime"], reverse=True)
     return found

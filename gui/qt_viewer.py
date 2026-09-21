@@ -4,8 +4,9 @@ Design notes (composed, to avoid name clashes):
 - ``QtCanvas`` and ``_CanvasArea`` are plain QWidgets; they do **not** inherit
   Live3DViewer -- Live3DViewer already has ``update()``/``close()``, and
   inheriting QWidget directly would clash with QWidget.update()/close().
-- Live3DViewer only produces the numpy canvas (_draw outputs 1280x720 uint8
-  BGR); QtCanvas displays it via ``QImage(Format_BGR888)`` (zero-copy) and
+- Live3DViewer only produces the numpy canvas (_draw outputs a uint8 BGR array
+  whose size follows the window, see canvas_pixel_size_for); QtCanvas displays
+  it via ``QImage(Format_BGR888)`` (zero-copy) and
   forwards Qt mouse/keyboard events to controller._on_mouse/_key_command after
   synthesizing them **with cv2 constant names**, so subclasses like BimanualViewer
   can override _on_mouse/_key_command unchanged.
@@ -31,6 +32,52 @@ from common.i18n import L  # noqa: E402
 # Default tactile threshold applied at startup: cells below this ADC value are
 # zeroed so tiny baseline / sensor fluctuations do not flicker the cell numbers.
 DEFAULT_TACTILE_THRESHOLD = 60
+
+# Canvas sizing.  The live 3D scene is CPU-rasterised, so the canvas follows
+# the window's own pixels instead of a fixed 1280x720 that Qt then magnified:
+# that magnification was why a fullscreen window went blurry while a windowed
+# one stayed sharp.  The ceiling is a performance budget, not an aesthetic one
+# -- cost is linear in pixel count and the auto viewer's default redraw rate is
+# --fps 60, i.e. a 16.7 ms budget.
+DEFAULT_CANVAS_W, DEFAULT_CANVAS_H = 1280, 720
+MIN_CANVAS_W, MIN_CANVAS_H = 640, 360
+MAX_CANVAS_W, MAX_CANVAS_H = 3840, 2160
+# Measured _draw() cost in the default "hand" display mode, against the
+# 16.7 ms budget: 1280x712 -> 7.0 ms (42%), 1920x952 -> 10.2 ms (61%),
+# 1980x1044 -> 11.5 ms (69%).  This cap therefore covers a maximised window on
+# a 1080p panel natively with room to spare, and leaves a 1440p or 4K window
+# rendering at this size for Qt to scale up -- still far sharper than the
+# ~1.5x nearest-neighbour upscale this replaced.  It is deliberately NOT
+# raised to 2560 * 1440: measured, that canvas costs ~17.8 ms, which is over
+# budget and would drop the default 60 fps.
+MAX_CANVAS_PIXELS = 1920 * 1080
+# Render sizes are floored to a multiple of this: it keeps every scanline
+# 32-bit aligned on any Qt backend for free, and flooring (rather than
+# rounding) guarantees the widget is never smaller than the canvas, so Qt is
+# never asked to downscale the result of a size change.
+CANVAS_SNAP = 4
+
+
+def canvas_pixel_size_for(w: int, h: int, dpr: float = 1.0) -> tuple[int, int]:
+    """Render target in device pixels for a widget of this logical size.
+
+    Pure, so it can be asserted offline (tools/self_test.py).  A degenerate
+    or not-yet-laid-out size falls back to the design baseline; an oversized
+    one is shrunk uniformly to MAX_CANVAS_PIXELS with the aspect preserved.
+    """
+    if w < MIN_CANVAS_W or h < MIN_CANVAS_H:
+        return DEFAULT_CANVAS_W, DEFAULT_CANVAS_H
+    scale = max(1.0, float(dpr))
+    cw = min(int(round(w * scale)), MAX_CANVAS_W)
+    ch = min(int(round(h * scale)), MAX_CANVAS_H)
+    pixels = cw * ch
+    if pixels > MAX_CANVAS_PIXELS:
+        shrink = (MAX_CANVAS_PIXELS / float(pixels)) ** 0.5
+        cw = max(1, int(cw * shrink))
+        ch = max(1, int(ch * shrink))
+    cw = max(MIN_CANVAS_W, cw // CANVAS_SNAP * CANVAS_SNAP)
+    ch = max(MIN_CANVAS_H, ch // CANVAS_SNAP * CANVAS_SNAP)
+    return cw, ch
 
 
 def ensure_qapp() -> QApplication:
@@ -76,6 +123,11 @@ class _CanvasArea(QWidget):
         self._place_view_control()
         self._baseline_overlay: QLabel | None = None
         self._setup_baseline_overlay()
+
+    def canvas_pixel_size(self) -> tuple[int, int]:
+        """Canvas size in device pixels that matches the current widget geometry."""
+        return canvas_pixel_size_for(
+            self.width(), self.height(), self.devicePixelRatioF())
 
     def _setup_baseline_overlay(self) -> None:
         """Large centred banner used during the baseline settle delay."""
@@ -163,10 +215,23 @@ class _CanvasArea(QWidget):
     # ---- Canvas display ----------------------------------------------------
     def set_image(self, qimage: QImage | None) -> None:
         self._image = qimage
+        # Keep the cached canvas size in step with the image.  _to_canvas maps
+        # widget coordinates into canvas coordinates with it, so a stale value
+        # would silently break every hit-test -- the record button, the tactile
+        # resize grips, drag-pan -- as soon as the canvas stops being the
+        # 1280x720 it was constructed with.  They fail by not responding, not
+        # by raising, so this must stay wired to the image itself.
+        if qimage is not None and qimage.width() > 0:
+            self._cw, self._ch = qimage.width(), qimage.height()
         self.update()
 
     def fitted_rect(self) -> QRect:
-        """Fit the canvas into the widget rect at its aspect ratio (letterbox)."""
+        """Fit the canvas into the widget rect at its aspect ratio (letterbox).
+
+        With a canvas sized from canvas_pixel_size() this is an exact 1:1 blit
+        of the widget rect, so nothing is scaled and the sharpness of the
+        canvas reaches the screen unchanged.
+        """
         r = self.rect()
         if self._image is None or self._image.width() <= 0:
             return QRect(r)
@@ -192,6 +257,11 @@ class _CanvasArea(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(18, 24, 34))
         if self._image is not None:
+            # Qt defaults to nearest-neighbour, which reads as blocky for the
+            # one frame where a resize outruns the renderer, and for any window
+            # large enough to hit the MAX_CANVAS_PIXELS cap.  At 1:1 this is a
+            # no-op, and it costs nothing measurable.
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
             p.drawImage(self.fitted_rect(), self._image)
         p.end()
 
@@ -1155,8 +1225,12 @@ class QtCanvas(QWidget):
         if callback is not None:
             callback(self._display_combo.itemData(index))
 
+    def canvas_pixel_size(self) -> tuple[int, int]:
+        """Canvas size the renderer should produce for the window's current geometry."""
+        return self._area.canvas_pixel_size()
+
     def set_canvas(self, bgr: np.ndarray) -> None:
-        """Give the 720x1280x3 uint8 BGR canvas to Qt for display (zero-copy QImage).
+        """Give the uint8 BGR canvas to Qt for display (zero-copy QImage).
 
         QImage does not copy the pixels, so the numpy array reference must be
         kept alive until the next set_canvas; otherwise the memory is freed and

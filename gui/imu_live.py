@@ -56,7 +56,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from common import usb_cdc as uc  # noqa: E402
-from runtime import RawImuStream  # noqa: E402
+from sdk import RawImuStream  # noqa: E402
 
 # Firmware physical channel -> MANO joint id (physical channels 0..15; matches
 # DEFAULT_CHANNEL_TO_HAND in modules/hand/usb_cdc.py / config.json's channel_to_hand)
@@ -187,7 +187,7 @@ def main() -> int:
     imu = RawImuStream(serial_port=port)
     imu.start()
     print(f"Connected. {args.refresh}s refresh, "
-          f"{'' if args.raw else 'MANO remapping applied'} (raw values via the runtime.compat.imu interface)")
+          f"{'' if args.raw else 'MANO remapping applied'} (raw values via the sdk.compat.imu interface)")
 
     csv_fp = None
     if args.csv:

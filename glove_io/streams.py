@@ -17,6 +17,7 @@ from typing import Callable, Iterator
 import numpy as np
 
 from glove_io.usb_protocol import (
+    BLUETOOTH_DONGLE_PID,
     STM32_USB_PID,
     STM32_USB_VID,
     is_supported_version,
@@ -39,6 +40,7 @@ from glove_io.usb_protocol import (
     supports_latency_probe,
 )
 from common.errors import StreamClosedError, StreamTimeoutError
+from common.link_quality import SequenceDropCounter, sequence_mask
 from common.types import RawImuFrame, TactileFrame
 
 
@@ -50,6 +52,13 @@ _IMU_PRESENT_BITS = (1 << np.arange(16)).astype(np.uint32)
 # long an unanswered probe is kept before being discarded.
 LATENCY_PROBE_INTERVAL_S = 2.0
 LATENCY_PROBE_EXPIRY_S = 1.5
+# A silent Bluetooth link is reopened independently by the reader which owns
+# that COM port.  CRC/loss spikes are deliberately *not* used to bounce it:
+# hardware testing proved those spikes come from two-radio interference, and
+# repeatedly reopening the same port cannot cure interference.
+BT_VALID_FRAME_SILENCE_S = 2.0
+BT_RECOVERY_COOLDOWN_S = 12.0
+BT_REOPEN_DELAY_S = 1.0
 
 
 def _monotonic_us() -> int:
@@ -127,6 +136,7 @@ class _UsbSensorTransport:
         self.requested_port = serial_port
         self.usb_vid = int(usb_vid)
         self.usb_pid = int(usb_pid)
+        self._is_bluetooth = self.usb_pid == BLUETOOTH_DONGLE_PID
         self.imu_queue: Queue[RawImuFrame] = Queue(
             maxsize=max(2, int(imu_queue_size)))
         self.tactile_queue: Queue[TactileFrame] = Queue(
@@ -164,7 +174,15 @@ class _UsbSensorTransport:
             "crc_errors": 0,
             "length_errors": 0,
             "discarded_bytes": 0,
+            "recoveries": 0,
         }
+        self._recovery_count = 0
+        # Sequence-gap loss, same publishing contract as ``link_errors``.  This
+        # is the one measurement that separates a link that is dropping frames
+        # from a host that is discarding them, so it is fed every frame the
+        # parser produces -- all five types share the device's counter.
+        self._drop_counter = SequenceDropCounter()
+        self.link_drops: dict[str, int] = {"frames": 0, "dropped": 0}
 
     @property
     def mag_telemetry(self) -> MagTelemetrySnapshot | None:
@@ -197,7 +215,9 @@ class _UsbSensorTransport:
             "crc_errors": parser.crc_errors,
             "length_errors": parser.length_errors,
             "discarded_bytes": parser.discarded_bytes,
+            "recoveries": self._recovery_count,
         }
+        self.link_drops = self._drop_counter.snapshot()
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -235,6 +255,13 @@ class _UsbSensorTransport:
 
         now = time.monotonic()
         self._expire_pending_pings(now)
+        # The BP101Y link is half-duplex at the application boundary and the
+        # gloves already fill most of its UART budget with IMU + pressure data.
+        # Automatic two-second probes add reverse traffic exactly when a weak
+        # link is congested.  Explicit ``ping()`` remains available for a
+        # deliberate diagnostic, but live Bluetooth acquisition stays one-way.
+        if self._is_bluetooth:
+            return
         if now < self._next_probe_s:
             return
         self._next_probe_s = now + LATENCY_PROBE_INTERVAL_S
@@ -361,6 +388,8 @@ class _UsbSensorTransport:
 
         parser = UsbCdcFrameParser()
         serial_handle = None
+        last_valid_frame_s = time.monotonic()
+        next_recovery_s = 0.0
         while not self.stop_event.is_set():
             if serial_handle is None:
                 try:
@@ -376,6 +405,9 @@ class _UsbSensorTransport:
                     serial_handle = serial.Serial(
                         port, baudrate=115200, timeout=0.2)
                     parser.reset()
+                    self._drop_counter.reset()
+                    opened_s = time.monotonic()
+                    last_valid_frame_s = opened_s
                     with self._state_lock:
                         self.active_port = str(port)
                         self.connected = True
@@ -392,17 +424,22 @@ class _UsbSensorTransport:
                     continue
 
             try:
-                # ``read(4096)`` waits for a nearly full 4 KiB block (or the
-                # 200 ms timeout) on Windows.  Since IMU and tactile packets
-                # share this CDC stream, that batches roughly 6-8 IMU samples
-                # into each host read.  Real-time consumers intentionally keep
-                # only the newest queued IMU frame, so the batching turns an
-                # 80 Hz device stream into about 10 Hz of solved hand poses.
-                #
                 # Block for one byte when idle, then immediately drain whatever
                 # the driver already has.  The frame parser accepts partial
                 # packets, so this preserves throughput while removing the
-                # host-side batching delay.
+                # host-side batching delay.  (Reading with ``read(4096)``
+                # instead waits for a nearly full 4 KiB block on Windows, which
+                # on a wired link batching 6-8 IMU samples per read is what
+                # used to turn an 80 Hz device stream into about 10 Hz of
+                # solved poses.)
+                #
+                # What arrives is still a *batch*, not a single frame: a
+                # Bluetooth dongle hands over one batch per RF event, so a
+                # read here can carry several frames that the device produced
+                # tens of milliseconds apart.  Trimming that batch to keep only
+                # its newest frame discards device frames the link delivered
+                # perfectly well, which is a host-side loss, not a link loss --
+                # ``link_drops`` below is what tells the two apart.
                 data = _read_available(serial_handle)
             except (OSError, serial.SerialException) as exc:
                 self._set_status("disconnected", f"serial read failed: {exc}")
@@ -421,12 +458,21 @@ class _UsbSensorTransport:
             # Time-driven, so it still fires on a link that is idle right now.
             self._maybe_probe_latency()
 
-            if not data:
-                continue
-            for wire_frame in parser.feed(data):
+            wire_frames = parser.feed(data) if data else []
+            if wire_frames:
+                last_valid_frame_s = time.monotonic()
+            for wire_frame in wire_frames:
                 host_timestamp_us = time.time_ns() // 1_000
                 with self._state_lock:
                     self.firmware_version = wire_frame.version
+                # Every frame type draws from one device-wide counter, so the
+                # gap is charged against all of them, not just the IMU ones.
+                self._drop_counter.observe(
+                    wire_frame.sequence,
+                    host_timestamp_us,
+                    sequence_mask(
+                        wire_frame.header_size, wire_frame.version),
+                )
                 if not is_supported_version(wire_frame.version):
                     self._set_status(
                         "error",
@@ -472,6 +518,42 @@ class _UsbSensorTransport:
                 except ValueError as exc:
                     self._set_status("error", f"invalid USB payload: {exc}")
             self._sync_link_errors(parser)
+
+            # Recover only the damaged Bluetooth side.  Closing this handle
+            # has no effect on the other hand because every hand owns a separate
+            # transport (and, in the bimanual viewer, a separate process).
+            now_s = time.monotonic()
+            recovery_reason = None
+            if self._is_bluetooth and now_s >= next_recovery_s:
+                if now_s - last_valid_frame_s >= BT_VALID_FRAME_SILENCE_S:
+                    recovery_reason = (
+                        f"no valid frame for {now_s - last_valid_frame_s:.1f}s")
+
+            if recovery_reason is not None:
+                self._recovery_count += 1
+                self._sync_link_errors(parser)
+                self._set_status(
+                    "recovering",
+                    f"Bluetooth auto-recovery #{self._recovery_count}: "
+                    f"{recovery_reason}")
+                # Do not send AT+REBOOT automatically.  On some BP101Y units
+                # that command removes the USB device without re-enumerating it
+                # until a physical unplug/replug.  Reopen only this COM handle;
+                # the explicit toolbar action remains available when a person
+                # deliberately wants a hardware reboot.
+                with self._state_lock:
+                    self.connected = False
+                    self._serial_handle = None
+                self._fail_pending_pings()
+                try:
+                    serial_handle.close()
+                except Exception:
+                    pass
+                serial_handle = None
+                parser.reset()
+                next_recovery_s = now_s + BT_RECOVERY_COOLDOWN_S
+                self.stop_event.wait(BT_REOPEN_DELAY_S)
+                continue
 
         if serial_handle is not None:
             try:
@@ -600,6 +682,8 @@ class RawImuStream:
         ``crc_errors`` counts frames whose CRC rejected the candidate layout,
         ``length_errors`` frames whose declared length was impossible, and
         ``discarded_bytes`` bytes dropped while hunting for the next magic.
+        ``recoveries`` counts automatic Bluetooth COM reopens triggered by two
+        seconds without a valid frame.
         Cumulative since the transport started, so a caller wanting a rate keeps
         the previous triple and subtracts.  A steady stream at zero is normal;
         a rising ``discarded_bytes`` means the parser, not the transport, is
@@ -607,6 +691,25 @@ class RawImuStream:
         """
 
         return self._transport.link_errors
+
+    @property
+    def link_drops(self) -> dict[str, int]:
+        """Cumulative sequence-gap loss for this link.
+
+        ``frames`` counts every frame the host received -- all five frame types,
+        since they share one device-wide counter -- and ``dropped`` the frames
+        the device sent that never reached the host, so
+        ``dropped / (frames + dropped)`` is the share of the device's own stream
+        lost in the link.  Cumulative since the transport started; a caller
+        wanting a rate keeps the previous pair and subtracts.
+
+        This is the counterweight to :attr:`link_errors`: those count bytes the
+        parser rejected, this counts frames the link never delivered.  Neither
+        rises when a consumer deliberately discards frames it received, which is
+        why the two together say where frames are going.
+        """
+
+        return self._transport.link_drops
 
     def ping(self, timeout_s: float = 1.0) -> UsbLinkLatency | None:
         """Measure the host<->device round trip (firmware v1.2.11+).

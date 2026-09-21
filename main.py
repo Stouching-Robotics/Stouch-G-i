@@ -35,10 +35,10 @@ def _fixup_stdio() -> None:
     PyInstaller's ``--windowed`` mode leaves ``sys.stdout``/``sys.stderr`` as
     ``None`` because there is no console.  That breaks anything that hands the
     stream to a third party: ``loguru``'s ``logger.add(sys.stderr)`` raises
-    ``TypeError: Cannot log to objects of type 'NoneType'``, and bare
-    ``sys.stdout.isatty()`` raises ``AttributeError``.  Both happen at *module
-    import* time inside ``algorithm/imu_calibrate_cli.py`` (lines 69-71), which
-    is why selecting the calibration program used to die on a traceback.
+    ``TypeError: Cannot log to objects of type 'NoneType'``.  It happens at
+    *module import* time inside ``algorithm/imu_calibrate_cli.py``
+    (``logger.add(sys.stderr)``), which is why selecting the calibration program
+    used to die on a traceback.
     """
     if not getattr(sys, "frozen", False):
         return

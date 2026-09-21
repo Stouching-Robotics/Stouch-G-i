@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from runtime.glove import GloveEngine
+from sdk.glove import GloveEngine
 from common.errors import RecordingError
 from common.types import (
     BimanualConfig, BimanualFrame, BimanualHealth,

@@ -21,9 +21,9 @@ from glove_io.tactile_processing import TactilePreprocessor
 from common.errors import (
     DeviceNotFoundError, RecordingError,
     StreamClosedError, StreamTimeoutError)
-from runtime.interfaces.device import DeviceManager
-from runtime.interfaces.sensors import RawImuStream
-from runtime.interfaces.solver import HandSolver
+from sdk.interfaces.device import DeviceManager
+from sdk.interfaces.sensors import RawImuStream
+from sdk.interfaces.solver import HandSolver
 from common.types import (
     DeviceHealth, GloveConfig, HandFrame,
     RecordingResult, RecordingStatus)

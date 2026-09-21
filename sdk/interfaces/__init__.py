@@ -6,15 +6,15 @@ import importlib
 
 
 _MODULES = {
-    "RawImuStream": "runtime.interfaces.sensors",
-    "SensorStream": "runtime.interfaces.sensors",
-    "TactileStream": "runtime.interfaces.sensors",
-    "DeviceManager": "runtime.interfaces.device",
-    "HandSolver": "runtime.interfaces.solver",
-    "Glove": "runtime.interfaces.glove",
-    "BimanualGlove": "runtime.interfaces.bimanual",
-    "ImuCalibrator": "runtime.interfaces.calibration",
-    "RecordingReplay": "runtime.interfaces.replay",
+    "RawImuStream": "sdk.interfaces.sensors",
+    "SensorStream": "sdk.interfaces.sensors",
+    "TactileStream": "sdk.interfaces.sensors",
+    "DeviceManager": "sdk.interfaces.device",
+    "HandSolver": "sdk.interfaces.solver",
+    "Glove": "sdk.interfaces.glove",
+    "BimanualGlove": "sdk.interfaces.bimanual",
+    "ImuCalibrator": "sdk.interfaces.calibration",
+    "RecordingReplay": "sdk.interfaces.replay",
 }
 
 __all__ = [

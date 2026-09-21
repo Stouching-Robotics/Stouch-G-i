@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from runtime.bimanual import BimanualEngine as _Engine
+from sdk.bimanual import BimanualEngine as _Engine
 from common.types import (
     BimanualConfig, BimanualFrame, BimanualHealth,
     RecordingResult, RecordingStatus)

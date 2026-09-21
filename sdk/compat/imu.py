@@ -1,4 +1,4 @@
-"""runtime.compat.imu — 公开的 IMU 原始数据接口（纯源码，不加密）。
+"""sdk.compat.imu — 公开的 IMU 原始数据接口（纯源码，不加密）。
 
 ``ImuStream`` 在后台起一个 STM32 USB CDC 接收线程（复用
 ``glove_lite.usb_receiver.hand_usb_receiver``），对外提供两类视图：
@@ -7,7 +7,7 @@
                       不重映射、不滤波、不轴校正），仅构造时 ``publish_physical=True`` 可用。
 
 同串口的触觉数据会推入 ``pressure_buffer``，可用 ``tactile_frames()`` 消费，
-或交给 :class:`runtime.compat.tactile.TactileStream` 复用（避免同一串口双线程）。
+或交给 :class:`sdk.compat.tactile.TactileStream` 复用（避免同一串口双线程）。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import threading
 import time
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator
 
 import numpy as np
 
@@ -199,5 +199,5 @@ class ImuStream:
 
     def tactile_frames(self):
         """便捷方法：消费同串口的 16×16 触觉帧（等价 TactileStream(imu=self)）。"""
-        from runtime.compat.tactile import TactileStream
+        from sdk.compat.tactile import TactileStream
         return TactileStream(imu=self).frames()
