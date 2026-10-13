@@ -22,7 +22,7 @@
 SDK/
 ├── main.py                       # Windows/Linux 统一入口
 ├── requirements.txt             # Python 3.10 依赖
-├── download_mano.py             # 下载并安装 MANO 手部模型
+├── download_mano.py             # 自检 MANO 资源，必要时重新安装并重建派生网格
 ├── 99-stm32-glove.rules         # Linux udev 串口权限规则
 ├── sdk/                         # 对外 Python SDK 接口
 ├── glove_io/                    # 串口、协议、录制与回放
@@ -86,19 +86,24 @@ sudo udevadm trigger
 
 ## 手部模型（MANO）
 
-21 关键点求解与 3D 显示依赖 MANO 手部模型。MANO 由 Max-Planck 提供，仅授权**非商业**科研/教育用途，且**禁止再分发**，因此本仓库不包含模型文件，需每位使用者自行注册下载。
+21 关键点求解与 3D 显示依赖 MANO 手部模型。模型文件**随本仓库一并分发**，克隆下来即可运行，无需另行下载：
 
-1. 访问 <https://mano.is.tue.mpg.de/>，注册账号并接受许可协议。
-2. 下载 **Models & Code（MANO v1.2）**，解压后得到 `MANO_LEFT.pkl` 与 `MANO_RIGHT.pkl`。
-3. 在本（`SDK`）目录运行安装脚本：
+| 文件 | 用途 |
+|---|---|
+| `assets/hand/models/MANO_{LEFT,RIGHT}.pkl` | Max-Planck 官方模型；3D 显示从它取三角面索引 |
+| `assets/hand/HAND_{LEFT,RIGHT}_PINKY_PLUS_2MM.npz` | 据官方模型生成的 21 关键点派生网格，求解与 3D 显示实际加载的就是它 |
 
-   ```powershell
-   python download_mano.py --install MANO_LEFT.pkl MANO_RIGHT.pkl
-   ```
+MANO 由 Max-Planck 提供，仅授权**非商业**科研/教育用途。许可全文见 `assets/hand/LICENSE.txt`；商业用途请单独联系 Max-Planck（ps-license@tue.mpg.de）。
 
-   也可以把解压后的整个目录直接传给 `--install`，脚本会自动识别左右手文件。
+如果需要从官方渠道重新获取模型，或调整手部厚度后重建派生网格，用 `download_mano.py`：
 
-脚本会把两个 PKL 复制到 `assets/hand/models/`，并据此重建 `assets/hand/HAND_*_PINKY_PLUS_2MM.npz`（求解与 3D 显示实际加载的是后者）。运行 `python download_mano.py` 可随时查看安装状态，`--open` 可直接打开下载页面。许可全文见 `assets/hand/LICENSE.txt`；商业用途请单独联系 Max-Planck（ps-license@tue.mpg.de）。
+```powershell
+python download_mano.py                            # 查看当前资源状态
+python download_mano.py --install <解压后的目录>    # 安装 PKL 并重建 npz
+python download_mano.py --open                     # 打开官方下载页面
+```
+
+`--install` 会把 `MANO_LEFT.pkl` / `MANO_RIGHT.pkl` 复制到 `assets/hand/models/`（可直接传解压后的整个目录，脚本会自动识别左右手文件），再据此重建 `assets/hand/HAND_*_PINKY_PLUS_2MM.npz`。
 
 ## 设备绑定
 
@@ -404,7 +409,7 @@ except DeviceNotFoundError as exc:
 
 - 正式打包前请删除所有 `__pycache__/`、`*.pyc`、录制数据和临时标定文件。
 - 请检查 `config/glove_devices.json` 与 `config/calibration_bindings.json`，避免对外发布无关设备序列号或失效路径。
-- `assets/hand/` 中的 MANO 模型及派生资源受单独许可证约束，对外发布前请阅读 `assets/hand/LICENSE.txt` 并确认再分发授权。
+- `assets/hand/` 中的 MANO 模型及派生资源随本仓库分发，受 Max-Planck 单独许可证约束（仅限非商业科研/教育用途）。再分发前请阅读 `assets/hand/LICENSE.txt`；商业用途请联系 ps-license@tue.mpg.de。
 
 ## 常见问题
 
