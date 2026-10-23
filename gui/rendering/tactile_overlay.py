@@ -11,7 +11,6 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from glove_io.pressure_linear_fit import fit_finger_force_matrix
 from gui.rendering.tactile import HAND_REGIONS_LEFT, HAND_REGIONS_RIGHT
 
 
@@ -56,11 +55,23 @@ _PRESSURE_BANDS_CORRECTED = (
     (float("inf"), (68, 68, 239)),  # #ef4444 red, no upper limit
 )
 _PRESSURE_BANDS_RAW = (
-    (2000, (95, 58, 30)),           # #1e3a5f dark blue (~empty-glove floor)
-    (2400, (199, 134, 22)),         # #1686c7 blue
-    (2800, (94, 197, 34)),          # #22c55e green
-    (3200, (21, 204, 250)),         # #facc15 yellow
-    (3600, (22, 115, 249)),         # #f97316 orange
+    # The first band is deliberately wide, and there is nothing below it.
+    #
+    # An unloaded glove does not sit at one value: measured on the real right
+    # hand over 18 s it spans 2020-2239, because each sensor carries its own
+    # offset.  Narrow 100-count steps at the bottom therefore spend their
+    # whole range on *offsets* rather than on pressure -- the resting hand
+    # came out 95.3% blue with the rest green and yellow, and those specks sat
+    # right on the band edges and flickered as the device refreshed.  One
+    # wide blue band covers the unloaded spread and the 2000 floor the viewer
+    # clamps to, so a resting hand is one flat colour and only a real contact
+    # changes it.  The corrected scale, which is the calibrated one, keeps its
+    # fine steps.
+    (2300, (199, 134, 22)),         # #1686c7 blue: unloaded, and the floor
+    (2500, (94, 197, 34)),          # #22c55e green
+    (2800, (21, 204, 250)),         # #facc15 yellow
+    (3200, (22, 115, 249)),         # #f97316 orange
+    (3600, (48, 90, 249)),          # orange-red
     (float("inf"), (68, 68, 239)),  # #ef4444 red, no upper limit
 )
 _PRESSURE_BANDS_FORCE_N = (
@@ -89,6 +100,21 @@ _CARD_CACHE_MAX = 8
 # uncapped cache would keep a full-size template for each step of the drag.
 _TEMPLATE_CACHE: dict[tuple[str, int], tuple] = {}
 _TEMPLATE_CACHE_MAX = 8
+
+
+def _remember(cache: dict, limit: int, key, value) -> None:
+    """Add one entry to a cache, dropping the oldest first when it is full.
+
+    Every cache in this module is bounded and evicts in insertion order.  The
+    limits are sized for the working set of a running viewer, not as a
+    performance lever: they exist so that a long session in one of the modes
+    whose key space is open-ended -- ``linear_matrix`` labels every cell with
+    an unrounded force -- cannot grow a cache without limit.
+    """
+
+    if len(cache) >= limit:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
 _CARD_HEADER = 34
 _CARD_PAD_X = 10
 _CARD_PAD_TOP = 6
@@ -437,6 +463,40 @@ def _draw_region_outlines(
 
 _GLYPH_FONT = cv2.FONT_HERSHEY_SIMPLEX
 _GLYPH_TILE_CACHE: dict[tuple, tuple[np.ndarray, int, int]] = {}
+# Bounded for the same reason as the cards and templates, and with the same
+# kind of margin: a session's working set is a few hundred numbers per hand, so
+# these limits are a guard rail rather than something a viewer hits.
+_GLYPH_TILE_CACHE_MAX = 8192
+_TEXT_METRICS: dict[tuple[str, int], tuple[float, int, int]] = {}
+_TEXT_METRICS_MAX = 4096
+
+
+def _text_metrics(
+        label: str, cell: int, scale: float) -> tuple[float, int, int]:
+    """The scale and pixel size ``label`` is drawn at inside a ``cell`` box.
+
+    Measured once per ``(label, cell)`` instead of once per cell per frame.
+    The auto-shrink below needs a ``cv2.getTextSize`` before it can decide
+    whether to shrink at all, and a second one to measure the result, so a
+    card whose cells all carry numbers spent roughly 390 of those calls per
+    frame -- on one hand 4- and 5-digit readings in a 28 px cell always take
+    the shrink path.  The labels repeat heavily: an unloaded glove shows its
+    own offset plus a little noise, so a hand's 195 cells carry only a few
+    hundred distinct numbers between them.
+    """
+
+    key = (label, cell)
+    cached = _TEXT_METRICS.get(key)
+    if cached is not None:
+        return cached
+    available = max(5, cell - 2)
+    (width, height), _ = cv2.getTextSize(label, _GLYPH_FONT, scale, 1)
+    if width > available:
+        scale *= available / float(width)
+        (width, height), _ = cv2.getTextSize(label, _GLYPH_FONT, scale, 1)
+    measured = (scale, width, height)
+    _remember(_TEXT_METRICS, _TEXT_METRICS_MAX, key, measured)
+    return measured
 
 
 def _digit_tile(text: str, scale: float, bg, fg, shadow):
@@ -460,7 +520,7 @@ def _digit_tile(text: str, scale: float, bg, fg, shadow):
                 shadow, 1, cv2.LINE_AA)
     cv2.putText(tile, text, (ox, oy), _GLYPH_FONT, scale, fg, 1, cv2.LINE_AA)
     sprite = (tile, ox, oy)
-    _GLYPH_TILE_CACHE[key] = sprite
+    _remember(_GLYPH_TILE_CACHE, _GLYPH_TILE_CACHE_MAX, key, sprite)
     return sprite
 
 
@@ -490,7 +550,16 @@ def _draw_cell_values(
 
     Digits are baked once into small cached tiles and blitted as plain uint8
     copies, removing the ~780 anti-aliased ``putText`` calls per frame that
-    dominated the budget when the matrix and the full-hand mesh were shown."""
+    dominated the budget when the matrix and the full-hand mesh were shown.
+    What is left per cell is a cached metric lookup, one glyph-tile lookup and
+    one block copy, with the label's size and the background's contrast
+    answered from a table the same way the glyph itself is."""
+
+    base_scale = (0.45 if cell >= 18 else 0.36) * _ui_factor(cell)
+    # Glyph colours depend only on the band colour, and there are six of those
+    # per scale, so the contrast decision is made once per colour rather than
+    # once per cell.
+    contrast: dict[tuple[int, int, int], tuple] = {}
     for row in range(_GRID_ROWS):
         for col in range(_GRID_COLS):
             if linear_fitted:
@@ -498,25 +567,24 @@ def _draw_cell_values(
                          if row < 4 else "--")
             else:
                 label = str(int(round(float(displayed[row, col]))))
-            scale = (0.45 if cell >= 18 else 0.36) * _ui_factor(cell)
-            (width, height), _ = cv2.getTextSize(label, _GLYPH_FONT, scale, 1)
-            available = max(5, cell - 2)
-            if width > available:
-                scale *= available / float(width)
-                (width, height), _ = cv2.getTextSize(
-                    label, _GLYPH_FONT, scale, 1)
+            scale, width, height = _text_metrics(label, cell, base_scale)
 
             x0 = grid_x + col * cell
             y0 = grid_y + row * cell
             origin_x = x0 + max(1, (cell - width) // 2)
             origin_y = y0 + max(height + 1, (cell + height) // 2)
-            bg = tuple(int(channel) for channel in cell_colors[row, col])
-            blue, green, red = bg
-            luminance = 0.114 * blue + 0.587 * green + 0.299 * red
-            foreground = ((12, 18, 25) if luminance >= 150
-                          else (244, 247, 252))
-            shadow = ((238, 242, 248) if luminance >= 150
-                      else (5, 10, 16))
+            bg = (int(cell_colors[row, col, 0]), int(cell_colors[row, col, 1]),
+                  int(cell_colors[row, col, 2]))
+            glyph_colors = contrast.get(bg)
+            if glyph_colors is None:
+                blue, green, red = bg
+                light = 0.114 * blue + 0.587 * green + 0.299 * red >= 150
+                glyph_colors = (
+                    ((12, 18, 25) if light else (244, 247, 252)),
+                    ((238, 242, 248) if light else (5, 10, 16)),
+                )
+                contrast[bg] = glyph_colors
+            foreground, shadow = glyph_colors
             sprite = _digit_tile(label, scale, bg, foreground, shadow)
             _blit_tile(card, sprite, origin_x, origin_y)
 
@@ -626,10 +694,41 @@ def _render_card_template(side: str, cell: int) -> tuple:
     cell_interior[1:-1, 1:-1] = True
     paint_mask = np.kron(region_at != "", cell_interior)
     cached = (card, mask, paint_mask, grid_x, grid_y, bounds)
-    if len(_TEMPLATE_CACHE) >= _TEMPLATE_CACHE_MAX:
-        _TEMPLATE_CACHE.pop(next(iter(_TEMPLATE_CACHE)))
-    _TEMPLATE_CACHE[cache_key] = cached
+    _remember(_TEMPLATE_CACHE, _TEMPLATE_CACHE_MAX, cache_key, cached)
     return cached
+
+
+def _paint_cell_colors(
+        grid: np.ndarray, cell_colors: np.ndarray, cell: int,
+        paint_mask: np.ndarray) -> None:
+    """Fill every mapped cell's interior with its band colour.
+
+    One slice write per mapped cell, straight from the cell-resolution colour
+    array.  The obvious vectorised forms are both slower, measured on a real
+    479x487 card: expanding the colours to full resolution and writing them
+    through the mask with ``np.copyto(..., where=)`` costs 1.20 ms, and the
+    3-D boolean fancy index (``grid[mask] = expanded[mask]``) costs 4.67 ms,
+    a quarter of a 60 Hz frame for one hand and, before this, half the cost of
+    the whole re-render.  Both spend their time materialising a 258 KB colour
+    block and then walking the whole 152 KB grid to find the 132 KB that the
+    mask allows; the slices touch exactly those bytes and nothing else, and
+    come to 0.60 ms.
+
+    ``paint_mask`` is still what decides which cells are mapped -- it is the
+    template's own map, and the probe below reads the cell's corner, which
+    ``cell_interior`` always covers for a cell that is part of a region.  The
+    two are checked against each other in ``tmp/verify_tactile_paint.py``.
+    """
+
+    rows, cols = cell_colors.shape[:2]
+    inner = cell - 2
+    for row in range(rows):
+        y0 = row * cell + 1
+        for col in range(cols):
+            if not paint_mask[y0, col * cell + 1]:
+                continue
+            x0 = col * cell + 1
+            grid[y0:y0 + inner, x0:x0 + inner] = cell_colors[row, col]
 
 
 def _render_card(
@@ -648,11 +747,10 @@ def _render_card(
     displayed = _display_matrix(values, side)
     peak = max(0.0, float(values.max()))
     cell_colors = _band_colors(displayed, bands)
-    expanded = np.repeat(np.repeat(cell_colors, cell, axis=0), cell, axis=1)
     grid_h = _GRID_ROWS * cell
     grid_w = _GRID_COLS * cell
     grid = card[grid_y:grid_y + grid_h, grid_x:grid_x + grid_w]
-    grid[paint_mask] = expanded[paint_mask]
+    _paint_cell_colors(grid, cell_colors, cell, paint_mask)
 
     # Repaint just six outlines so anti-aliased edges remain crisp at any heat.
     _draw_region_outlines(card, grid_x, grid_y, cell, bounds)
@@ -680,46 +778,52 @@ def draw_bimanual_tactile_overlay(
         tactile_frames: dict[str, np.ndarray | None],
         threshold: float = 0.0,
         scale: float = 0.6,
-        baseline_corrected: bool = True,
+        baseline_corrected: bool | dict[str, bool] = True,
         linear_fitted: bool = False) -> np.ndarray:
     """Draw compact active-region pressure cards on a 1280x720 BGR frame.
 
-    ``baseline_corrected`` selects the fixed colour scale: the corrected
-    (baseline-subtracted) bands when True, else the full raw-ADC bands.
+    ``linear_fitted`` says the frame already carries force in newtons -- which
+    is what the public SDK hands over -- so there is nothing left to fit and
+    the newton bands are used.  NaN cells (positions no fitted region covers)
+    read as zero force.  Otherwise ``baseline_corrected`` selects the fixed
+    colour scale for legacy ADC recordings: the corrected (baseline-subtracted)
+    bands when True, else the full raw-ADC bands.
     """
 
-    bands = (
-        _PRESSURE_BANDS_FORCE_N
-        if linear_fitted
-        else (
-            _PRESSURE_BANDS_CORRECTED if baseline_corrected
-            else _PRESSURE_BANDS_RAW
+    def bands_for(side: str) -> list:
+        corrected = (
+            bool(baseline_corrected.get(side, False))
+            if isinstance(baseline_corrected, dict)
+            else bool(baseline_corrected)
         )
-    )
+        if linear_fitted:
+            return _PRESSURE_BANDS_FORCE_N
+        return _PRESSURE_BANDS_CORRECTED if corrected else _PRESSURE_BANDS_RAW
+
     for side in _drawable_sides(tactile_frames):
+        bands = bands_for(side)
+        corrected = (
+            bool(baseline_corrected.get(side, False))
+            if isinstance(baseline_corrected, dict)
+            else bool(baseline_corrected)
+        )
         frame = np.asarray(
             tactile_frames[side], dtype=np.float32).reshape(16, 16)
         frame = np.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
         if threshold > 0:
             frame = np.where(frame < float(threshold), 0.0, frame)
-        if linear_fitted:
-            frame = np.nan_to_num(
-                fit_finger_force_matrix(frame, side),
-                nan=0.0, posinf=0.0, neginf=0.0)
 
         # The cell size depends on the frame as well as on the scale, so the
         # frame shape joins the cache key: the same scale on a smaller canvas
         # would otherwise reuse a card too wide for it.
         cell = _card_cell(scale, img.shape)
         cache_key = (side, frame.tobytes(), float(threshold), cell,
-                     baseline_corrected, linear_fitted)
+                     corrected, linear_fitted)
         cached = _CARD_CACHE.get(cache_key)
         if cached is None:
             cached = _render_card(
                 frame, side, cell, bands, linear_fitted=linear_fitted)
-            if len(_CARD_CACHE) >= _CARD_CACHE_MAX:
-                _CARD_CACHE.pop(next(iter(_CARD_CACHE)))
-            _CARD_CACHE[cache_key] = cached
+            _remember(_CARD_CACHE, _CARD_CACHE_MAX, cache_key, cached)
         card, mask = cached
 
         card_h, card_w = card.shape[:2]

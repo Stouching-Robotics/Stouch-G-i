@@ -30,13 +30,34 @@ _PRESSURE_BANDS_CORRECTED = (
     (float("inf"), (68, 68, 239)),
 )
 _PRESSURE_BANDS_RAW = (
+    # Resolve the low-force ADC range instead of hiding it in one 2000-2400
+    # band.  This keeps 2000 -> 2300 visibly changing without touching the
+    # baseline-corrected scale below.
     (2000, (95, 58, 30)),
-    (2400, (199, 134, 22)),
-    (2800, (94, 197, 34)),
-    (3200, (21, 204, 250)),
-    (3600, (22, 115, 249)),
+    (2100, (199, 134, 22)),
+    (2200, (94, 197, 34)),
+    (2300, (21, 204, 250)),
+    (2500, (22, 160, 249)),
+    (2800, (22, 115, 249)),
+    (3200, (48, 90, 249)),
+    (3600, (68, 68, 239)),
+    (float("inf"), (55, 55, 220)),
+)
+# The public SDK hands over finger force in newtons, already fitted and with
+# NaN outside the mapped regions, so the only scale this viewer needs is the
+# newton one.  It matches the compact 2D card's own force bands.
+_PRESSURE_BANDS_FORCE_N = (
+    (1.0, (95, 58, 30)),
+    (2.0, (199, 134, 22)),
+    (3.0, (94, 197, 34)),
+    (4.0, (21, 204, 250)),
+    (5.0, (22, 115, 249)),
     (float("inf"), (68, 68, 239)),
 )
+# Newton-scale heat ramp: a cell is grey until it carries a real force, and the
+# full blue->red sweep spans the band table above.
+_NEWTON_SPAN = 5.0
+_NEWTON_CONTACT_FLOOR_N = 0.05
 
 
 MATRIX_ROWS = 16
@@ -112,22 +133,32 @@ def canonical_pressure_matrix(matrix: np.ndarray, side: str) -> np.ndarray:
     return np.ascontiguousarray(values[::-1, ::-1].T)
 
 
-def _pressure_color(value: np.ndarray, baseline_corrected: bool) -> np.ndarray:
-    bands = (_PRESSURE_BANDS_CORRECTED if baseline_corrected
-             else _PRESSURE_BANDS_RAW)
+def _pressure_color(
+        value: np.ndarray, baseline_corrected: bool,
+        newtons: bool = False) -> np.ndarray:
+    if newtons:
+        bands = _PRESSURE_BANDS_FORCE_N
+    else:
+        bands = (_PRESSURE_BANDS_CORRECTED if baseline_corrected
+                 else _PRESSURE_BANDS_RAW)
     upper = np.asarray([item[0] for item in bands], dtype=np.float32)
     palette = np.asarray([item[1] for item in bands], dtype=np.uint8)
     index = np.searchsorted(upper, np.maximum(value, 0.0), side="left")
     return palette[np.clip(index, 0, len(palette) - 1)]
 
 
-def _heat_colors(value: np.ndarray, baseline_corrected: bool) -> np.ndarray:
+def _heat_colors(
+        value: np.ndarray, baseline_corrected: bool,
+        newtons: bool = False) -> np.ndarray:
     values = np.maximum(0.0, np.asarray(value, dtype=np.float32))
     # Raw frames are around 2000 at rest; baseline-corrected frames are around
     # zero.  Keeping this reference fixed means an unloaded cell remains grey
     # instead of being promoted to blue just because another cell is pressed.
-    reference = 0.0 if baseline_corrected else 2000.0
-    span = 1800.0 if baseline_corrected else 2095.0
+    if newtons:
+        reference, span = 0.0, _NEWTON_SPAN
+    else:
+        reference = 0.0 if baseline_corrected else 2000.0
+        span = 1800.0 if baseline_corrected else 2095.0
     level = (values - reference) / span
     level = np.clip(level, 0.0, 1.0)
     return np.stack([
@@ -136,19 +167,35 @@ def _heat_colors(value: np.ndarray, baseline_corrected: bool) -> np.ndarray:
     ], axis=-1).astype(np.uint8)
 
 
-def _heat_display_values(
-        values: np.ndarray, baseline_corrected: bool,
-        threshold: float) -> np.ndarray:
-    """Keep every cell visible while making sub-threshold cells grey."""
+def _contact_floor(
+        values: np.ndarray, threshold: float, newtons: bool = False) -> float:
+    """The value above which a cell counts as touching something.
 
-    values = np.maximum(0.0, np.asarray(values, dtype=np.float32))
+    ADC frames need a relative floor -- the unloaded glove carries its own
+    per-sensor offset -- so it is taken from the frame's own low percentile.
+    A newton frame has an absolute zero already, so a fixed small floor is
+    both simpler and comparable between hands and sessions.
+    """
+
+    if newtons:
+        return max(_NEWTON_CONTACT_FLOOR_N, float(threshold))
     peak = float(np.max(values, initial=0.0))
     baseline = float(np.percentile(values, 20.0))
     contact_floor = baseline + max(60.0, max(1.0, peak - baseline) * 0.16)
     if threshold > 0.0:
         contact_floor = max(contact_floor, float(threshold))
-    reference = 0.0 if baseline_corrected else 2000.0
-    return np.where(values > contact_floor, values, reference)
+    return contact_floor
+
+
+def _heat_display_values(
+        values: np.ndarray, baseline_corrected: bool,
+        threshold: float, newtons: bool = False) -> np.ndarray:
+    """Keep every cell visible while making sub-threshold cells grey."""
+
+    values = np.maximum(0.0, np.asarray(values, dtype=np.float32))
+    floor = _contact_floor(values, threshold, newtons)
+    reference = 0.0 if (newtons or baseline_corrected) else 2000.0
+    return np.where(values > floor, values, reference)
 
 
 def _barycentric_projection(
@@ -407,6 +454,7 @@ def draw_pressure_color_points(
         mappers: dict[str, PressureHandMapper],
         baseline_ready: dict[str, bool],
         threshold: float = 0.0,
+        newtons: bool = False,
 ) -> None:
     """Draw one independent colour point per pressure cell.
 
@@ -433,7 +481,7 @@ def draw_pressure_color_points(
             cell_values = np.maximum(
                 0.0, values[mapper.cell_indices[:, 0], mapper.cell_indices[:, 1]])
         display_values = _heat_display_values(
-            cell_values, baseline_ready.get(side, False), threshold)
+            cell_values, baseline_ready.get(side, False), threshold, newtons)
         bases, normals = mapper.points_on_mesh(vertices)
         visible = np.einsum(
             "ij,ij->i", normals,
@@ -445,7 +493,7 @@ def draw_pressure_color_points(
         if not np.any(valid):
             continue
         colors = _heat_colors(
-            display_values, baseline_ready.get(side, False))
+            display_values, baseline_ready.get(side, False), newtons)
         order = np.argsort(depth, kind="stable")[::-1]
         for index in order:
             if not valid[index]:
@@ -463,6 +511,7 @@ def draw_pressure_tiles(
         mappers: dict[str, PressureHandMapper],
         baseline_ready: dict[str, bool],
         threshold: float = 0.0,
+        newtons: bool = False,
 ) -> None:
     """Draw independent, number-free pressure-matrix tiles on the mesh."""
 
@@ -483,7 +532,7 @@ def draw_pressure_tiles(
             cell_values = np.maximum(
                 0.0, values[mapper.cell_indices[:, 0], mapper.cell_indices[:, 1]])
         display_values = _heat_display_values(
-            cell_values, baseline_ready.get(side, False), threshold)
+            cell_values, baseline_ready.get(side, False), threshold, newtons)
         corners, centers, normals = mapper.tile_corners_on_mesh(vertices)
         visible = np.einsum(
             "ij,ij->i", normals,
@@ -501,7 +550,7 @@ def draw_pressure_tiles(
         if not np.any(valid):
             continue
         colors = _heat_colors(
-            display_values, baseline_ready.get(side, False))
+            display_values, baseline_ready.get(side, False), newtons)
         order = np.argsort(depth, kind="stable")[::-1]
         for index in order:
             if not valid[index]:
@@ -519,6 +568,7 @@ def draw_pressure_markers(
         mappers: dict[str, PressureHandMapper],
         baseline_ready: dict[str, bool],
         threshold: float = 0.0,
+        newtons: bool = False,
 ) -> None:
     """Draw fixed geometry pressure markers over already-rendered hand meshes."""
 
@@ -532,13 +582,7 @@ def draw_pressure_markers(
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         cell_values = np.maximum(0.0, values[mapper.cell_indices[:, 0],
                                                mapper.cell_indices[:, 1]])
-        peak = float(np.max(cell_values, initial=0.0))
-        baseline = float(np.percentile(cell_values, 20.0))
-        span = max(1.0, peak - baseline)
-        contact_floor = baseline + max(60.0, span * 0.16)
-        if threshold > 0.0:
-            contact_floor = max(contact_floor, float(threshold))
-        active = cell_values > contact_floor
+        active = cell_values > _contact_floor(cell_values, threshold, newtons)
         if not np.any(active):
             continue
 
@@ -555,7 +599,8 @@ def draw_pressure_markers(
         if not np.any(valid):
             continue
 
-        colors = _pressure_color(cell_values, baseline_ready.get(side, False))
+        colors = _pressure_color(
+            cell_values, baseline_ready.get(side, False), newtons)
         order = np.argsort(top_depth, kind="stable")[::-1]
         for index in order:
             if not valid[index]:

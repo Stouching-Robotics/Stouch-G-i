@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""STM32 glove 16 IMUs -> project-owned direct-FK 21 joints -> live 3D view.
+"""STM32 glove -> 21 solved joints -> live 3D view, through the client SDK.
 
-Same pipeline as ``pc/glove_21_live_lite.py`` (USB CDC -> IMU neutral reference
--> project FK 21 joints, pure numpy), but the display is swapped for the
-spherical-coordinate perspective camera from ``render_21_points.py``: fingers
-colored by BGR, brightness by depth, z=0 ground grid + RGB axes, with keyboard
-live view rotation and saving (view parameters stored in
-``view_config_3d.json``, so config.json and the lite script's view_config.json
-are not touched).
+Everything arrives from the one SDK entry point: ``sdk.open_glove`` ->
+``Glove.read`` -> :class:`sdk.HandFrame`, which hands over the 21 solved
+keypoints (metres), finger force (newtons) and the link diagnostics -- and
+nothing raw.  The display is the spherical-coordinate perspective camera from
+``render_21_points.py``: fingers colored by BGR, brightness by depth, z=0
+ground grid + RGB axes, with keyboard live view rotation and saving (view
+parameters stored in ``view_config_3d.json``, so config.json and the lite
+script's view_config.json are not touched).
 
-Data source: STM32 USB CDC by default (16 IMUs, mapping from the internal
-channel table in config.json, i.e. the configuration calibrated by run_pc.sh);
-``--demo`` runs the full pipeline on synthetic no-glove data.
+Data source: whichever link carries this hand -- ``open_glove`` is asked for no
+particular one, so the wired USB cable and the Bluetooth dongle are equally
+valid and are told apart inside :mod:`sdk.transport`.
 
 View interaction: the camera orbits the origin while the ground grid, RGB axes
 and the hand rotate with the scene:
@@ -20,21 +21,17 @@ and the hand rotate with the scene:
     wheel: zoom dist | left-drag: pan
     e/c: roll (about the view axis) | a/d/w/s: fine-tune yaw/elev
     r: reset view | v: save view | q/ESC: quit and save
-Tactile overlay: fixed 2D panel in the lower-left corner (pixel-identical to
-the /touch HTML tactile view), it does not rotate with the view; [ / ] keys
-resize it and zeroing runs automatically at startup (do not touch while it is
-active).  While recording it is also written to
-observation.tactile.right_glove (16x16 processed pressure map).
-On exit (including Ctrl+C) the view and any recorded parquet are saved.
+Tactile overlay: fixed 2D panel in the lower-left corner, fed straight from the
+frame's newton force matrix; it does not rotate with the view and the [ / ] keys
+resize it.
+On exit (including Ctrl+C) the view is saved.
 
-Dependencies match the lite version: numpy scipy opencv-python pyserial loguru
-pydantic polars (for recording).
+Dependencies match the lite version: numpy scipy opencv-python PySide6.
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import os
 import pickle
@@ -66,31 +63,23 @@ if str(BUNDLE_ROOT) not in sys.path:
 from gui import APP_VERSION  # noqa: E402
 from gui.calibration_selector import select_calibration_files  # noqa: E402
 from gui.qt_viewer import (  # noqa: E402
-    DEFAULT_TACTILE_THRESHOLD, QtCanvas, ensure_qapp, pump_events)
+    QtCanvas, ensure_qapp, pump_events)
 from gui.rendering.tactile import render_hand  # noqa: E402
-from common.frame_pacing import recent_batch  # noqa: E402
+from common.frame_pacing import BURST_SPAN_US  # noqa: E402
 from common.i18n import L, is_en, set_lang  # noqa: E402
-from glove_io.recording import (  # noqa: E402
-    JointPositionSmoother,
-    KeypointParquetRecorder,
-    KeypointParquetRecorderWithIMU,
-    SkeletonRenderer,
-    make_hand_result,
-)
-from glove_io.session import (  # noqa: E402
-    update_session_metadata, view_state_metadata, write_session_metadata)
-from glove_io.tactile_processing import TactilePreprocessor  # noqa: E402
+from common.types import LINK_USB  # noqa: E402
 from sdk import (  # noqa: E402
-    DeviceManager, HandSolver, RawImuStream, get_version)
+    CalibrationError, HandFrame, StreamTimeoutError, get_version, open_glove)
+# The device manager is not on the client SDK's public surface; resolving an
+# explicit ``--serial-port`` reaches it through :mod:`sdk.device`.
+from sdk.device import DeviceManager  # noqa: E402
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
-DEFAULT_GEOMETRY_PATH = (
-    BUNDLE_ROOT / "assets/hand_geometry/hand_measured_runtime_v1.json")
 
-# View parameters are stored here (display only; calibration/recording are
-# unaffected).  Kept separate from the lite script's view_config.json:
-# spherical (yaw/elev/dist) and orthogonal (euler/ppm) are two distinct
-# parameter spaces and would overwrite each other if shared.
+# View parameters are stored here (display only; calibration is unaffected).
+# Kept separate from the lite script's view_config.json: spherical
+# (yaw/elev/dist) and orthogonal (euler/ppm) are two distinct parameter spaces
+# and would overwrite each other if shared.
 VIEW3D_CONFIG_PATH = PROJECT_ROOT / "config" / "view_config_3d.json"
 
 # --------------------------------------------------------------------------
@@ -598,8 +587,7 @@ class Live3DViewer:
     e/c: roll (about the view axis) | a/d/w/s: fine-tune yaw/elev
     r: reset view | v: save view | q/ESC: quit and save
     With --view rotating, yaw auto-rotates at --yaw-rate (can be combined with
-    middle-drag rotation).  The view only affects display; the recorded 2D
-    projection still uses the lite script's fixed camera.
+    middle-drag rotation).  The view affects display only.
     """
 
     # Right-drag rotation sensitivity: dragging the full canvas width ~= 360°
@@ -627,7 +615,8 @@ class Live3DViewer:
                  show_tactile_toggle: bool = True,
                  show_orientation_button: bool = False,
                  show_selector_button: bool = False,
-                 show_dongle_reboot_button: bool = False):
+                 show_dongle_reboot_button: bool = False,
+                 show_pressure_fit_buttons: bool = False):
         self.view = view_state
         # The reset target is the state with which this particular window was
         # opened (including values loaded from its view JSON), not hard-coded
@@ -659,6 +648,11 @@ class Live3DViewer:
         # session polls this and returns to the calibration-file picker.
         self.request_selector = False
         self.fps = 0.0
+        # The two device streams' own arrival rates, both carried on the frame
+        # and both a separate number from the solve rate above: attitude and
+        # pressure arrive independently, so one cannot stand in for the other.
+        self.device_fps = 0.0
+        self.tactile_fps = 0.0
         self.frame_count = 0
         self.missing_labels: list[str] = []
         self.safety_intervened = False
@@ -684,11 +678,9 @@ class Live3DViewer:
         self._yaw_at_orbit: float = 0.0
         self._elev_at_orbit: float = 0.0
         self._last_tick_s: float | None = None
-        # Tactile overlay: 16x16 processed pressure map, fixed 2D panel in the lower-left corner (does not rotate with the view)
+        # Tactile overlay: 16x16 finger-force matrix in newtons, fixed 2D panel in the lower-left corner (does not rotate with the view)
         self.tactile_frame: np.ndarray | None = None
-        self.tactile_calibrating = False
         self.tactile_scale = 0.6
-        self.tactile_threshold = DEFAULT_TACTILE_THRESHOLD  # cells below it are zeroed
         # Live canvas size.  Seeded with the design baseline so the first _draw
         # below is exactly what it always was; _refresh_canvas_size() then
         # takes over from the widget's real geometry.
@@ -700,7 +692,6 @@ class Live3DViewer:
         # drawn only when show_title_in_canvas.
         self._qcanvas = QtCanvas(
             self, f"{self.title} (SDK v{get_version()})", W, H,
-            show_slider=True,
             display_modes=self._display_mode_options(),
             display_mode=self.display_mode,
             show_baseline=show_baseline,
@@ -710,7 +701,8 @@ class Live3DViewer:
             show_tactile_toggle=show_tactile_toggle,
             show_orientation_button=show_orientation_button,
             show_selector_button=show_selector_button,
-            show_dongle_reboot_button=show_dongle_reboot_button)
+            show_dongle_reboot_button=show_dongle_reboot_button,
+            show_pressure_fit_buttons=show_pressure_fit_buttons)
         self._refresh_canvas_size()
         self._canvas = self._draw()
         self._qcanvas.set_canvas(self._canvas)
@@ -892,10 +884,8 @@ class Live3DViewer:
         lines = [
             L(f"GUI / 解算: {self.fps:5.1f} FPS",
               f"GUI / solve: {self.fps:5.1f} FPS"),
-            L(f"已录制帧数: {self.frame_count}",
-              f"Recorded frames: {self.frame_count}"),
-            L(f"IMU 就绪: {16 - len(self.missing_labels)}/16",
-              f"IMU ready: {16 - len(self.missing_labels)}/16"),
+            L(f"IMU {self.device_fps:5.1f} Hz   压力 {self.tactile_fps:5.1f} Hz",
+              f"IMU {self.device_fps:5.1f} Hz   TACTILE {self.tactile_fps:5.1f} Hz"),
             L(f"显示: {'完整手' if self.display_mode == 'hand' else '手骨'}",
               f"Display: {'full hand' if self.display_mode == 'hand' else 'bones'}"),
             f"{view_label}: yaw {self.view.yaw:5.1f}°  elev {self.view.elev:5.1f}°  "
@@ -904,8 +894,6 @@ class Live3DViewer:
         if self.display_mode == "hand" and self._mesh_faces is None:
             lines.append(L("完整手网格不可用；显示手骨",
                            "Full hand mesh unavailable; showing bones"))
-        if self.missing_labels:
-            lines.append(L("缺失: ", "Missing: ") + ", ".join(self.missing_labels))
         if self.safety_intervened:
             lines.append(L("姿势安全修正已激活", "Pose safety correction active"))
         if self.active_contact:
@@ -994,15 +982,10 @@ class Live3DViewer:
         self._draw_tactile(img)
         return img
 
-    def set_tactile(self, processed):
-        """Accept the 16x16 processed pressure map (None = zeroing), drawn at the fixed lower-left corner."""
-        self.tactile_frame = (None if processed is None
-                              else np.asarray(processed, np.float32).reshape(16, 16))
-        self.tactile_calibrating = processed is None
-        self._redraw_requested = True
-
-    def _on_tactile_thr(self, value) -> None:
-        self.tactile_threshold = int(value)
+    def set_tactile(self, force_n):
+        """Accept the 16x16 finger-force matrix in newtons (None clears the panel), drawn at the fixed lower-left corner."""
+        self.tactile_frame = (None if force_n is None
+                              else np.asarray(force_n, np.float32).reshape(16, 16))
         self._redraw_requested = True
 
     def _on_display_mode(self, value) -> None:
@@ -1035,13 +1018,16 @@ class Live3DViewer:
         # self.canvas_h, so they cannot disagree with it.
         h = img.shape[0]
         if self.tactile_frame is None:
-            if self.tactile_calibrating:
-                put_text(img, L("触觉正在校零 - 请勿触碰", "Tactile zeroing - do not touch"),
-                         (12, h - 62), 0.5, (0, 0, 255), 1)
             return
         frame = self.tactile_frame
-        if self.tactile_threshold > 0:
-            frame = np.where(frame < self.tactile_threshold, 0.0, frame)
+        # Force is NaN in the positions no fitted region covers; those cells
+        # hold no sensor, so they read as zero force rather than as a NaN patch.
+        # No threshold is subtracted here: this panel draws newtons, whose zero
+        # is absolute and whose card scales itself, so an ADC-count gate would
+        # only erase every cell (the panel is 0..5 N, the old gate counted ADC
+        # steps).
+        if not np.isfinite(frame).all():
+            frame = np.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
         hand_img = render_hand(
             frame, mirror=self.hand_side == "left",
             side=self.hand_side)
@@ -1063,9 +1049,12 @@ class Live3DViewer:
     def update(self, joints: np.ndarray, fps: float, frame_count: int,
                missing_labels: list[str], safety_intervened: bool,
                active_contact: str | None = None,
-               mesh_vertices: np.ndarray | None = None):
+               mesh_vertices: np.ndarray | None = None,
+               device_fps: float = 0.0, tactile_fps: float = 0.0):
         """Accept one hand's (21,3) smoothed joints and write them into the matching left/right slot."""
         self.fps = float(fps)
+        self.device_fps = float(device_fps or 0.0)
+        self.tactile_fps = float(tactile_fps or 0.0)
         self.frame_count = int(frame_count)
         self.missing_labels = list(missing_labels)
         self.safety_intervened = bool(safety_intervened)
@@ -1120,8 +1109,8 @@ class Live3DViewer:
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description=("STM32 glove: raw 16-IMU acquisition, protected "
-                     "21-keypoint solving, live 3D view and Parquet recording"),
+        description=("STM32 glove: live 3D view of the 21 solved keypoints "
+                     "and finger force, through the SDK"),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--config", "--calib-config", "--calibration-config",
@@ -1142,12 +1131,8 @@ def _parse_args(argv=None):
         help="Folder scanned by the calibration selector")
     parser.add_argument("--serial-port", help="STM32 CDC port; default: bound device")
     parser.add_argument("--side", choices=("left", "right"), default="right")
-    parser.add_argument("--geometry", type=Path, default=DEFAULT_GEOMETRY_PATH,
-                        help="Hand geometry JSON")
     parser.add_argument("--allow-uncalibrated", action="store_true",
                         help="Deprecated compatibility option; calibrated mode is required")
-    parser.add_argument("--demo", action="store_true",
-                        help="Run a no-hardware synthetic keypoint preview")
     parser.add_argument("--view", default="static", choices=("static", "rotating"),
                         help="Static interactive view or automatically rotating camera")
     parser.add_argument("--display-mode", default="hand", choices=("bones", "hand"),
@@ -1165,40 +1150,69 @@ def _parse_args(argv=None):
     parser.add_argument("--yaw-rate", type=float, default=60.0,
                         help="Rotating-view angular speed in degrees per second")
     parser.add_argument("--fps", type=float, default=30.0, help="Display frame-rate limit")
-    parser.add_argument("--out", type=Path, help="Output chunk-000.parquet path")
-    parser.add_argument("--episode-index", type=int, default=0)
-    parser.add_argument("--task-index", type=int, default=0)
-    parser.add_argument("--checkpoint-frames", type=int, default=600)
     parser.add_argument("--joint-smoothing-ms", type=float, default=35.0)
     parser.add_argument("--display-raw", action="store_true",
                         help="Display unsmoothed solved keypoints")
     parser.add_argument("--startup-timeout", type=float, default=15.0,
                         help="Seconds to wait for the first frame; 0 waits forever")
-    parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--max-frames", type=int, default=0,
                         help="Stop after N frames; 0 means unlimited")
     return parser.parse_args(argv)
 
 
-def _latest_solver_mesh_vertices(solver) -> np.ndarray | None:
-    candidates = [
-        solver,
-        getattr(solver, "_impl", None),
-        getattr(getattr(solver, "_impl", None), "_solver", None),
-    ]
-    for candidate in candidates:
-        vertices = getattr(candidate, "last_mesh_vertices_m", None)
-        if vertices is None:
+def _stale_backlog(frame: HandFrame, newest: HandFrame | None) -> bool:
+    """True when ``frame`` is history rather than part of the current burst.
+
+    A poll used to hand over a whole batch, which is what
+    :func:`common.frame_pacing.recent_batch` trimmed; ``Glove.read`` hands over
+    one frame from a bounded queue instead, so the same decision is taken one
+    frame at a time against ``Glove.latest()``: a frame more than a burst behind
+    the newest is the tail of a backlog and display must not replay it, while
+    everything inside the window is a batch the link legitimately delivered and
+    is kept -- keeping only the newest is what made the displayed rate equal the
+    batch rate on a Bluetooth dongle.
+
+    The comparison is a plain difference because ``HandFrame.timestamp_us`` is
+    on the host's monotonic timeline (``algorithm.hand.safety``'s device clock),
+    not the device's wrapping uint32 counter.
+    """
+    if newest is None or newest is frame:
+        return False
+    return int(newest.timestamp_us) - int(frame.timestamp_us) > BURST_SPAN_US
+
+
+def _port_serial(port_name: str | None) -> str | None:
+    """Translate an explicit ``--serial-port`` into the serial a hand is pinned by.
+
+    ``open_glove`` resolves a hand by link serial rather than by COM name, so an
+    explicit port has to be looked up and handed over as what the system knows
+    it as.  A name that is not an attached glove link is an error rather than a
+    silent fallback: the caller asked for one specific device.
+    """
+    if not port_name:
+        return None
+    wanted = str(port_name).strip().upper()
+    try:
+        devices = DeviceManager(DEFAULT_REGISTRY).list_devices()
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot resolve --serial-port {port_name}: {exc}") from exc
+    for device in devices:
+        if str(device.device).strip().upper() != wanted:
             continue
-        value = np.asarray(vertices, dtype=np.float32)
-        if value.shape == (778, 3) and np.isfinite(value).all():
-            return value.copy()
-    return None
+        serial = str(device.serial_number or "").strip()
+        if serial:
+            return serial
+        break
+    attached = ", ".join(str(device.device) for device in devices) or "none"
+    raise RuntimeError(
+        f"--serial-port {port_name} is not an attached glove link "
+        f"(attached: {attached})")
 
 
 def _selected_calibration(args) -> Path | None:
-    if args.select_calibration and args.calib is None and not args.demo:
+    if args.select_calibration and args.calib is None:
         selected = select_calibration_files(
             args.calibration_dir,
             (args.side,),
@@ -1209,40 +1223,21 @@ def _selected_calibration(args) -> Path | None:
         args.calib = selected[args.side]
     if args.calib is not None:
         return Path(args.calib).expanduser().resolve()
+    # The two files this edition ships: a bare checkout has exactly one
+    # calibration per side, so the fallback below always finds something.
     filename = ("imu_2d_calibration.json" if args.side == "left"
-                else "imu_calibration.json")
+                else "imu_calibration_right_default.json")
     return (PROJECT_ROOT / "calibration" / filename).resolve()
 
 
-def _transport_metadata(calibration: Path, side: str) -> dict:
-    try:
-        payload = json.loads(calibration.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Cannot read calibration {calibration}: {exc}") from exc
-    saved_side = str(payload.get("side") or "right").lower()
-    if saved_side != side:
-        raise RuntimeError(
-            f"Calibration side mismatch: file is {saved_side}, requested {side}")
-    return {
-        "usb_vid": int(payload.get("usb_vid", 0x0483)),
-        "usb_pid": int(payload.get("usb_pid", 0x5740)),
-        "fps": float(payload.get("fps") or 80.0),
-        "hardware_id": str(payload.get("hardware_id", f"stm32-glove-{side}")),
-        "channel_to_hand": payload.get("channel_to_hand"),
-    }
-
-
-def _output_path(args) -> Path:
-    if args.out is not None:
-        return Path(args.out)
-    folder = "keypoints_21_left" if args.side == "left" else "keypoints_21"
-    return (PROJECT_ROOT / "data" / folder /
-            datetime.now().strftime("%Y%m%d_%H%M%S") /
-            "chunk-000.parquet")
+# How long one Glove.read may block.  The frame rate belongs to the glove, so a
+# short block is only about the idle loop: the window still gets its heartbeat
+# and the startup timeout still fires on schedule, without a spinning wait.
+READ_TIMEOUT_S = 0.05
 
 
 def main(argv=None) -> int:
-    """Run the plaintext single-hand collector over the three public APIs."""
+    """Run the live single-hand viewer over the client SDK interface."""
 
     args = _parse_args(argv)
     set_lang(args.lang)
@@ -1260,45 +1255,24 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        transport = _transport_metadata(calibration, args.side)
-        solver = HandSolver(args.side, calibration, args.geometry)
-    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+        glove = open_glove(
+            args.side,
+            calibration=calibration,
+            serial_number=_port_serial(args.serial_port),
+            registry=DEFAULT_REGISTRY,
+            smoothing_ms=args.joint_smoothing_ms,
+        ).start()
+    except CalibrationError as exc:
         print(f"[Calibration error] {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:
+        print(f"[Device error] {exc}", file=sys.stderr)
+        return 2
 
-    serial_port = args.serial_port
-    usb_serial = ""
-    if not args.demo:
-        try:
-            manager = DeviceManager(DEFAULT_REGISTRY)
-            if serial_port is None:
-                serial_port, usb_serial = manager.resolve_port(args.side)
-            else:
-                bindings = manager.get_bindings(resolve_ports=False)
-                usb_serial = (bindings.left_serial if args.side == "left"
-                              else bindings.right_serial)
-        except Exception as exc:
-            print(f"[Device error] {exc}", file=sys.stderr)
-            return 2
+    # One snapshot of what is carrying this hand; the link is resolved inside
+    # open_glove, so this is also the only place the viewer can learn it.
+    info = glove.info()
 
-    output_path = _output_path(args)
-    recorder = None
-    if not args.no_save:
-        try:
-            recorder = KeypointParquetRecorderWithIMU(
-                output_path,
-                args.episode_index,
-                args.task_index,
-                args.checkpoint_frames,
-                side=args.side,
-                usb_serial=usb_serial,
-            )
-        except RuntimeError as exc:
-            print(f"[Recording warning] {exc}; recording is disabled.",
-                  file=sys.stderr)
-
-    smoother = JointPositionSmoother(args.joint_smoothing_ms / 1000.0)
-    projection_renderer = SkeletonRenderer()
     view_state = LiveViewState(args.view_config)
     if args.view_reference_config is not None:
         reference_view = LiveViewState(args.view_reference_config)
@@ -1317,39 +1291,13 @@ def main(argv=None) -> int:
         view_state.dist = float(np.clip(
             args.dist, LiveViewState.DIST_MIN, LiveViewState.DIST_MAX))
 
-    backend = solver.backend
-    if recorder is not None:
-        write_session_metadata(output_path, {
-            "mode": "single",
-            "sides": [args.side],
-            "sample_fps": transport["fps"],
-            "devices": {
-                args.side: {
-                    "usb_serial": usb_serial,
-                    "hardware_id": transport["hardware_id"],
-                    "channel_to_hand": transport["channel_to_hand"],
-                },
-            },
-            "calibration_files": {args.side: str(calibration)},
-            "view": view_state_metadata(view_state),
-            "display": {
-                "live_source": "raw" if args.display_raw else "smoothed",
-                "recorded_source": "raw",
-            },
-            "kinematics": {
-                "type": backend.get("backend", "unknown"),
-                "geometry": str(Path(args.geometry).resolve()),
-            },
-            "public_interfaces": [
-                "RawImuStream", "TactileStream", "HandSolver.process"
-            ],
-        })
+    backend = glove.backend
 
     viewer = None
     if not args.no_display:
         initial_slots = np.full((2, 21, 3), np.nan, np.float32)
-        initial_slots[0 if args.side == "left" else 1] = solver.neutral_joints()
-        source_label = "demo" if args.demo else "USB"
+        initial_slots[0 if args.side == "left" else 1] = glove.neutral_joints()
+        source_label = "USB" if info.link_kind == LINK_USB else "Bluetooth"
         viewer = Live3DViewer(
             view_state,
             initial_slots,
@@ -1359,215 +1307,98 @@ def main(argv=None) -> int:
             yaw_rate=args.yaw_rate,
             hand_side=args.side,
             display_mode=args.display_mode,
-            initial_mesh_vertices=_latest_solver_mesh_vertices(solver),
+            initial_mesh_vertices=glove.mesh_vertices_m,
             redraw_interval_s=1.0 / max(args.fps, 1.0),
         )
 
-    tactile_pre = TactilePreprocessor(
-        base_gate=0.0,
-        dynamic_noise_ratio=0.0,
-        temporal_smooth=0.15,
-        spatial_filter=False,
-        calibration_frames=100,
-        bypass_gates=False,
-    )
-    sensor_stream = None
-    tactile_stream = None
-    if not args.demo:
-        sensor_stream = RawImuStream(
-            serial_port,
-            usb_vid=transport["usb_vid"],
-            usb_pid=transport["usb_pid"],
-        ).start()
-        tactile_stream = sensor_stream.tactile_stream().start()
-
     print(f"Calibration: {calibration}")
-    print(f"Pipeline: RawImuStream -> HandSolver.process -> 21 keypoints")
-    print("Tactile: TactileStream -> 16x16 live panel and recording")
+    print(f"Link: {info.link_kind} {info.port} [{info.serial_number}]")
+    print("Pipeline: open_glove -> Glove.read -> 21 keypoints + newton force")
+    print("Tactile: HandFrame.force_n -> 16x16 live panel (newtons)")
     print("Controls: middle-drag rotate, wheel zoom, left-drag pan, "
           "a/d/w/s orbit, e/c roll, r reset, v save, q/ESC quit.")
-    if recorder is not None:
-        print(f"Recording target: {output_path}")
 
-    first_sample_s = None
     start_wait_s = time.monotonic()
     frame_index = 0
     fps_times: list[float] = []
-    last_sequence = -1
-    latest_tactile: np.ndarray | None = None
-    latest_tactile_raw: np.ndarray | None = None
     exit_requested = False
     return_code = 0
     display_interval = 1.0 / max(args.fps, 1.0)
     next_display_s = 0.0
-    next_demo_s = time.monotonic()
 
     try:
         while not exit_requested:
-            if tactile_stream is not None and (recorder is not None or viewer is not None):
-                for tactile_frame in tactile_stream.poll():
-                    latest_tactile_raw = tactile_frame.samples.copy()
-                    processed, _ = tactile_pre.process(tactile_frame.samples)
-                    if viewer is not None:
-                        viewer.set_tactile(processed)
-                    if processed is not None:
-                        latest_tactile = processed
+            try:
+                frame = glove.read(timeout=READ_TIMEOUT_S)
+            except StreamTimeoutError:
+                # Not a failure yet: the startup timeout below, and the
+                # window's own heartbeat, are what decide when silence is.
+                frame = None
+            else:
+                if _stale_backlog(frame, glove.latest()):
+                    # Skipping it, rather than drawing it, is the point: the
+                    # view must track the newest frame and never replay the
+                    # backlog a slow consumer let pile up.
+                    continue
 
-            samples = []
-            if sensor_stream is not None:
-                samples = sensor_stream.poll()
-                # Real-time display must track the newest frame, not replay the
-                # buffered backlog.  Solving + recording can be slower than the
-                # device rate, so the 256-deep queue can fill and poll() can hand
-                # over a genuine backlog; processing that FIFO makes the view lag
-                # by the queue depth.  Drop the stale part and keep the rest.
-                #
-                # Keeping only the last frame (what this did before) also threw
-                # away the frames a poll legitimately carries: a Bluetooth dongle
-                # hands over one batch per RF event, so a poll of several current
-                # frames became one, and the rate the view tracked was the batch
-                # rate rather than the frame rate.
-                if samples:
-                    samples = recent_batch(samples)
-            elif time.monotonic() >= next_demo_s:
-                base = solver.neutral_imu_xyzw
-                quaternions = base.copy()
-                elapsed = time.monotonic() - start_wait_s
-                for channel in (3, 6, 9, 12, 15):
-                    angle = 0.35 * np.sin(2 * np.pi * 0.6 * elapsed + 0.7 * channel)
-                    quaternions[channel] = (
-                        R.from_quat(base[channel])
-                        * R.from_rotvec([0.0, 0.0, angle])
-                    ).as_quat()
-                samples = [(frame_index, int(time.time() * 1_000_000),
-                            quaternions, solver.solve(quaternions))]
-                next_demo_s += 1.0 / max(transport["fps"], 1.0)
-
-            if not samples:
+            if frame is None:
                 if (args.startup_timeout > 0 and frame_index == 0
                         and time.monotonic() - start_wait_s >= args.startup_timeout):
-                    detail = (sensor_stream.last_error
-                              if sensor_stream is not None else None)
+                    detail = glove.health().last_error
                     raise RuntimeError(
-                        "Timed out waiting for STM32 IMU data"
+                        "Timed out waiting for STM32 data"
                         + (f": {detail}" if detail else ""))
                 if viewer is not None and not viewer.tick():
                     exit_requested = True
                 time.sleep(0.003)
                 continue
 
-            for sample in samples:
-                if sensor_stream is not None:
-                    raw_frame = sample
-                    if raw_frame.sequence == last_sequence:
-                        continue
-                    last_sequence = raw_frame.sequence
-                    keypoints = solver.process(raw_frame)
-                    sequence = keypoints.sequence
-                    sample_us = keypoints.timestamp_us
-                    joints = keypoints.joints_m
-                    imu_quats = keypoints.imu_xyzw
-                    sensor_age = keypoints.sensor_age_s
-                    status = keypoints.status
-                else:
-                    raw_frame = None
-                    sequence, sample_us, imu_quats, solved = sample
-                    joints = solved.joints_m
-                    sensor_age = np.zeros(16, dtype=np.float32)
-                    status = solved.status
+            # Finger force in newtons, NaN where no fitted region covers the
+            # cell.  The matrix rides on every attitude frame until a new scan
+            # replaces it, so it is redrawn as-is rather than gated on
+            # ``force_fresh``.
+            if frame.force_n is not None and viewer is not None:
+                viewer.set_tactile(frame.force_n)
 
-                sample_s = sample_us / 1_000_000.0
-                if first_sample_s is None:
-                    first_sample_s = sample_s
-                timestamp_s = max(0.0, sample_s - first_sample_s)
-                smoothed = smoother.update(joints, timestamp_s)
-                missing_ids = [
-                    f"IMU-{index}" for index in
-                    np.flatnonzero(~np.isfinite(sensor_age))
-                ]
-                now = time.monotonic()
-                fps_times.append(now)
-                fps_times = fps_times[-60:]
-                live_fps = ((len(fps_times) - 1)
-                            / max(fps_times[-1] - fps_times[0], 1e-6)
-                            if len(fps_times) >= 2 else 0.0)
-                virtual_uv, _ = projection_renderer.project(smoothed)
-                result = make_hand_result(
-                    args.side, joints, smoothed, virtual_uv,
-                    imu_ready=not missing_ids)
-                if recorder is not None:
-                    recorder.add(
-                        frame_index,
-                        timestamp_s,
-                        result,
-                        imu_quats=imu_quats,
-                        tactile=latest_tactile,
-                        raw_imu_quats=(
-                            raw_frame.quaternions_xyzw
-                            if raw_frame is not None else None),
-                        raw_present_mask=(
-                            raw_frame.present_mask
-                            if raw_frame is not None else None),
-                        raw_valid_mask=(
-                            raw_frame.valid_mask
-                            if raw_frame is not None else None),
-                        raw_device_timestamp_us=(
-                            raw_frame.device_timestamp_us
-                            if raw_frame is not None else None),
-                        tactile_raw=latest_tactile_raw,
-                    )
-                if viewer is not None and now >= next_display_s:
-                    viewer.update(
-                        joints if args.display_raw else smoothed,
-                        live_fps,
-                        frame_index + 1,
-                        missing_ids,
-                        status.safety_intervened,
-                        active_contact=status.active_contact,
-                        mesh_vertices=_latest_solver_mesh_vertices(solver),
-                    )
-                    if not viewer.tick():
-                        exit_requested = True
-                    next_display_s = now + display_interval
-                frame_index += 1
-                if args.max_frames > 0 and frame_index >= args.max_frames:
+            # The frame carries its own solved copies.  --display-raw picks the
+            # unsmoothed keypoints; otherwise the SDK's smoothing_ms low-pass.
+            joints = frame.joints_raw_m
+            smoothed = frame.joints_smoothed_m
+            status = frame.status
+            now = time.monotonic()
+            fps_times.append(now)
+            fps_times = fps_times[-60:]
+            live_fps = ((len(fps_times) - 1)
+                        / max(fps_times[-1] - fps_times[0], 1e-6)
+                        if len(fps_times) >= 2 else 0.0)
+            if viewer is not None and now >= next_display_s:
+                viewer.update(
+                    joints if args.display_raw else smoothed,
+                    live_fps,
+                    frame_index + 1,
+                    [],
+                    status.safety_intervened,
+                    active_contact=status.active_contact,
+                    mesh_vertices=glove.mesh_vertices_m,
+                    device_fps=frame.device_fps,
+                    tactile_fps=frame.tactile_fps,
+                )
+                if not viewer.tick():
                     exit_requested = True
-                if exit_requested:
-                    break
+                next_display_s = now + display_interval
+            frame_index += 1
+            if args.max_frames > 0 and frame_index >= args.max_frames:
+                exit_requested = True
     except KeyboardInterrupt:
-        print("\nInterrupted; saving current recording...")
+        print("\nInterrupted.")
         return_code = 130
     except RuntimeError as exc:
         print(f"[Runtime error] {exc}", file=sys.stderr)
         return_code = 3
     finally:
-        if sensor_stream is not None:
-            sensor_stream.stop()
-        if recorder is not None:
-            saved = recorder.save()
-            if saved is not None:
-                print(f"Saved {len(recorder.rows)} frames: {saved}")
+        glove.close()
         if viewer is not None:
             viewer.close()
-        if recorder is not None:
-            duration_s = (float(recorder.rows[-1]["timestamp"])
-                          - float(recorder.rows[0]["timestamp"])
-                          if recorder.rows else 0.0)
-            measured_fps = ((len(recorder.rows) - 1) / duration_s
-                            if len(recorder.rows) >= 2 and duration_s > 0.0
-                            else transport["fps"])
-            try:
-                update_session_metadata(output_path, {
-                    "sample_fps": measured_fps,
-                    "view": view_state_metadata(view_state),
-                    "recording": {
-                        "frame_count": len(recorder.rows),
-                        "duration_s": duration_s,
-                    },
-                })
-            except (OSError, RuntimeError) as exc:
-                print(f"[Recording warning] Cannot update session.json: {exc}",
-                      file=sys.stderr)
     print(f"Finished: {frame_index} frames")
     return return_code
 

@@ -25,13 +25,19 @@ from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSlider, QVBoxLayout, QWidget)
+    QScrollArea, QVBoxLayout, QWidget)
 
 from common.i18n import L  # noqa: E402
 
 # Default tactile threshold applied at startup: cells below this ADC value are
 # zeroed so tiny baseline / sensor fluctuations do not flicker the cell numbers.
-DEFAULT_TACTILE_THRESHOLD = 60
+# 30 matches the standalone pressure tools (``hands_ma.py`` DEADBAND_DEFAULT,
+# ``matrix_gui.py`` self.threshold), both of which justify it from the same
+# measurement: idle per-channel noise is a peak-to-peak median of 5 and at most
+# 26 counts, so 30 flattens an unloaded glove to one colour without clipping a
+# real contact.  Note this value also reaches the mesh colouring, not just the
+# matrix card.
+DEFAULT_TACTILE_THRESHOLD = 30
 
 # Canvas sizing.  The live 3D scene is CPU-rasterised, so the canvas follows
 # the window's own pixels instead of a fixed 1280x720 that Qt then magnified:
@@ -688,10 +694,9 @@ class _ViewControl(QWidget):
 
 class QtCanvas(QWidget):
     """Qt window: top bar (optional tactile selector left, display controls right),
-    middle = _CanvasArea, bottom = tactile threshold slider."""
+    middle = _CanvasArea."""
 
     def __init__(self, controller, title: str, w: int = 1280, h: int = 720,
-                 show_slider: bool = True,
                  display_modes: list[tuple[str, str]] | None = None,
                  display_mode: str | None = None,
                  lang_button: bool = True,
@@ -703,7 +708,8 @@ class QtCanvas(QWidget):
                  show_orientation_button: bool = False,
                  show_selector_button: bool = False,
                  show_dongle_reboot_button: bool = False,
-                 show_view_control_button: bool = True):
+                 show_view_control_button: bool = True,
+                 show_pressure_fit_buttons: bool = False):
         super().__init__()
         # Dark navy-blue chrome to match the in-canvas palette.
         self.setStyleSheet(
@@ -718,10 +724,6 @@ class QtCanvas(QWidget):
             "QCheckBox { background: transparent; color: #cfe0f5; "
             "spacing: 6px; }"
             "QCheckBox::indicator { width: 14px; height: 14px; }"
-            "QSlider::groove:horizontal { background: #1b2740; height: 6px; "
-            "border-radius: 3px; }"
-            "QSlider::handle:horizontal { background: #3b6ea5; width: 14px; "
-            "margin: -4px 0; border-radius: 7px; }"
         )
         self._controller = controller
         self._display_modes = list(display_modes or [])
@@ -745,7 +747,6 @@ class QtCanvas(QWidget):
         self._display_combo: QComboBox | None = None
         self._display_label: QLabel | None = None
         self._lang_button: QPushButton | None = None
-        self._slider: QSlider | None = None
         self._tactile_toggle: QCheckBox | None = None
         self._tactile_panel_label: QLabel | None = None
         self._tactile_panel_combo: QComboBox | None = None
@@ -758,13 +759,19 @@ class QtCanvas(QWidget):
         self._selector_button: QPushButton | None = None
         self._dongle_reboot_button: QPushButton | None = None
         self._view_control_button: QPushButton | None = None
+        self._pressure_fit_send_button: QPushButton | None = None
+        self._pressure_fit_query_button: QPushButton | None = None
+        # Last busy flag seen; ``None`` until the first frame, so the first
+        # ``set_pressure_fit_busy`` always applies.
+        self._pressure_fit_busy: bool | None = None
 
         # Top bar: the optional tactile-panel selector stays at the left edge;
         # display, language and pressure controls remain right-aligned.
         if (self._display_modes or lang_button or show_baseline
                 or show_surface_color or self._tactile_panel_modes
                 or show_orientation_button or show_selector_button
-                or show_dongle_reboot_button or show_view_control_button):
+                or show_dongle_reboot_button or show_view_control_button
+                or show_pressure_fit_buttons):
             top = QWidget()
             top_layout = QHBoxLayout(top)
             top_layout.setContentsMargins(10, 6, 10, 6)
@@ -835,6 +842,27 @@ class QtCanvas(QWidget):
                 # Born hidden: the controller reveals it once a Bluetooth link
                 # is detected (see set_dongle_reboot_visible).
                 self._dongle_reboot_button.setVisible(False)
+            if show_pressure_fit_buttons:
+                # Two buttons: a read-only query and the query that carries the
+                # write-back.  Anything else about the
+                # parameter commands (set pickers, write toggles) was removed on
+                # purpose -- the firmware decides which set it sends, so there
+                # is nothing for this side to choose.
+                self._pressure_fit_send_button = QPushButton()
+                self._pressure_fit_query_button = QPushButton()
+                for fit_button, handler in (
+                        (self._pressure_fit_send_button,
+                         self._on_pressure_fit_send),
+                        (self._pressure_fit_query_button,
+                         self._on_pressure_fit_query)):
+                    fit_button.setFocusPolicy(Qt.NoFocus)
+                    btn_font = fit_button.font()
+                    btn_font.setBold(True)
+                    fit_button.setFont(btn_font)
+                    fit_button.setMinimumHeight(36)
+                    fit_button.clicked.connect(handler)
+                    top_layout.addWidget(fit_button)
+                self._retranslate_pressure_fit_buttons()
             if show_view_control_button:
                 self._view_control_button = QPushButton()
                 self._view_control_button.setFocusPolicy(Qt.NoFocus)
@@ -863,7 +891,6 @@ class QtCanvas(QWidget):
                 self._baseline_button = QPushButton()
                 self._baseline_button.setFocusPolicy(Qt.NoFocus)
                 self._baseline_button.setMinimumHeight(36)
-                self._baseline_button.setEnabled(False)
                 self._baseline_button.clicked.connect(
                     self._on_recollect_baseline)
                 self._baseline_status = QLabel()
@@ -915,29 +942,11 @@ class QtCanvas(QWidget):
 
         layout.addWidget(self._area, 1)
 
-        if show_slider:
-            bottom = QWidget()
-            bottom_layout = QHBoxLayout(bottom)
-            bottom_layout.setContentsMargins(8, 3, 8, 3)
-            self._slider = QSlider(Qt.Horizontal)
-            self._slider.setRange(0, 1000)
-            self._slider.setValue(DEFAULT_TACTILE_THRESHOLD)
-            # do not steal keyboard focus
-            self._slider.setFocusPolicy(Qt.NoFocus)
-            self._slider.setToolTip("tactile threshold (low cells zeroed)")
-            self._slider.valueChanged.connect(self._on_slider)
-
-            label = QLabel("tactile_thr")
-            label.setFocusPolicy(Qt.NoFocus)
-            bottom_layout.addWidget(label)
-            bottom_layout.addWidget(self._slider, 1)
-            layout.addWidget(bottom)
-
-        extra = 28 if show_slider else 0
+        extra = 0
         if (self._display_modes or lang_button or show_baseline
                 or show_surface_color or self._tactile_panel_modes
                 or show_orientation_button or show_selector_button
-                or show_dongle_reboot_button):
+                or show_dongle_reboot_button or show_pressure_fit_buttons):
             extra += 48
         # A 1280x720 canvas plus chrome is taller than the usable height of
         # many 1366x768 laptops.  Start within the available work area instead
@@ -1032,6 +1041,7 @@ class QtCanvas(QWidget):
         self._retranslate_selector_button()
         self._retranslate_dongle_reboot_button()
         self._retranslate_view_control_button()
+        self._retranslate_pressure_fit_buttons()
 
     def _on_lang_toggle(self) -> None:
         fn = getattr(self._controller, "_toggle_language", None)
@@ -1049,10 +1059,34 @@ class QtCanvas(QWidget):
         if callback is not None:
             callback()
 
-    def _on_slider(self, value: int) -> None:
-        callback = getattr(self._controller, "_on_tactile_thr", None)
+    def _on_pressure_fit_send(self) -> None:
+        callback = getattr(self._controller, "_on_pressure_fit_send", None)
         if callback is not None:
-            callback(value)
+            callback()
+
+    def _on_pressure_fit_query(self) -> None:
+        callback = getattr(self._controller, "_on_pressure_fit_query", None)
+        if callback is not None:
+            callback()
+
+    def set_pressure_fit_busy(self, busy: bool) -> None:
+        """Grey out both fit buttons while a command is in flight.
+
+        Called from the viewer's per-frame refresh with the controller's flag,
+        because the run happens on a worker thread and this is the only place
+        that may touch a widget.  The last value is remembered so a frame that
+        changes nothing does not restyle a button every time.
+        """
+
+        buttons = (self._pressure_fit_send_button,
+                   self._pressure_fit_query_button)
+        if self._pressure_fit_busy == bool(busy) or all(
+                button is None for button in buttons):
+            return
+        self._pressure_fit_busy = bool(busy)
+        for button in buttons:
+            if button is not None:
+                button.setEnabled(not busy)
 
     def _on_baseline_toggled(self, checked: bool) -> None:
         callback = getattr(self._controller, "_on_use_baseline_toggled", None)
@@ -1171,6 +1205,17 @@ class QtCanvas(QWidget):
         self._orientation_button.setText(
             fn() if fn is not None else "Recapture orientation")
 
+    def _retranslate_pressure_fit_buttons(self) -> None:
+        for button, method, fallback in (
+                (self._pressure_fit_send_button, "_pressure_fit_send_label",
+                 "Query fit parameters"),
+                (self._pressure_fit_query_button, "_pressure_fit_query_label",
+                 "Query and store back")):
+            if button is None:
+                continue
+            fn = getattr(self._controller, method, None)
+            button.setText(fn() if fn is not None else fallback)
+
     def _refresh_baseline_status(self) -> None:
         if self._baseline_status is None:
             return
@@ -1184,6 +1229,23 @@ class QtCanvas(QWidget):
     def set_baseline_button_enabled(self, enabled: bool) -> None:
         if self._baseline_button is not None:
             self._baseline_button.setEnabled(bool(enabled))
+
+    def set_baseline_toggle(self, checked: bool) -> None:
+        """Push the controller's baseline-view state into the switch.
+
+        The checkbox is built unchecked and the controller owns that state, so
+        the two have to be reconciled at construction: otherwise the widget
+        would contradict the view it drives until the user happened to click
+        it.  Signals are blocked -- this is the controller stating a fact, not
+        a user click, and letting it emit would hand the controller a toggle
+        event it never had.
+        """
+
+        if self._baseline_toggle is None:
+            return
+        previous = self._baseline_toggle.blockSignals(True)
+        self._baseline_toggle.setChecked(bool(checked))
+        self._baseline_toggle.blockSignals(previous)
 
     def set_dongle_reboot_visible(self, visible: bool) -> None:
         """Show the dongle reboot button only while a Bluetooth link exists.

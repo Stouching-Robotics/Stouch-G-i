@@ -1,429 +1,222 @@
-# Stouch Glove 跨平台工具包
+# Stouch Glove 跨平台工具包（Stouch-G-i）
 
-本工具包用于 STM32 数据手套的设备识别、IMU/触觉数据采集、姿态标定、21 关键点求解、3D 实时显示、录制与回放。
+Stouch-G-i 是 GitHub 半开源用户发行仓库，提供 SDK/GUI 源码与受保护的算法模块，用于数据手套设备识别、姿态标定、21 关键点求解、触觉显示及已有数据回放。
 
-当前 SDK 版本：`2.0.7`
+当前 SDK 版本：`2.3.1`；GUI 版本：`2.0.11`。
 
-> 支持平台：**Windows x86_64 / Linux x86_64 + Python 3.10**
+本仓库提供可直接运行的用户版源码，桌面 EXE 使用独立发行包。
 
 ## 主要功能
 
-- 自动识别左右手套的 STM32 USB CDC 串口。
-- 读取 16 路 IMU 四元数及 16×16 触觉压力矩阵。
-- 支持单手/双手 IMU 标定。
-- 将 IMU 数据解算为 21×3 手部关键点（单位：米）。
-- 提供单手、双手及自适应双手 3D 显示。
-- 支持 Parquet 录制与 MP4/PNG 回放渲染。
-- 提供 Python SDK 接口，便于集成到其他项目。
+- 设备发现与左右手绑定，支持 USB / 蓝牙链路自动选择。
+- GUI 单手/双手 IMU 标定，单手、双手及自适应双手 3D 实时显示。
+- 输出 21×3 手部关键点（米）、16×16 触觉 ADC 和拟合力值（牛顿）。
+- 回放已有 Parquet 数据，并渲染 MP4 / PNG。
+- 通过 `sdk.open_glove` / `sdk.open_bimanual` 集成用户帧。
 
 ## 目录结构
 
+所有安装和运行命令均在 `Stouch-G-i` 仓库根目录执行：
+
 ```text
-SDK/
-├── main.py                       # Windows/Linux 统一入口
-├── requirements.txt             # Python 3.10 依赖
-├── download_mano.py             # 自检 MANO 资源，必要时重新安装并重建派生网格
-├── 99-stm32-glove.rules         # Linux udev 串口权限规则
-├── sdk/                         # 对外 Python SDK 接口
-├── glove_io/                    # 串口、协议、录制与回放
-├── algorithm/                   # 标定与求解核心
-├── gui/                         # 标定、实时显示和回放程序
-├── common/                      # 公共数据类型、常量和路径工具
-├── config/                      # 设备、显示和运行配置
-├── calibration/                 # 默认标定文件及用户标定结果
-├── assets/                      # 手部模型、几何与显示资源
-└── firmware/                    # USB/蓝牙固件
+Stouch-G-i/
+├── README.md
+├── .gitignore
+├── main.py                       # GUI 与设备管理统一入口
+├── replay_entry.py               # 回放辅助入口
+├── requirements.txt              # Python 3.10 依赖
+├── sdk/                          # 用户 SDK
+│   └── io/                       # 内部通信、协议与数据文件处理
+├── algorithm/                    # 含受保护模块的标定与求解算法
+├── common/                       # 公共类型、常量和路径工具
+├── gui/                          # 标定、实时显示和回放
+├── assets/                       # 手部模型、几何与显示资源
+├── calibration/                  # 随包标定及用户标定结果
+├── config/                       # 设备绑定、标定绑定和显示配置
+├── firmware/                     # 固件文件
+└── pyarmor_runtime_000000/        # Windows / Linux x86_64 保护运行时
 ```
 
-`data/` 不是预置目录；录制数据后会自动创建。
+## 环境与安装
 
-## 环境要求
-
-- 必须使用 **Python 3.10 x86_64**。
-- 首次安装需要网络和 Git；`manotorch` 会从指定的 GitHub commit 安装。
-- 安装内容包含 CPU 版 PyTorch、NumPy、SciPy、PySide6、OpenCV、Polars 和串口库。
-- 必须在工具包的 `SDK` 目录中运行下面的命令。
+使用 **Python 3.10 x86_64**。首次安装需要网络和 Git；`manotorch` 从固定 GitHub commit 安装。依赖包括 CPU 版 PyTorch、NumPy、SciPy、PySide6、OpenCV、Polars 和串口库。
 
 ### Windows
 
-建议将虚拟环境建在工具包之外：
-
 ```powershell
-py -3.10 -m venv C:\venvs\stouch_glove
-C:\venvs\stouch_glove\Scripts\Activate.ps1
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
-python -c "import sdk; print(sdk.get_version())"
+python -m pip install -r requirements.txt
+python -c "import sdk, gui; print(sdk.get_version(), gui.APP_VERSION)"
 ```
 
-如 `chumpy==0.70` 构建失败：
+如 `chumpy==0.70` 构建失败，在已激活的环境中执行后重试：
 
 ```powershell
-pip install numpy==1.22.4 scipy==1.11.4 six
-pip install --no-build-isolation --no-deps chumpy==0.70
-pip install -r requirements.txt
+python -m pip install numpy==1.22.4 scipy==1.11.4 six
+python -m pip install --no-build-isolation --no-deps chumpy==0.70
+python -m pip install -r requirements.txt
 ```
-
-Windows 下使用 `python main.py ...` 启动各项功能。
 
 ### Linux
 
-先确保系统已安装 Python 3.10、Git 和 Qt 所需的 `libxcb-cursor0`，然后执行：
+先安装 Python 3.10、Git 和对应发行版的 Qt/XCB 运行依赖（如 `libxcb-cursor0`）：
 
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -c "import sdk; print(sdk.get_version())"
-
-sudo cp 99-stm32-glove.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger
+python -c "import sdk, gui; print(sdk.get_version(), gui.APP_VERSION)"
 ```
 
-安装 udev 规则后请重新插拔手套。Linux 与 Windows 使用相同的 `python main.py ...` 命令。
+请按部署环境配置串口设备权限。包内包含 Linux x86_64 保护运行时；Linux 尚未实机验收。Windows 与 Linux 使用相同的 `python main.py ...` 命令。
 
 ## 手部模型（MANO）
 
-21 关键点求解与 3D 显示依赖 MANO 手部模型。模型文件**随本仓库一并分发**，克隆下来即可运行，无需另行下载：
+21 关键点求解与 3D 显示使用随包分发的 MANO 模型及派生资源：
 
 | 文件 | 用途 |
 |---|---|
-| `assets/hand/models/MANO_{LEFT,RIGHT}.pkl` | Max-Planck 官方模型；3D 显示从它取三角面索引 |
-| `assets/hand/HAND_{LEFT,RIGHT}_PINKY_PLUS_2MM.npz` | 据官方模型生成的 21 关键点派生网格，求解与 3D 显示实际加载的就是它 |
+| [MANO_LEFT.pkl](assets/hand/models/MANO_LEFT.pkl) / [MANO_RIGHT.pkl](assets/hand/models/MANO_RIGHT.pkl) | 官方模型资源 |
+| [HAND_LEFT_PINKY_PLUS_2MM.npz](assets/hand/HAND_LEFT_PINKY_PLUS_2MM.npz) / [HAND_RIGHT_PINKY_PLUS_2MM.npz](assets/hand/HAND_RIGHT_PINKY_PLUS_2MM.npz) | 求解与显示使用的派生网格 |
 
-MANO 由 Max-Planck 提供，仅授权**非商业**科研/教育用途。许可全文见 `assets/hand/LICENSE.txt`；商业用途请单独联系 Max-Planck（ps-license@tue.mpg.de）。
-
-如果需要从官方渠道重新获取模型，或调整手部厚度后重建派生网格，用 `download_mano.py`：
-
-```powershell
-python download_mano.py                            # 查看当前资源状态
-python download_mano.py --install <解压后的目录>    # 安装 PKL 并重建 npz
-python download_mano.py --open                     # 打开官方下载页面
-```
-
-`--install` 会把 `MANO_LEFT.pkl` / `MANO_RIGHT.pkl` 复制到 `assets/hand/models/`（可直接传解压后的整个目录，脚本会自动识别左右手文件），再据此重建 `assets/hand/HAND_*_PINKY_PLUS_2MM.npz`。
+MANO 由 Max-Planck 提供，许可限非商业科研/教育等用途；完整条款见 [assets/hand/LICENSE.txt](assets/hand/LICENSE.txt)。商业用途请联系 Max-Planck（ps-license@tue.mpg.de）。
 
 ## 设备绑定
 
-先插入手套并查看系统识别到的设备：
+插入手套后查看设备，将下面的占位字符串替换为对应设备的 USB 序列号：
 
 ```powershell
 python main.py devices --list
-```
-
-将输出的 USB 序列号绑定为左手或右手：
-
-```powershell
-python main.py devices --set-serial left  --serial <LEFT_SERIAL>
-python main.py devices --set-serial right --serial <RIGHT_SERIAL>
+python main.py devices --set-serial left --serial "LEFT_USB_SERIAL"
+python main.py devices --set-serial right --serial "RIGHT_USB_SERIAL"
 python main.py devices --check-both
 ```
 
-清空所有已记住序列号：
+绑定保存在 `config/glove_devices.json`。需要重新绑定时，可用 `python main.py devices --clear` 清空记忆，再按上述步骤设置。
 
-```powershell
-python main.py devices --clear
-```
+## GUI 与命令行用法
 
-设备信息保存在 `config/glove_devices.json`。
-
-## 命令行用法
-
-Windows 和 Linux 的命令相同：
+`main.py` 的应用白名单为 `devices`、`calibration`、`live_3d`、`live_3d_bimanual`、`live_3d_bimanual_auto`、`replay`。
 
 | 功能 | 命令 |
 |---|---|
-| 自适应单手/双手 3D | `python main.py` |
-| 强制重新选择标定 | `python main.py --select-calibration` |
+| 标定选择器 → 自适应单手/双手 3D | `python main.py` |
 | 标定 GUI（默认右手） | `python main.py calibration` |
 | 左手标定 GUI | `python main.py calibration --side left` |
-| 单手 3D | `python main.py live_3d --side right` |
-| 双手 3D | `python main.py live_3d_bimanual --select-calibration` |
-| 自适应双手 3D | `python main.py live_3d_bimanual_auto --select-calibration` |
-| 单手 IMU 终端 | `python main.py imu_live` |
-| 双手 IMU 终端 | `python main.py imu_live_bimanual` |
-| 触觉矩阵 | `python main.py tactile --side right` |
-| 回放选择器 | `python main.py replay` |
-| 指定 Parquet 回放 | `python main.py replay <PARQUET>` |
+| 单手 3D，并选择标定 | `python main.py live_3d --side right --select-calibration` |
+| 双手 3D，并选择标定 | `python main.py live_3d_bimanual --select-calibration` |
+| 自适应实时 3D，复用有效标定记忆 | `python main.py live_3d_bimanual_auto` |
+| 自适应实时 3D，强制重选标定 | `python main.py live_3d_bimanual_auto --select-calibration` |
+| 回放文件选择器 | `python main.py replay` |
+| 将已有 Parquet 渲染为 MP4 | `python main.py replay "recording.parquet" --out "preview.mp4"` |
+| 将指定帧渲染为 PNG | `python main.py replay "recording.parquet" --frame 0` |
 
-默认标定文件：
+回放示例中的 `recording.parquet` 是用户提供的已有文件；请替换为实际路径。PNG 输出固定为输入文件同目录的 `preview_frame0.png`。
 
-- 右手：`calibration/imu_calibration.json`
-- 左手：`calibration/imu_2d_calibration.json`
+### 标定文件如何选择
 
-实时窗口内的录制会写入 `data/keypoints_21*/<SESSION>/`。
+- GUI 选择器按左右手筛选兼容文件，并按修改时间从新到旧列出。自适应实时程序通过 `config/calibration_bindings.json` 记忆设备序列号对应的标定；`python main.py` 会强制进入选择器。
+- GUI 未指定文件/标定目录、未经过选择且无有效标定绑定时，文件回退值为左手 `calibration/imu_2d_calibration.json`、右手 `calibration/imu_calibration_right_default.json`。
+- API 省略标定参数时，在仓库 `calibration/`（或 `calibration_dir`）内按左右手和 HAND2mm 兼容性筛选，取修改时间最新的文件；时间相同再按文件名排序取最大值。API 不使用 GUI 的标定绑定。
+- 随包提供多份标定。建议使用 GUI 生成适配当前手套的文件，并在集成时显式指定，避免文件修改时间变化影响选择。以下示例显式选用随包文件，实际使用请换成对应手套的标定。
 
 ## Python SDK
 
-所有公开接口都可以直接从 `sdk` 导入：
+推荐从 `sdk` 导入 `open_glove` / `open_bimanual`。单手默认 `side="right"`、`link="auto"`、`sample_rate_hz=80`、`include_tactile=True`、`smoothing_ms=35.0`。可用 `calibration` 显式指定文件，或用 `calibration_dir` 指定扫描目录。
+
+用户版 `HandFrame` 字段如下：
+
+| 字段 | 含义 |
+|---|---|
+| `side`、`sequence`、`timestamp_us` | 左右手、帧序号与微秒时间戳 |
+| `joints_raw_m`、`joints_smoothed_m` | 未平滑/已平滑的关键点，均为 `(21, 3)`，单位米 |
+| `tactile_adc` | `(16, 16)` 原始 12-bit 触觉 ADC，计数范围 0–4095；无扫描时为 `None` |
+| `force_n` | `(16, 16)` 拟合力值，单位牛顿；未拟合区域为 `NaN`，无扫描时为 `None` |
+| `force_fresh` | 上述 ADC 与力值共用的新鲜度标志，`False` 时可能沿用之前的扫描 |
+| `status` | 求解状态；`details["warming_up"]` 为真时，关键点为预热占位姿态 |
+| `firmware_version`、`link_kind` | 固件版本（可能为 `None`）与当前链路类型 |
+| `device_fps`、`tactile_fps` | 姿态帧与触觉扫描各自的到达帧率 |
+| `link_drops`、`link_errors` | 链路丢帧与错误统计字典 |
+| `latency_ms` | 延迟估计，可能为 `None` |
+
+`force_fresh` 同时适用于 `tactile_adc` 与 `force_n`；累计或滤波时只处理新扫描，并跳过非有限力值。SDK 版本与固件版本独立，SDK 版本可用 `sdk.get_version()` 查询。
+
+### 单手：在有限时间内读取一帧
 
 ```python
-from sdk import (
-    DeviceManager,
-    RawImuStream,
-    TactileStream,
-    HandSolver,
-    Glove,
-    GloveConfig,
-    BimanualGlove,
-    BimanualConfig,
-    ImuCalibrator,
-    RecordingReplay,
-)
+from time import monotonic
+import numpy as np
+from sdk import StreamTimeoutError, open_glove
+
+with open_glove("right", calibration="calibration/imu_default_right.json") as glove:
+    deadline = monotonic() + 10.0
+    while monotonic() < deadline:
+        try:
+            frame = glove.read(timeout=0.5)
+        except StreamTimeoutError:
+            continue
+        if frame.status.details.get("warming_up", False):
+            continue
+        if not np.isfinite(frame.joints_smoothed_m).all():
+            continue
+        print("关键点形状：", frame.joints_smoothed_m.shape)
+        if frame.force_fresh:
+            if frame.tactile_adc is not None:
+                print("触觉 ADC 形状：", frame.tactile_adc.shape)
+            if frame.force_n is not None:
+                values = frame.force_n[np.isfinite(frame.force_n)]
+                if values.size:
+                    print("有效力值均值（N）：", float(values.mean()))
+        break
+    else:
+        print("读取阶段 10 秒内未取得可用姿态帧")
 ```
 
-### 接口总览
+`read(timeout=...)` 超时会抛出 `StreamTimeoutError`；单手 `latest()` 不阻塞，首帧前可能返回 `None`。`health()` 可查看连接状态，`info()` 可查看版本与链路信息。`with` 退出时释放串口与采集资源。
 
-| 接口 | 用途 | 主要返回值 |
-|---|---|---|
-| `DeviceManager` | 查找手套、绑定左右手、解析串口 | `DeviceInfo`、`DeviceBindings` |
-| `RawImuStream` | 读取 STM32 原始 16 路 IMU 数据 | `RawImuFrame` |
-| `TactileStream` | 读取 16×16 触觉压力矩阵 | `TactileFrame` |
-| `HandSolver` | 将一帧原始 IMU 数据解算为 21 关键点 | `KeypointFrame` |
-| `Glove` | 单手采集、解算、触觉和录制的一体化接口 | `HandFrame` |
-| `BimanualGlove` | 同步读取左右手并支持双手录制 | `BimanualFrame` |
-| `ImuCalibrator` | 按步骤完成单只手套的 IMU 标定 | `CalibrationProgress` |
-| `RecordingReplay` | 检查 Parquet 录制文件并渲染 MP4 | `RecordingInfo`、`ReplayResult` |
-
-### 主要数据结构
-
-| 数据结构 | 重要字段 | 数据形状或含义 |
-|---|---|---|
-| `RawImuFrame` | `quaternions_xyzw` | `(16, 4)`，原始四元数顺序为 XYZW |
-| `RawImuFrame` | `present_mask`、`valid_mask` | `(16,)`，IMU 是否存在及数据是否有效 |
-| `TactileFrame` | `samples` | `(16, 16)`，触觉压力矩阵 |
-| `KeypointFrame` | `joints_m` | `(21, 3)`，21 个关键点，单位为米 |
-| `HandFrame` | `joints_raw_m`、`joints_smoothed_m` | `(21, 3)`，原始及平滑后的关键点 |
-| `HandFrame` | `imu_xyzw`、`imu_valid`、`tactile` | IMU 姿态、有效标记及可选触觉矩阵 |
-| `BimanualFrame` | `left`、`right` | 左右手各一个 `HandFrame` |
-| `BimanualFrame` | `synchronization_error_ms` | 左右手帧的时间同步误差，单位为毫秒 |
-
-### 1. DeviceManager：设备发现与绑定
-
-默认使用 `config/glove_devices.json` 保存绑定关系。`resolve_port()` 返回 `(串口名称, USB序列号)`。
+### 双手：读取同步关键点
 
 ```python
-from sdk import DeviceManager
+from time import monotonic
+import numpy as np
+from sdk import StreamTimeoutError, open_bimanual
 
-devices = DeviceManager()
-
-# 查看当前连接的手套
-for item in devices.list_devices():
-    print(item.device, item.serial_number, item.bound_side)
-
-# 首次使用时，根据实际序列号完成绑定
-devices.bind("right", "YOUR_RIGHT_USB_SERIAL")
-
-# 后续无需依赖固定的 COM 口或 /dev/tty* 名称
-port, serial_number = devices.resolve_port("right")
-print(port, serial_number)
-
-# 双手程序启动前可检查左右手是否都已连接
-bindings = devices.validate_bimanual()
-print(bindings.left_port, bindings.right_port)
+with open_bimanual(
+    left_calibration="calibration/imu_default_left.json",
+    right_calibration="calibration/imu_default_right.json",
+) as gloves:
+    deadline = monotonic() + 10.0
+    while monotonic() < deadline:
+        try:
+            frame = gloves.read(timeout=0.5)
+        except StreamTimeoutError:
+            continue
+        hands = (frame.left, frame.right)
+        if any(h.status.details.get("warming_up", False) for h in hands):
+            continue
+        if not all(np.isfinite(h.joints_smoothed_m).all() for h in hands):
+            continue
+        print(frame.left.joints_smoothed_m.shape, frame.right.joints_smoothed_m.shape)
+        print("同步误差（ms）：", frame.synchronization_error_ms)
+        break
+    else:
+        print("读取阶段 10 秒内未取得可用双手姿态帧")
 ```
 
-常用方法：
+双手帧的 `left` / `right` 均为上述用户版 `HandFrame`；读取两侧触觉或力值时，分别检查各自的 `force_fresh`、`None` 与非有限值。
 
-- `list_devices()`：列出当前连接的 STM32 手套。
-- `bind(side, serial_number)`：将 USB 序列号绑定到 `left` 或 `right`。
-- `resolve_port(side)`：根据绑定关系找到当前串口。
-- `get_bindings(resolve_ports=True)`：读取绑定关系，并可同时解析串口。
-- `validate_bimanual()`：确认左右手绑定和连接状态可用于双手模式。
-- `swap_bindings()`：交换左右手绑定。
+## 保护与验证状态
 
-### 2. RawImuStream 与 TactileStream：原始传感器数据
+部分算法模块使用 **PyArmor 9.2.8 trial** 保护；运行所需的 Windows / Linux x86_64 运行时已包含在仓库。模型使用边界见随附许可证。
 
-下面的示例让 IMU 和触觉共用同一个串口连接：
-
-```python
-from sdk import DeviceManager, RawImuStream
-
-port, _ = DeviceManager().resolve_port("right")
-
-with RawImuStream(serial_port=port) as imu_stream:
-    tactile_stream = imu_stream.tactile_stream()
-
-    imu_frame = imu_stream.read(timeout=3.0)
-    tactile_frame = tactile_stream.read(timeout=3.0)
-
-    print(imu_frame.quaternions_xyzw.shape)  # (16, 4)
-    print(imu_frame.valid_mask.shape)        # (16,)
-    print(tactile_frame.samples.shape)       # (16, 16)
-```
-
-两种数据来自同一个 USB CDC 串口。需要同时读取时，应使用 `imu_stream.tactile_stream()` 共享连接，不要针对同一只手套分别创建两个独立串口对象。
-
-数据读取方式：
-
-- `read(timeout=...)`：阻塞等待一帧，超时会抛出 `StreamTimeoutError`。
-- `poll(maximum=...)`：立即返回缓冲区中已有的帧，不阻塞。
-- `frames(timeout=...)`：持续迭代数据帧，适合采集循环。
-- `status`、`connected`、`last_error`：查看 IMU 数据流的连接状态。
-
-### 3. HandSolver：离线解算 21 关键点
-
-`HandSolver` 不负责打开串口，它只负责把 `RawImuFrame` 或 NumPy 四元数数组转换为手部关键点，因此也可以处理已保存的 IMU 数据。
-
-```python
-from sdk import HandSolver
-
-solver = HandSolver(
-    side="right",
-    calibration="calibration/imu_calibration.json",
-)
-
-# imu_frame 是 RawImuStream.read() 返回的 RawImuFrame
-keypoints = solver.process(imu_frame)
-print(keypoints.joints_m.shape)  # (21, 3)，单位：米
-print(keypoints.valid_mask)      # 16 路 IMU 有效状态
-```
-
-也可以使用 `solve(imu_xyzw, valid_mask)` 直接传入形状为 `(16, 4)` 的 XYZW 四元数数组。切换到一段新的、不连续的数据流时，可调用 `reset_stream_state()` 清除内部连续帧状态。
-
-### 4. Glove：推荐的单手高级接口
-
-一般的单手应用建议直接使用 `Glove`。它会根据设备绑定打开对应手套，并把 IMU、21 关键点、触觉和状态放在同一个 `HandFrame` 中。
-
-```python
-from sdk import Glove, GloveConfig
-
-config = GloveConfig(
-    side="right",
-    calibration="calibration/imu_calibration.json",
-    include_tactile=True,
-)
-
-with Glove(config) as glove:
-    frame = glove.read(timeout=3.0)
-    print(frame.joints_smoothed_m.shape)  # (21, 3)
-    if frame.tactile is not None:
-        print(frame.tactile.shape)        # (16, 16)
-```
-
-`GloveConfig` 的常用参数：
-
-- `side`：`"left"` 或 `"right"`。
-- `calibration`：该手套对应的标定 JSON。
-- `serial_number`：可选；指定 USB 序列号。省略时使用设备绑定。
-- `sample_rate_hz`：目标采样率，默认 `80`。
-- `include_tactile`：是否在输出帧中包含触觉数据，默认开启。
-- `smoothing_ms`：关键点平滑窗口，默认 `35.0` 毫秒。
-- `recording_root`：可选的录制输出目录。
-
-`Glove` 还提供 `latest()`、`health()`、`start_recording()`、`stop_recording()` 和 `recording_status`。推荐使用 `with`，确保退出时关闭串口和采集线程。
-
-### 5. BimanualGlove：双手同步接口
-
-```python
-from sdk import BimanualConfig, BimanualGlove, GloveConfig
-
-left = GloveConfig(
-    side="left",
-    calibration="calibration/imu_2d_calibration.json",
-)
-right = GloveConfig(
-    side="right",
-    calibration="calibration/imu_calibration.json",
-)
-
-with BimanualGlove(BimanualConfig(left=left, right=right)) as gloves:
-    frame = gloves.read(timeout=3.0)
-    print(frame.left.joints_smoothed_m.shape)   # (21, 3)
-    print(frame.right.joints_smoothed_m.shape)  # (21, 3)
-    print(frame.synchronization_error_ms)
-```
-
-`health()` 返回左右手各自的连接状态和同步误差。双手录制可使用 `start_recording(name)`、`stop_recording()` 和 `recording_status`。
-
-### 6. ImuCalibrator：程序化标定
-
-`ImuCalibrator` 将标定过程拆分为多个步骤。应用程序应展示每一步的 `title`，提示用户完成对应动作后再调用 `run_step()`。
-
-```python
-from sdk import ImuCalibrator
-
-with ImuCalibrator(side="right") as calibrator:
-    health = calibrator.connect()
-    if not health.connected:
-        raise RuntimeError(health.last_error or health.message)
-
-    calibrator.start_new()
-    for step in calibrator.steps:
-        input(f"请完成动作：{step.title}，然后按回车继续...")
-        result = calibrator.run_step(step.id)
-        if not result.ok:
-            raise RuntimeError(result.message)
-
-    output = calibrator.save(
-        "right_calibration.json",
-        directory="calibration",
-        overwrite=False,
-    )
-    print(output)
-```
-
-如果某一步失败，可调整手势后调用 `retry_step(step.id)`。`progress()` 返回总步骤数、已完成步骤和是否全部完成。
-
-### 7. RecordingReplay：录制文件检查与回放
-
-```python
-from sdk import RecordingReplay
-
-replay = RecordingReplay()
-info = replay.inspect("data/example/chunk-000.parquet")
-print(info.mode, info.sides, info.frame_count, info.sample_fps)
-print(info.has_imu, info.has_tactile)
-
-result = replay.render_mp4(
-    "data/example/chunk-000.parquet",
-    "data/example/preview.mp4",
-    view="static",          # 也可以使用 "rotating"
-    smooth=True,
-    include_tactile=True,
-    overwrite=True,
-)
-print(result.output_path, result.frame_count)
-```
-
-### 异常处理与资源释放
-
-常用异常也从 `sdk` 导出，例如：
-
-```python
-from sdk import DeviceNotFoundError, StreamTimeoutError
-
-try:
-    frame = glove.read(timeout=1.0)
-except StreamTimeoutError:
-    print("等待数据超时")
-except DeviceNotFoundError as exc:
-    print(f"未找到手套：{exc}")
-```
-
-`RawImuStream`、`TactileStream`、`Glove`、`BimanualGlove` 和 `ImuCalibrator` 都支持 `with` 上下文管理。长期运行的程序也可以显式调用对应的 `close()` 或 `stop()` 方法。
-
-## 发布注意事项
-
-- 正式打包前请删除所有 `__pycache__/`、`*.pyc`、录制数据和临时标定文件。
-- 请检查 `config/glove_devices.json` 与 `config/calibration_bindings.json`，避免对外发布无关设备序列号或失效路径。
-- `assets/hand/` 中的 MANO 模型及派生资源随本仓库分发，受 Max-Planck 单独许可证约束（仅限非商业科研/教育用途）。再分发前请阅读 `assets/hand/LICENSE.txt`；商业用途请联系 ps-license@tue.mpg.de。
+Windows 离线验证已通过；Linux 仅随包提供运行时，尚未真机验收，手套硬件未测。
 
 ## 常见问题
 
-- **Python 依赖无法加载**  
-  确认当前是 Python 3.10 x86_64，并已在当前虚拟环境中完整安装 `requirements.txt`。
-
-- **Windows 找不到手套**  
-  运行 `python main.py devices --list`，确认设备出现为 `COMx`，然后绑定 USB 序列号。
-
-- **Linux 串口权限不足**  
-  安装 `99-stm32-glove.rules` 并重新插拔手套。
-
-- **Qt 报错缺少 `libxcb-cursor.so.0`**  
-  安装系统包 `libxcb-cursor0`。
-
-- **双手模式无法启动**  
-  先运行 `devices --check-both`，然后确认左右手都有对应的标定 JSON。
+- **依赖无法加载**：确认使用 Python 3.10 x86_64，且在当前虚拟环境完整安装 `requirements.txt`。
+- **找不到手套/双手无法启动**：运行 `python main.py devices --list` 核对设备，再检查左右手绑定及所选标定文件。
+- **Linux 串口权限不足**：按部署环境配置串口访问权限，并重新连接设备。
+- **Qt 缺少 `libxcb-cursor.so.0`**：安装对应发行版的 Qt/XCB 依赖（如 `libxcb-cursor0`）。

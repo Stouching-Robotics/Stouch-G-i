@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Two STM32 gloves -> HAND2mm-calibrated MANO meshes -> live 3D."""
+"""Two STM32 gloves -> HAND2mm-calibrated MANO meshes -> live 3D.
+
+Both hands arrive through the SDK's single entry point: ``sdk.open_bimanual``
+returns a ``BimanualGlove`` whose ``read`` hands over one ``BimanualFrame``
+carrying a complete ``HandFrame`` per hand, so this viewer owns only display,
+joint smoothing and pressure presentation.  Each hand's link (wired USB or
+Bluetooth dongle) is resolved by the SDK, not here.
+
+This is the client edition, so it renders exactly what that edition hands over
+-- solved joint positions and finger force in newtons -- and nothing else.
+There is no recording path (capturing and writing data out is the admin
+edition's job) and no raw IMU, pressure ADC or magnetometer register is read
+anywhere here.
+"""
 
 from __future__ import annotations
 
@@ -32,30 +45,29 @@ DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
 if str(BUNDLE_ROOT) not in sys.path:
     sys.path.insert(0, str(BUNDLE_ROOT))
 
-from common.frame_pacing import recent_batch  # noqa: E402
 from gui.calibration_selector import select_calibration_files  # noqa: E402
 from gui.live_3d import (  # noqa: E402
     Live3DViewer, LiveViewState, VIEW3D_CONFIG_PATH,
     align_left_to_right_reference, apply_hand_display_rotation,
-    hand_display_basis, _latest_solver_mesh_vertices,
-    place_hands_at_wrist_anchors)
-from gui.rendering.tactile import render_hand  # noqa: E402
+    hand_display_basis, place_hands_at_wrist_anchors)
+from gui.rendering.tactile_overlay import (  # noqa: E402
+    draw_bimanual_tactile_overlay)
 from gui.rendering.tactile_pressure_hand import (  # noqa: E402
-    PressureHandMapper, draw_pressure_color_points, draw_pressure_tiles,
-)
-from glove_io.recording import (  # noqa: E402
-    BimanualRecorder, BimanualRecordingSession,
-    JointPositionSmoother, KeypointParquetRecorder,
-    SkeletonRenderer)
-from glove_io.session import (  # noqa: E402
-    session_metadata_path, update_session_metadata,
-    view_state_metadata, write_session_metadata)
-from glove_io.tactile_processing import TactilePreprocessor  # noqa: E402
-from sdk import DeviceManager, HandSolver, RawImuStream  # noqa: E402
+    PressureHandMapper, draw_pressure_color_points, draw_pressure_tiles)
+from sdk.io.recording import JointPositionSmoother  # noqa: E402
+from sdk.io.session import view_state_metadata  # noqa: E402
+from sdk.device import DeviceManager  # noqa: E402
+from sdk import StreamClosedError, StreamTimeoutError, open_bimanual  # noqa: E402
+from sdk.calibration import find_latest_hand2mm_calibration  # noqa: E402
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
 DEFAULT_GEOMETRY_PATH = (
     BUNDLE_ROOT / "assets/hand_geometry/hand_measured_runtime_v1.json")
+
+# How long one pass may wait for the next bimanual frame.  The pass also drives
+# the viewer, so it must come back often enough to keep the redraw on schedule;
+# a frame that is already queued returns immediately.
+READ_TIMEOUT_S = 0.02
 
 
 @dataclass
@@ -97,32 +109,6 @@ def load_calibration(path: Path, side: str) -> CalibrationSettings:
     )
 
 
-def find_latest_hand2mm_calibration(directory: Path, side: str) -> Path:
-    """Find the newest HAND2mm-compatible calibration for one hand."""
-    folder = Path(directory).expanduser().resolve()
-    if not folder.is_dir():
-        raise RuntimeError(f"Calibration directory does not exist: {folder}")
-    matches = []
-    for path in folder.glob("*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        saved_side = str(payload.get("side") or "right").lower()
-        if saved_side != side or not isinstance(payload.get("param_inst_calib"), dict):
-            continue
-        # The local HAND2mm path consumes the original root/installation and
-        # contact payload. Direct-FK factory files use a different solver.
-        if payload.get("kinematics") in {"direct_fk", "fitted_direct_fk"}:
-            continue
-        if str(payload.get("tool") or "") in {
-                "direct_fk_calibrate_cli", "hand_fk_fit_cli"}:
-            continue
-        matches.append(path)
-    if not matches:
-        raise RuntimeError(
-            f"No usable HAND2mm {side} IMU calibration JSON in {folder}")
-    return max(matches, key=lambda path: (path.stat().st_mtime_ns, path.name))
 
 
 def resolve_calibration_paths(
@@ -140,7 +126,8 @@ def resolve_calibration_paths(
         left = (Path(left_calib) if left_calib is not None
                 else DEFAULT_CALIBRATION_DIR / "imu_2d_calibration.json")
         right = (Path(right_calib) if right_calib is not None
-                 else DEFAULT_CALIBRATION_DIR / "imu_calibration.json")
+                 else DEFAULT_CALIBRATION_DIR
+                 / "imu_calibration_right_default.json")
     return {"left": left.expanduser(), "right": right.expanduser()}
 
 
@@ -322,59 +309,44 @@ def remap_hand_root_motion(
 
 @dataclass
 class HandRuntime:
+    """One hand's newest SDK frame, reduced to what the display consumes.
+
+    No raw field is carried: the frame the SDK hands over here has none to
+    copy.  ``latest_smoothed`` is the display's own low-pass copy of the solved
+    keypoints, kept distinct from the frame's ``joints_smoothed_m`` so this
+    viewer's smoothing stays a presentation choice.
+    """
+
     side: str
-    config: CalibrationSettings
-    solver: HandSolver
-    stream: RawImuStream
-    tactile_stream: object
     smoother: JointPositionSmoother
-    tactile_pre: TactilePreprocessor
-    missing: list[str]
     latest_joints: np.ndarray | None = None
     latest_smoothed: np.ndarray | None = None
-    latest_uv: np.ndarray | None = None
-    latest_imu: np.ndarray | None = None
-    latest_raw_imu: np.ndarray | None = None
-    latest_raw_present: np.ndarray | None = None
-    latest_raw_valid: np.ndarray | None = None
-    latest_raw_device_timestamp_us: int | None = None
-    latest_tactile: np.ndarray | None = None
-    latest_tactile_raw: np.ndarray | None = None
     latest_host_s: float = 0.0
     last_seq: int = -1
     safety: bool = False
     contact: str | None = None
+    # While the IMUs are still settling the SDK returns a neutral resting pose
+    # rather than a solve of the wearer's hand, and flags it here.
+    warming_up: bool = False
+    # Device-side arrival rate, carried on the frame.
+    device_fps: float = 0.0
+    # The pressure stream's own arrival rate, a separate device stream: the
+    # scan a frame carries is often the newest one standing over.
+    tactile_fps: float = 0.0
 
 
-def draw_bimanual_tactile_overlay(
-        img: np.ndarray,
-        tactile_frames: dict[str, np.ndarray | None],
-        threshold: float = 0.0,
-        scale: float = 0.6) -> np.ndarray:
-    """Draw the exact fixed left/right tactile panels used by live view."""
-    for side, x_anchor in (("left", 12), ("right", None)):
-        value = tactile_frames.get(side)
-        if value is None:
-            continue
-        frame = np.asarray(value, dtype=np.float32).reshape(16, 16)
-        if not np.isfinite(frame).any():
-            continue
-        frame = np.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
-        if threshold > 0:
-            frame = np.where(frame < float(threshold), 0.0, frame)
-        hand_img = render_hand(frame, mirror=side == "left", side=side)
-        shown_scale = min(max(float(scale), 0.1), 0.7)
-        tw = max(1, int(round(hand_img.shape[1] * shown_scale)))
-        th = max(1, int(round(hand_img.shape[0] * shown_scale)))
-        shown = cv2.resize(
-            hand_img, (tw, th), interpolation=cv2.INTER_LINEAR)
-        x0 = x_anchor if x_anchor is not None else img.shape[1] - tw - 12
-        y0 = img.shape[0] - th - 60
-        img[y0:y0 + th, x0:x0 + tw] = shown
-        cv2.putText(
-            img, side.upper(), (x0, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX,
-            0.5, (200, 195, 185), 1, cv2.LINE_AA)
-    return img
+def _hand_engine(bm, side: str):
+    """One hand of the bimanual facade, for what the frame itself lacks.
+
+    A ``BimanualFrame`` carries joints and no MANO surface, so the mesh the
+    renderer draws and the solver backend it names come from the hand's own
+    facade -- ``BimanualGlove.left`` / ``.right``, which is the same public
+    surface ``sdk.open_glove`` hands back, read through its public
+    ``mesh_vertices_m`` and ``backend``.  No solver is poked and no solve
+    happens here.
+    """
+
+    return getattr(bm, side)
 
 
 class BimanualViewer(Live3DViewer):
@@ -382,20 +354,18 @@ class BimanualViewer(Live3DViewer):
                  display_rotations=None, palm_target_bases=None,
                  left_root_rotvec_sign=None,
                  display_config_path=DEFAULT_BIMANUAL_DISPLAY_CONFIG,
-                 recording_enabled=True, recording_state="idle",
                  **kwargs):
-        self.recording_enabled = bool(recording_enabled)
-        self.recording_state = str(recording_state)
-        self._record_action_requested: str | None = None
         self.side_status = {
-            "left": {"fps": 0.0, "device_fps": 0.0, "missing": [], "safety": False,
-                     "contact": None},
-            "right": {"fps": 0.0, "device_fps": 0.0, "missing": [], "safety": False,
-                      "contact": None},
+            "left": {"fps": 0.0, "device_fps": 0.0, "tactile_fps": 0.0,
+                     "warming_up": False,
+                     "safety": False, "contact": None},
+            "right": {"fps": 0.0, "device_fps": 0.0, "tactile_fps": 0.0,
+                      "warming_up": False,
+                      "safety": False, "contact": None},
         }
         self.tactile_frames = {"left": None, "right": None}
         self.tactile_calibrating_sides = {"left": True, "right": True}
-        # Pressure samples can be projected onto the animated MANO surface as
+        # Force samples can be projected onto the animated MANO surface as
         # either coloured points or cell-shaped tiles.  The barycentric anchor
         # map is static; only the live mesh positions change each frame.
         self.pressure_display_mode = "none"
@@ -453,15 +423,8 @@ class BimanualViewer(Live3DViewer):
         self._redraw_requested = True
 
     def _hud_lines(self):
-        state_labels = {
-            "disabled": "DISABLED",
-            "idle": "READY - press button or SPACE",
-            "recording": "RECORDING",
-            "saved": "SAVED - ready for next take",
-        }
         lines = [
-            f"Recording: {state_labels.get(self.recording_state, self.recording_state)}",
-            f"Bimanual recorded frames: {self.frame_count}",
+            f"Bimanual frames: {self.frame_count}",
         ]
         metrics = bimanual_relative_metrics(
             self._display_slots(), self._relative_reference_slots)
@@ -482,13 +445,18 @@ class BimanualViewer(Live3DViewer):
                     metrics["right_nonthumb_motion_m"] * 1000.0))
         for side in ("left", "right"):
             status = self.side_status[side]
-            # Solve rate first, device arrival rate right behind it: when they
-            # differ, the gap is the host dropping frames, not the glove
-            # withholding them, and that is the whole point of showing both.
+            # Solve rate first, then each device stream's own arrival rate:
+            # when they differ, the gap is the host dropping frames, not the
+            # glove withholding them, and that is the whole point of showing
+            # all three.  Attitude and pressure are separate streams, so one
+            # rate cannot stand in for the other.
+            # Warm-up is flagged because until it clears the joints are a
+            # neutral placeholder rather than a solve of the wearer's hand.
             lines.append(
                 f"{side.upper()}: {status['fps']:5.1f} FPS  "
-                f"DEV {float(status.get('device_fps') or 0.0):5.1f} Hz  "
-                f"IMU {16-len(status['missing'])}/16"
+                f"IMU {float(status.get('device_fps') or 0.0):5.1f} Hz  "
+                f"TACT {float(status.get('tactile_fps') or 0.0):5.1f} Hz"
+                + ("  WARMUP" if status.get("warming_up") else "")
                 + ("  SAFETY" if status["safety"] else "")
                 + (f"  contact={status['contact']}" if status["contact"] else ""))
         return lines
@@ -572,79 +540,25 @@ class BimanualViewer(Live3DViewer):
                 position = tuple(points[index].astype(int) + np.array([8, -8]))
                 cv2.putText(img, label, position, cv2.FONT_HERSHEY_SIMPLEX,
                             0.9, color, 2, cv2.LINE_AA)
-        self._draw_record_button(img)
         return img
 
-    def _record_button_rect(self) -> tuple[int, int, int, int]:
-        # Right-anchored, so it tracks the canvas width.  Draw and hit-test
-        # both go through here, which is what keeps them in agreement.
-        return self.canvas_w - 305, 18, self.canvas_w - 22, 66
+    def set_tactile_side(self, side, force):
+        """Store one hand's newest force map, or clear it until the first scan.
 
-    def _draw_record_button(self, img: np.ndarray) -> None:
-        x0, y0, x1, y1 = self._record_button_rect()
-        if not self.recording_enabled:
-            color, label = (75, 75, 75), "RECORDING DISABLED"
-        elif self.recording_state == "recording":
-            color, label = (45, 55, 220), "STOP & SAVE"
-        elif self.recording_state == "saved":
-            color, label = (55, 145, 75), "START NEW RECORDING"
-        else:
-            color, label = (55, 155, 70), "START RECORDING"
-        cv2.rectangle(img, (x0, y0), (x1, y1), color, -1)
-        cv2.rectangle(img, (x0, y0), (x1, y1), (150, 165, 190), 1)
-        text_size = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)[0]
-        origin = (
-            x0 + max(8, (x1 - x0 - text_size[0]) // 2),
-            y0 + (y1 - y0 + text_size[1]) // 2,
-        )
-        cv2.putText(img, label, origin, cv2.FONT_HERSHEY_SIMPLEX,
-                    0.62, (245, 245, 245), 2, cv2.LINE_AA)
-        if self.recording_enabled and self.recording_state != "saved":
-            cv2.putText(
-                img, "SPACE = start / stop & save", (x0 + 18, y1 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 195, 185), 1,
-                cv2.LINE_AA)
-
-    def _request_record_toggle(self) -> None:
-        if not self.recording_enabled:
-            return
-        self._record_action_requested = (
-            "stop" if self.recording_state == "recording" else "start")
-
-    def _on_mouse(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            x0, y0, x1, y1 = self._record_button_rect()
-            if x0 <= x <= x1 and y0 <= y <= y1:
-                self._request_record_toggle()
-                return
-        super()._on_mouse(event, x, y, flags, param)
-
-    def _key_command(self, key: int):
-        if key == ord(" "):
-            self._request_record_toggle()
-            return
-        super()._key_command(key)
-
-    def consume_record_action(self) -> str | None:
-        action = self._record_action_requested
-        self._record_action_requested = None
-        return action
-
-    def set_recording_state(self, state: str, frame_count: int = 0) -> None:
-        if state not in {"disabled", "idle", "recording", "saved"}:
-            raise ValueError(f"invalid recording state: {state}")
-        self.recording_state = state
-        self.frame_count = int(frame_count)
-        self._redraw_requested = True
-
-    def set_tactile_side(self, side, processed):
-        self.tactile_frames[side] = (None if processed is None else
-                                     np.asarray(processed, np.float32).reshape(16, 16))
-        self.tactile_calibrating_sides[side] = processed is None
+        The map arrives already fitted to newtons, so it is only reshaped here:
+        NaN cells are kept -- the overlay reads them as zero force for the
+        positions no fitted region covers.
+        """
+        self.tactile_frames[side] = (None if force is None else
+                                     np.asarray(force, np.float32).reshape(16, 16))
+        self.tactile_calibrating_sides[side] = force is None
         self._redraw_requested = True
 
     def _draw_tactile(self, img):
+        # Force comes from the SDK already in newtons, so it is drawn with the
+        # newton scale: ``newtons=True`` on the mesh overlays, and
+        # ``linear_fitted=True`` on the fixed matrix card.  The ADC-scale
+        # threshold slider no longer applies -- newtons carry their own zero.
         if (self.display_mode == "hand" and self._pressure_mappers
                 and self.pressure_display_mode != "none"):
             draw_args = (
@@ -653,36 +567,15 @@ class BimanualViewer(Live3DViewer):
                 {"left": False, "right": False},
             )
             if self.pressure_display_mode == "tiles":
-                draw_pressure_tiles(
-                    *draw_args, threshold=float(self.tactile_threshold))
+                draw_pressure_tiles(*draw_args, newtons=True)
             else:
-                draw_pressure_color_points(
-                    *draw_args, threshold=float(self.tactile_threshold))
+                draw_pressure_color_points(*draw_args, newtons=True)
         draw_bimanual_tactile_overlay(
             img,
             self.tactile_frames,
-            threshold=self.tactile_threshold,
             scale=self.tactile_scale,
+            linear_fitted=True,
         )
-
-
-def make_result(runtimes, projector):
-    hands3d = np.stack([runtimes["left"].latest_joints,
-                        runtimes["right"].latest_joints]).astype(np.float32)
-    smoothed = np.stack([runtimes["left"].latest_smoothed,
-                         runtimes["right"].latest_smoothed]).astype(np.float32)
-    hands2d = np.stack([projector.project(smoothed[index])[0] for index in range(2)])
-    ready = [len(runtimes[side].missing) == 0 for side in ("left", "right")]
-    return {
-        "hands2d": hands2d,
-        "hands3d": hands3d,
-        "smoothed": smoothed,
-        "labels": ["Left", "Right"],
-        "presents": [True, True],
-        "propagated": [False, False],
-        "stage2": ready,
-        "reprojection_error": [float("nan"), float("nan")],
-    }
 
 
 def main(argv=None):
@@ -699,7 +592,6 @@ def main(argv=None):
     parser.add_argument("--geometry", type=Path, default=DEFAULT_GEOMETRY_PATH,
                         help="Hand geometry JSON")
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
-    parser.add_argument("--out", type=Path)
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--display-mode", default="hand", choices=("bones", "hand"),
                         help="Initial 3D display mode: bones or full MANO hand mesh")
@@ -720,14 +612,8 @@ def main(argv=None):
     parser.add_argument("--elev", type=float, default=None)
     parser.add_argument("--roll", type=float, default=None)
     parser.add_argument("--dist", type=float, default=None)
-    parser.add_argument("--checkpoint-frames", type=int, default=600)
-    parser.add_argument("--episode-index", type=int, default=0)
-    parser.add_argument("--task-index", type=int, default=0)
-    parser.add_argument("--no-save", action="store_true")
-    parser.add_argument(
-        "--record-on-start", action="store_true",
-        help="Start recording when data is ready; default waits for the GUI button")
-    parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--no-display", action="store_true",
+                        help="Run the display loop headless (no 3D window)")
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--allow-uncalibrated", action="store_true",
                         help="Deprecated compatibility option; both calibrations are required")
@@ -752,10 +638,13 @@ def main(argv=None):
                 args.left_calib = selected.get("left")
             if args.right_calib is None:
                 args.right_calib = selected.get("right")
-    if args.no_save and args.record_on_start:
-        parser.error("--no-save and --record-on-start cannot be combined")
-    if args.no_display and not (args.no_save or args.record_on_start):
-        parser.error("--no-display requires --record-on-start or --no-save")
+    # sdk.open_bimanual builds its solver on the SDK's own default geometry, so
+    # an override cannot be routed through it: refuse loudly rather than show a
+    # differently-fitted hand than the caller asked for.
+    if Path(args.geometry).resolve() != DEFAULT_GEOMETRY_PATH.resolve():
+        parser.error(
+            f"--geometry has no effect: sdk.open_bimanual always solves with "
+            f"{DEFAULT_GEOMETRY_PATH}")
     calib_paths = resolve_calibration_paths(
         args.calibration_dir, args.left_calib, args.right_calib)
 
@@ -784,66 +673,52 @@ def main(argv=None):
         separation_m = 0.30
 
     bindings = DeviceManager(args.registry).validate_bimanual()
-    ports = {"left": bindings.left_port, "right": bindings.right_port}
     serials = {
         "left": bindings.left_serial,
         "right": bindings.right_serial,
     }
     for side in ("left", "right"):
-        print(
-            f"{side} device: serial={serials[side]}  "
-            f"port={ports[side]}")
+        print(f"{side} device: serial={serials[side]}")
     print(f"Left IMU calibration: {calib_paths['left'].resolve()}")
     print(f"Right IMU calibration: {calib_paths['right'].resolve()}")
     runtimes = {}
-    runtime_backend = None
-    registry = {}
     for side in ("left", "right"):
         if not calib_paths[side].is_file():
             raise RuntimeError(
                 f"Missing {side} calibration: {calib_paths[side]}")
-        config = load_calibration(calib_paths[side], side)
-        try:
-            solver = HandSolver(side, calib_paths[side], args.geometry)
-            selected_backend = solver.backend
-            if runtime_backend is None:
-                runtime_backend = selected_backend
-            elif runtime_backend["backend"] != selected_backend["backend"]:
-                raise RuntimeError("Left and right solver backends do not match")
-        except (OSError, ValueError, KeyError, RuntimeError) as exc:
-            raise RuntimeError(f"{side} calibration is not usable: {exc}") from exc
-        stream = RawImuStream(
-            ports[side], usb_vid=config.usb_vid, usb_pid=config.usb_pid)
-        runtime = HandRuntime(
-            side=side, config=config, solver=solver,
-            stream=stream,
-            tactile_stream=stream.tactile_stream(),
-            smoother=JointPositionSmoother(0.035),
-            tactile_pre=TactilePreprocessor(
-                base_gate=0.0, dynamic_noise_ratio=0.0, temporal_smooth=0.15,
-                spatial_filter=False, calibration_frames=100, bypass_gates=False),
-            missing=[f"IMU-{index}" for index in range(16)],
-        )
-        runtimes[side] = runtime
-        registry[side] = {
-            "usb_serial": serials[side],
-            "hardware_id": config.hardware_id,
-            "channel_to_hand": config.channel_to_hand,
-        }
-    for runtime in runtimes.values():
-        runtime.stream.start()
-        runtime.tactile_stream.start()
+        # Parsed only to reject an unreadable or wrong-side calibration before
+        # the SDK is asked to open a glove with it.
+        load_calibration(calib_paths[side], side)
+        runtimes[side] = HandRuntime(
+            side=side, smoother=JointPositionSmoother(0.035))
+    # The calibration files resolved for this run are handed over explicitly:
+    # a folder shortcut or the file picker must win over the SDK's own
+    # "newest usable file" discovery.  Which link carries each hand (wired or
+    # Bluetooth dongle) is left to the SDK.
+    bm = open_bimanual(
+        left_calibration=calib_paths["left"],
+        right_calibration=calib_paths["right"],
+        registry=args.registry,
+    )
+    hands = {side: _hand_engine(bm, side) for side in ("left", "right")}
+    runtime_backend = None
+    for side in ("left", "right"):
+        selected_backend = hands[side].backend
+        if runtime_backend is None:
+            runtime_backend = selected_backend
+        elif runtime_backend["backend"] != selected_backend["backend"]:
+            raise RuntimeError("Left and right solver backends do not match")
 
-    if runtime_backend["backend"] == "hand_pinky_plus_2mm":
-        print("Pipeline: 32 raw IMUs -> protected HAND solver -> 42 keypoints")
-    elif runtime_backend["backend"] == "retargeted_direct":
-        print("Pipeline: 32 raw IMUs -> calibrated retargeting -> 42 keypoints")
-    elif runtime_backend["backend"] == "fitted_direct":
-        print("Pipeline: 32 raw IMUs -> fitted direct FK -> 42 keypoints")
-    else:
-        print("Pipeline: 32 raw IMUs -> protected direct FK -> 42 keypoints")
+    backend_labels = {
+        "hand_pinky_plus_2mm": "HAND pinky +2 mm LOCAL",
+        "retargeted_direct": "measured direct / calibrated HAND orientation",
+        "fitted_direct": "fitted project direct FK",
+        "direct_fk": "direct FK",
+    }
+    backend_label = backend_labels[runtime_backend["backend"]]
+    print("Pipeline: sdk.open_bimanual -> 21 solved keypoints + finger force "
+          f"in newtons ({backend_label})")
 
-    projector = SkeletonRenderer()
     right_view = LiveViewState(args.view_reference_config)
     view_state = LiveViewState(args.view_config)
     saved_view = (saved_display.get("view", {})
@@ -864,78 +739,71 @@ def main(argv=None):
         view_state.dist = float(args.dist)
     viewer = None
     startup_initialized = False
-
-    output_path = args.out or (
-        PROJECT_ROOT / "data/keypoints_21_bimanual" /
-        datetime.now().strftime("%Y%m%d_%H%M%S") / "chunk-000.parquet")
-    recording_session: BimanualRecordingSession | None = None
     started = time.monotonic()
     next_sample = started
     processed_frame_index = 0
     fps_times = {"left": [], "right": []}
-    # Device arrival rate, tracked beside the solve rate so a host that cannot
-    # keep up is not mistaken for a glove that is not delivering.
-    device_totals = {"left": 0, "right": 0}
-    device_samples = {"left": [], "right": []}
     try:
+        bm.start()
+        # Printed once the SDK has resolved them, because the link a hand is
+        # reached over (wired or Bluetooth dongle) is the SDK's choosing, not
+        # the registry's.
+        health = bm.health()
+        for side in ("left", "right"):
+            print(f"{side} link: {getattr(health, side).message}")
         while True:
             now = time.monotonic()
-            for side, runtime in runtimes.items():
-                for tactile_frame in runtime.tactile_stream.poll():
-                    runtime.latest_tactile_raw = tactile_frame.samples.copy()
-                    processed, _ = runtime.tactile_pre.process(
-                        tactile_frame.samples)
-                    runtime.latest_tactile = processed
-                    if viewer:
-                        viewer.set_tactile_side(side, processed)
-                raw_frames = runtime.stream.poll()
-                if raw_frames:
-                    # Count arrivals before the backlog is discarded below;
-                    # past this point the device rate is unobservable.
-                    device_totals[side] += len(raw_frames)
-                    device_samples[side].append((now, device_totals[side]))
-                    device_samples[side] = [
-                        sample for sample in device_samples[side]
-                        if now - sample[0] <= 1.0]
-                    # Real-time: drop the part of the poll that is history by
-                    # now, keep the rest, so the view never lags the USB rate
-                    # without paying for it in frames the link delivered fine.
-                    # A Bluetooth dongle hands over a whole batch per RF event,
-                    # and keeping only its newest frame made this entry's rate
-                    # equal the batch rate.  There is no rate limiter here, so
-                    # every frame kept below is also solved.
-                    raw_frames = recent_batch(raw_frames)
-                for raw_frame in raw_frames:
-                    if raw_frame.sequence == runtime.last_seq:
+            try:
+                newest = bm.read(timeout=READ_TIMEOUT_S)
+            except StreamTimeoutError:
+                newest = None
+            except StreamClosedError as exc:
+                # A link that died under us must not read as a slow glove: end
+                # the run cleanly.
+                print(f"[Stream error] {exc}", file=sys.stderr)
+                break
+            if newest is not None:
+                # Keep only the newest frame of what the link has queued.  The
+                # SDK queue is a FIFO, so taking one frame per pass would
+                # replay a Bluetooth batch the dongle handed over long ago;
+                # draining it is the "newest, never history" policy
+                # common.frame_pacing.recent_batch applied to one poll.
+                while True:
+                    try:
+                        newest = bm.read(timeout=0)
+                    except (StreamTimeoutError, StreamClosedError):
+                        break
+            if newest is not None:
+                for side, runtime in runtimes.items():
+                    frame = getattr(newest, side)
+                    if frame.sequence == runtime.last_seq:
                         continue
-                    runtime.last_seq = raw_frame.sequence
-                    runtime.latest_raw_imu = raw_frame.quaternions_xyzw.copy()
-                    runtime.latest_raw_present = raw_frame.present_mask.copy()
-                    runtime.latest_raw_valid = raw_frame.valid_mask.copy()
-                    runtime.latest_raw_device_timestamp_us = (
-                        raw_frame.device_timestamp_us)
-                    keypoints = runtime.solver.process(raw_frame)
-                    sample_s = keypoints.timestamp_us / 1_000_000.0
-                    runtime.latest_joints = keypoints.joints_m
+                    runtime.last_seq = frame.sequence
+                    # The local smoother runs on the raw keypoints, so display
+                    # smoothing stays a presentation choice here instead of
+                    # following the SDK's smoothing_ms default.
+                    runtime.latest_joints = frame.joints_raw_m
                     runtime.latest_smoothed = runtime.smoother.update(
-                        keypoints.joints_m, sample_s)
-                    runtime.latest_imu = keypoints.imu_xyzw
+                        frame.joints_raw_m, frame.timestamp_us / 1_000_000.0)
                     runtime.latest_host_s = now
-                    runtime.missing = [
-                        f"IMU-{index}" for index in np.flatnonzero(
-                            ~np.isfinite(keypoints.sensor_age_s))
-                    ]
-                    runtime.safety = keypoints.status.safety_intervened
-                    runtime.contact = keypoints.status.active_contact
+                    runtime.warming_up = bool(
+                        frame.status.details.get("warming_up"))
+                    runtime.safety = frame.status.safety_intervened
+                    runtime.contact = frame.status.active_contact
+                    runtime.device_fps = float(frame.device_fps)
+                    runtime.tactile_fps = float(frame.tactile_fps)
+                    # Force rides the frame as the newest scan, repeated until a
+                    # newer one lands.  None means no scan has arrived yet, so
+                    # whatever was last shown stays in place.  It is already
+                    # fitted to newtons inside the SDK, so it goes straight to
+                    # the display with no further processing.
+                    if frame.force_n is not None and viewer:
+                        viewer.set_tactile_side(side, frame.force_n)
                     fps_times[side].append(now)
                     fps_times[side] = fps_times[side][-60:]
-                    samples = device_samples[side]
-                    span = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
-                    runtime.device_fps = (
-                        (samples[-1][1] - samples[0][1]) / span
-                        if span > 0.0 else 0.0)
 
-            ready = all(runtime.latest_joints is not None for runtime in runtimes.values())
+            ready = all(runtime.latest_joints is not None
+                        for runtime in runtimes.values())
             fresh = ready and all(
                 now - runtime.latest_host_s <= args.max_frame_age
                 for runtime in runtimes.values())
@@ -966,66 +834,7 @@ def main(argv=None):
                     # save_bimanual_display_config is the only path allowed to
                     # change this persistent left-root handedness correction.
                     print(f"Bimanual display config saved: {saved_path}")
-                fixed_rotations = fixed_bimanual_display_rotations(
-                    initial, palm_target_bases)
-                recording_metadata = {
-                    "mode": "bimanual",
-                    "sides": ["left", "right"],
-                    "sample_fps": float(args.fps),
-                    "devices": {
-                        side: {
-                            "usb_serial": registry[side]["usb_serial"],
-                            "hardware_id": registry[side]["hardware_id"],
-                            "channel_to_hand": registry[side]["channel_to_hand"],
-                        }
-                        for side in ("left", "right")
-                    },
-                    "calibration_files": {
-                        side: str(calib_paths[side].resolve())
-                        for side in ("left", "right")
-                    },
-                    "view": view_state_metadata(view_state),
-                    "display": {
-                        "recorded_source": "raw",
-                        "separation_m": separation_m,
-                        "palm_target_bases": palm_target_bases,
-                        "fixed_rotation_matrices": np.stack([
-                            rotation.as_matrix() for rotation in fixed_rotations
-                        ]),
-                        "stabilize_palm_bases": False,
-                        "left_root_rotvec_sign": left_root_rotvec_sign,
-                        "default_config": str(args.display_config.resolve()),
-                    },
-                    "kinematics": {
-                        "type": runtime_backend["backend"],
-                        "geometry": str(Path(args.geometry).resolve()),
-                    },
-                    "public_interfaces": [
-                        "RawImuStream", "TactileStream", "HandSolver.process"
-                    ],
-                }
-                recording_session = BimanualRecordingSession(
-                    output_path, args.episode_index, args.task_index,
-                    args.checkpoint_frames,
-                    serials={
-                        side: registry[side]["usb_serial"]
-                        for side in ("left", "right")
-                    },
-                    metadata=recording_metadata,
-                    enabled=not args.no_save,
-                )
-                if args.record_on_start:
-                    recording_session.start(now)
-                    print(
-                        f"Automatic bimanual recording started: {recording_session.output_path}")
                 if not args.no_display:
-                    backend_labels = {
-                        "hand_pinky_plus_2mm": "HAND pinky +2 mm LOCAL",
-                        "retargeted_direct": "measured direct / calibrated HAND orientation",
-                        "fitted_direct": "fitted project direct FK",
-                        "direct_fk": "direct FK",
-                    }
-                    backend_label = backend_labels[runtime_backend["backend"]]
                     viewer = BimanualViewer(
                         view_state, initial,
                         f"STM32 bimanual live 21 joints / {backend_label}",
@@ -1033,17 +842,11 @@ def main(argv=None):
                         palm_target_bases=palm_target_bases,
                         left_root_rotvec_sign=left_root_rotvec_sign,
                         display_config_path=None,
-                        recording_enabled=not args.no_save,
-                        recording_state=recording_session.state,
                         display_mode=args.display_mode,
-                        initial_mesh_vertices=_latest_solver_mesh_vertices(
-                            runtimes["right"].solver),
+                        initial_mesh_vertices=hands["right"].mesh_vertices_m,
                         redraw_interval_s=1.0 / max(args.fps, 1.0))
                 startup_initialized = True
             if fresh and now >= next_sample:
-                result = make_result(runtimes, projector)
-                if recording_session is not None:
-                    recording_session.add(now, result, runtimes)
                 if viewer:
                     statuses = {}
                     for side in ("left", "right"):
@@ -1052,61 +855,36 @@ def main(argv=None):
                                if len(times) >= 2 else 0.0)
                         statuses[side] = {
                             "fps": fps,
-                            "device_fps": float(
-                                getattr(runtimes[side], "device_fps", 0.0)),
-                            "missing": runtimes[side].missing,
+                            "device_fps": runtimes[side].device_fps,
+                            "tactile_fps": runtimes[side].tactile_fps,
+                            "warming_up": runtimes[side].warming_up,
                             "safety": runtimes[side].safety,
                             "contact": runtimes[side].contact,
                         }
                     viewer.update_both(
-                        runtimes["left"].latest_joints,
-                        runtimes["right"].latest_joints,
-                        (recording_session.frame_count
-                         if recording_session is not None else 0), statuses,
+                        runtimes["left"].latest_smoothed,
+                        runtimes["right"].latest_smoothed,
+                        processed_frame_index + 1, statuses,
                         mesh_slots=[
-                            _latest_solver_mesh_vertices(runtimes["left"].solver),
-                            _latest_solver_mesh_vertices(runtimes["right"].solver),
+                            hands["left"].mesh_vertices_m,
+                            hands["right"].mesh_vertices_m,
                         ])
                 processed_frame_index += 1
                 next_sample = now + 1.0 / max(args.fps, 1.0)
                 if args.max_frames and processed_frame_index >= args.max_frames:
                     break
             elif not ready and now - started > args.startup_timeout:
-                missing = [side for side, runtime in runtimes.items()
+                waiting = [side for side, runtime in runtimes.items()
                            if runtime.latest_joints is None]
-                raise RuntimeError(f"Timed out waiting for bimanual data: {missing}")
+                raise RuntimeError(f"Timed out waiting for bimanual data: {waiting}")
 
-            if viewer:
-                keep_running = viewer.tick()
-                action = viewer.consume_record_action()
-                if action == "start" and recording_session is not None:
-                    if recording_session.start(time.monotonic()):
-                        viewer.set_recording_state("recording", 0)
-                        print(
-                            f"Bimanual recording started: {recording_session.output_path}")
-                elif action == "stop" and recording_session is not None:
-                    saved = recording_session.stop_and_save(
-                        view_state_metadata(view_state))
-                    viewer.set_recording_state(
-                        "saved", recording_session.frame_count)
-                    if saved is not None:
-                        print(f"Bimanual recording saved: {saved}")
-                    else:
-                        print("No valid bimanual frames; no file was created.")
-                if not keep_running:
-                    break
+            if viewer and not viewer.tick():
+                break
             time.sleep(0.002)
     finally:
-        for runtime in runtimes.values():
-            runtime.stream.stop()
-        if (recording_session is not None
-                and recording_session.state == "recording"):
-            saved = recording_session.stop_and_save(
-                view_state_metadata(view_state))
-            if saved is not None:
-                print(f"Bimanual recording saved: {saved}")
         if viewer:
             viewer.close()
+        bm.close()
     print(f"Bimanual run finished: {processed_frame_index} preview frames")
     return 0
 

@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """Adaptive two-STM32 gloves -> HAND2mm-calibrated skeletons -> live 3D.
 
-Runs exactly like ``live_3d_bimanual`` (same persistent display config: wrist
-separation, palm bases and viewpoint are shared), but does not require both
-gloves to be plugged in:
+Data acquisition is the SDK's: each hand gets its own process calling
+``sdk.open_glove``, so nothing here builds a stream-and-solver pipeline of its
+own any more and neither hand's solver shares an interpreter with the other's.
+What arrives is the client edition's frame -- solved joint positions in metres
+and finger force in newtons -- so the raw IMU quaternions, the raw pressure ADC
+matrix and the magnetometer registers are not on this side of the boundary at
+all.  Everything the viewer draws, including the pressure panel, is computed
+from those two arrays.
+
+Runs exactly like
+``live_3d_bimanual`` (same persistent display config: wrist separation, palm
+bases and viewpoint are shared), but does not require both gloves to be
+plugged in:
 
 * right only -> show the right hand at its bimanual anchor position
 * left  only -> show the left  hand at its bimanual anchor position
@@ -19,7 +29,6 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import json
-import math
 import multiprocessing
 import os
 import queue
@@ -27,10 +36,9 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -67,10 +75,9 @@ from gui.live_3d import (  # noqa: E402
     TACTILE_SCALE_MAX, TACTILE_SCALE_MIN,
     Live3DViewer, LiveViewState, VIEW3D_CONFIG_PATH,
     align_left_to_right_reference, apply_hand_display_rotation,
-    hand_display_basis, _latest_solver_mesh_vertices,
-    place_hands_at_wrist_anchors, put_text, text_size)
+    hand_display_basis, place_hands_at_wrist_anchors, put_text, text_size)
 from gui.rendering.tactile import (  # noqa: E402
-    HAND_REGIONS_LEFT, HAND_REGIONS_RIGHT, render_hand,
+    HAND_REGIONS_LEFT, HAND_REGIONS_RIGHT,
 )
 from gui.rendering.tactile_overlay import (  # noqa: E402
     draw_bimanual_tactile_overlay as draw_full_matrix_tactile_overlay,
@@ -80,224 +87,43 @@ from gui.rendering.tactile_overlay import (  # noqa: E402
 from gui.rendering.tactile_pressure_hand import (  # noqa: E402
     PressureHandMapper, draw_pressure_color_points, draw_pressure_tiles,
 )
-from glove_io.recording import (  # noqa: E402
-    BimanualRecorder, BimanualRecordingSession,
-    JointPositionSmoother, KeypointParquetRecorder,
-    SkeletonRenderer)
-from glove_io.session import (  # noqa: E402
-    session_metadata_path, update_session_metadata,
-    view_state_metadata, write_session_metadata)
-from glove_io.bluetooth_dongle import reboot_bluetooth_dongle  # noqa: E402
-from glove_io.device_registry import (  # noqa: E402
-    detect_unbound_glove_links, link_kind_for_device, set_glove_serial,
+# A display-side helper borrowed from the recorder module: a joint low-pass.
+# It touches no sensor data; it lives there because the recorder is its other
+# caller.  ``view_state_metadata`` is the same idea for the persistent display
+# config's viewpoint, and lives with the session metadata it is written beside.
+from sdk.io.recording import JointPositionSmoother  # noqa: E402
+from sdk.io.session import view_state_metadata  # noqa: E402
+from sdk.device import (  # noqa: E402
+    DeviceManager, GloveHandMismatchError, detect_unbound_glove_links,
+    link_kind_for_device,
+    reboot_bluetooth_dongle, set_glove_serial,
 )
-from glove_io.tactile_processing import TactilePreprocessor  # noqa: E402
+from sdk.calibration import find_latest_hand2mm_calibration  # noqa: E402
 from sdk import (  # noqa: E402
-    DeviceManager, DeviceNotFoundError, HandSolver, RawImuStream,
-    get_version)
-from common.frame_pacing import recent_batch  # noqa: E402
+    DeviceNotFoundError, StreamTimeoutError,
+    display_firmware_version, firmware_real_version, get_version, open_glove)
 from common.i18n import L, set_lang  # noqa: E402
-from common.usb_cdc import (  # noqa: E402
-    USB_FULL_SEQUENCE_FROM,
-    display_firmware_version, firmware_real_version, mag_gate_met)
+
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
-DEFAULT_GEOMETRY_PATH = (
-    BUNDLE_ROOT / "assets/hand_geometry/hand_measured_runtime_v1.json")
 
-_FORCE_REGION_NAMES = ("thumb", "index", "middle", "ring", "pinky", "palm")
-_FORCE_CURVE_RGB = {
-    "thumb": (255, 107, 108),
-    "index": (255, 190, 85),
-    "middle": (78, 214, 128),
-    "ring": (72, 165, 255),
-    "pinky": (184, 118, 255),
-    "palm": (54, 184, 235),
-}
-_FORCE_CURVE_BGR = {
-    name: tuple(reversed(color)) for name, color in _FORCE_CURVE_RGB.items()
-}
-_FORCE_REGION_SHORT = {
-    "thumb": "THM",
-    "index": "IDX",
-    "middle": "MID",
-    "ring": "RNG",
-    "pinky": "PNK",
-    "palm": "PALM",
-}
-_FORCE_HISTORY_SECONDS = 10.0
-_FORCE_HISTORY_MAX_SAMPLES = 1200
-# Baseline acquisition waits a fixed settle delay after the button is pressed
-# before collecting the median frames, so a still-settling hand cannot seed a
-# bad empty-glove baseline.
-_BASELINE_SETTLE_DELAY_S = 2.0
+# Floor for the raw-ADC pressure view.  A resting 16x16 sensor sits at ~2000
+# with several hundred counts of spread between cells, and a contact drags its
+# neighbours *down*, not up -- so without a floor the cells around a press sink
+# into a darker colour band and read as a second, larger contact.  Clamping to
+# this value pins all of them to one flat colour that matches an unloaded cell,
+# which leaves only the pressed cells visibly changed.  The newton view needs no
+# floor: it has a real zero.  The same convention, and the same number, as the
+# development viewer's ADC panel.
+_DISPLAY_ADC_FLOOR = 2000.0
 
-
-def _tactile_force_totals(
-        frame: np.ndarray, side: str, threshold: float = 0.0) -> np.ndarray:
-    """Sum the processed tactile cells in each anatomical hand region."""
-
-    values = np.asarray(frame, dtype=np.float32).reshape(16, 16)
-    values = np.maximum(
-        0.0, np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
-    if threshold > 0.0:
-        values = np.where(values >= float(threshold), values, 0.0)
-    regions = HAND_REGIONS_LEFT if side == "left" else HAND_REGIONS_RIGHT
-    return np.asarray([
-        float(values[np.ix_(regions[name]["rows"], regions[name]["cols"])].sum())
-        for name in _FORCE_REGION_NAMES
-    ], dtype=np.float32)
-
-
-def _nice_force_axis_max(value: float) -> float:
-    """Round an autoscaled force axis up to a readable 1/2/5 multiple."""
-
-    value = max(1.0, float(value))
-    exponent = 10.0 ** math.floor(math.log10(value))
-    fraction = value / exponent
-    step = 1.0 if fraction <= 1.0 else 2.0 if fraction <= 2.0 else 5.0
-    if fraction > 5.0:
-        step = 10.0
-    return step * exponent
-
-
-def _compact_force_value(value: float) -> str:
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:.1f}M"
-    if value >= 1_000:
-        return f"{value / 1_000:.1f}k"
-    return f"{value:.0f}"
-
-
-def _render_force_trend_card(
-        side: str, data, scale: float, now: float) -> tuple[np.ndarray, np.ndarray]:
-    """Render six independent force axes in a compact 3-row x 2-column card."""
-
-    card_w = min(520, max(400, int(round(720.0 * float(scale)))))
-    card_h = min(330, max(225, int(round(400.0 * float(scale)))))
-    top_color = np.asarray((48, 35, 21), np.float32)
-    bottom_color = np.asarray((22, 27, 38), np.float32)
-    mix = np.linspace(0.0, 1.0, card_h, dtype=np.float32)[:, None]
-    rows = (top_color[None, :] + (bottom_color - top_color)[None, :] * mix)
-    card = np.empty((card_h, card_w, 3), np.uint8)
-    card[...] = rows.astype(np.uint8)[:, None, :]
-
-    accent = (240, 201, 76) if side == "left" else (84, 180, 255)
-    cv2.circle(card, (18, 17), 9, accent, -1, cv2.LINE_AA)
-    cv2.putText(card, "L" if side == "left" else "R", (14, 21),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (20, 28, 38), 1,
-                cv2.LINE_AA)
-    cv2.putText(card, "FORCE TREND  /  REGION SUM", (34, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.43, (221, 228, 239), 1,
-                cv2.LINE_AA)
-    cv2.line(card, (10, 33), (card_w - 11, 33), (84, 72, 61), 1,
-             cv2.LINE_AA)
-
-    timestamps = np.empty((0,), dtype=np.float64)
-    totals = np.empty((0, len(_FORCE_REGION_NAMES)), dtype=np.float32)
-    if data is not None:
-        timestamps, totals = data
-
-    rows_top = 38
-    rows_bottom = card_h - 9
-    row_gap = 3
-    column_gap = 4
-    grid_rows, grid_columns = 3, 2
-    row_h = (rows_bottom - rows_top - row_gap * (grid_rows - 1)) / grid_rows
-    column_w = (card_w - 10 - column_gap * (grid_columns - 1)) / grid_columns
-    history_start = now - _FORCE_HISTORY_SECONDS
-    for region_index, name in enumerate(_FORCE_REGION_NAMES):
-        grid_row, grid_column = divmod(region_index, grid_columns)
-        x0 = int(round(5 + grid_column * (column_w + column_gap)))
-        x1 = int(round(x0 + column_w))
-        y0 = int(round(rows_top + grid_row * (row_h + row_gap)))
-        y1 = int(round(y0 + row_h))
-        cv2.rectangle(card, (x0, y0), (x1, y1), (31, 38, 51), -1)
-        cv2.rectangle(card, (x0, y0), (x1, y1), (61, 70, 86), 1)
-
-        color = _FORCE_CURVE_BGR[name]
-        cv2.putText(card, _FORCE_REGION_SHORT[name], (x0 + 5, y0 + 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, color, 1, cv2.LINE_AA)
-        series = (totals[:, region_index] if totals.size
-                  else np.empty((0,), dtype=np.float32))
-        peak = float(np.max(series)) if series.size else 0.0
-        y_max = _nice_force_axis_max(peak * 1.05)
-        if series.size:
-            current_text = "NOW " + _compact_force_value(float(series[-1]))
-            (text_w, _), _ = cv2.getTextSize(
-                current_text, cv2.FONT_HERSHEY_SIMPLEX, 0.30, 1)
-            cv2.putText(card, current_text, (x1 - text_w - 5, y0 + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (173, 188, 209), 1,
-                        cv2.LINE_AA)
-
-        plot_left, plot_right = x0 + 50, x1 - 5
-        plot_top = y0 + 17
-        plot_bottom = max(plot_top + 3, y1 - 12)
-        for division in range(3):
-            ratio = division / 2.0
-            y = int(round(plot_bottom - ratio * (plot_bottom - plot_top)))
-            cv2.line(card, (plot_left, y), (plot_right, y),
-                     (79, 87, 103) if division == 0 else (48, 58, 74), 1,
-                     cv2.LINE_AA)
-        for division in range(3):
-            ratio = division / 2.0
-            x = int(round(plot_left + ratio * (plot_right - plot_left)))
-            cv2.line(card, (x, plot_top), (x, plot_bottom),
-                     (48, 58, 74), 1, cv2.LINE_AA)
-
-        max_text = _compact_force_value(y_max)
-        cv2.putText(card, max_text, (x0 + 4, plot_top + 7),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (151, 164, 184), 1,
-                    cv2.LINE_AA)
-        cv2.putText(card, "0", (x0 + 35, plot_bottom + 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (151, 164, 184), 1,
-                    cv2.LINE_AA)
-        cv2.putText(card, "-10s", (plot_left, y1 - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.24, (139, 153, 174), 1,
-                    cv2.LINE_AA)
-        (zero_w, _), _ = cv2.getTextSize(
-            "0s", cv2.FONT_HERSHEY_SIMPLEX, 0.24, 1)
-        cv2.putText(card, "0s", (plot_right - zero_w, y1 - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.24, (139, 153, 174), 1,
-                    cv2.LINE_AA)
-
-        if series.size:
-            xs = plot_left + np.clip(
-                (timestamps - history_start) / _FORCE_HISTORY_SECONDS,
-                0.0, 1.0) * (plot_right - plot_left)
-            ys = plot_bottom - np.clip(
-                series / y_max, 0.0, 1.0) * (plot_bottom - plot_top)
-            points = np.rint(np.column_stack([xs, ys])).astype(np.int32)
-            if len(points) >= 2:
-                cv2.polylines(card, [points], False, color, 2, cv2.LINE_AA)
-            elif len(points) == 1:
-                cv2.circle(card, tuple(points[0]), 2, color, -1, cv2.LINE_AA)
-
-    mask = _rounded_card_mask(card_h, card_w)
-    inner = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
-    card[mask > inner] = np.asarray((100, 84, 70), np.uint8)
-    card[1:3, 13:card_w - 13] = accent
-    return card, mask
-
-
-def _draw_force_trend_overlay(
-        img: np.ndarray, snapshot: dict, sides, scale: float) -> np.ndarray:
-    """Draw force cards in exactly the left/right tactile-panel positions."""
-
-    now = time.monotonic()
-    for side in ("left", "right"):
-        if side not in sides:
-            continue
-        card, mask = _render_force_trend_card(
-            side, snapshot.get(side), scale, now)
-        card_h, card_w = card.shape[:2]
-        x0 = 12 if side == "left" else img.shape[1] - card_w - 12
-        y0 = img.shape[0] - 60 - card_h
-        roi = img[y0:y0 + card_h, x0:x0 + card_w]
-        cv2.copyTo(card, mask, roi)
-    return img
-
-
+# Baseline calibration, the same rule as the admin edition and the standalone
+# pressure-matrix tools: press 重新采集基线 with the glove unloaded, average
+# _BASELINE_FRAMES raw scans per cell as the zero, then draw
+# ``max(0, adc - baseline)`` on the ADC card.  No settle delay -- the first
+# frame after the press already counts.  The newton card is not baseline-
+# corrected: those newtons already have an absolute zero.
+_BASELINE_FRAMES = 40
 
 
 def _show_frozen_error(message: str) -> None:
@@ -310,73 +136,6 @@ def _show_frozen_error(message: str) -> None:
         QMessageBox.critical(None, "Stouch Glove Live", str(message))
     except Exception as dialog_error:
         print(f"[Dialog error] {dialog_error}", file=sys.stderr)
-
-
-@dataclass
-class CalibrationSettings:
-    side: str
-    channel_to_hand: list[int]
-    fps: float
-    hardware_id: str
-    usb_vid: int
-    usb_pid: int
-    param_inst_calib: dict | None = None
-    param_shape_calib: dict | list | None = None
-    transport: str = "usb_cdc"
-    serial_port: str | None = None
-
-    @property
-    def calibration_hardware_id(self) -> str:
-        mapping = "-".join(str(value) for value in self.channel_to_hand)
-        return f"{self.hardware_id}|physical-to-hand:{mapping}"
-
-
-def load_calibration(path: Path, side: str) -> CalibrationSettings:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Cannot read {side} calibration {path}: {exc}") from exc
-    saved_side = str(data.get("side") or "right").lower()
-    if saved_side != side:
-        raise RuntimeError(f"{path} is a {saved_side} calibration, not {side}")
-    return CalibrationSettings(
-        side=side,
-        channel_to_hand=list(data.get("channel_to_hand") or range(16)),
-        fps=float(data.get("fps") or 80),
-        hardware_id=str(data.get("hardware_id", f"stm32-glove-{side}")),
-        usb_vid=int(data.get("usb_vid", 0x0483)),
-        usb_pid=int(data.get("usb_pid", 0x5740)),
-        param_inst_calib=data.get("param_inst_calib"),
-        param_shape_calib=data.get("param_shape_calib"),
-    )
-
-
-def find_latest_hand2mm_calibration(directory: Path, side: str) -> Path:
-    """Find the newest HAND2mm-compatible calibration for one hand."""
-    folder = Path(directory).expanduser().resolve()
-    if not folder.is_dir():
-        raise RuntimeError(f"Calibration directory does not exist: {folder}")
-    matches = []
-    for path in folder.glob("*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        saved_side = str(payload.get("side") or "right").lower()
-        if saved_side != side or not isinstance(payload.get("param_inst_calib"), dict):
-            continue
-        # The local HAND2mm path consumes the original root/installation and
-        # contact payload. Direct-FK factory files use a different solver.
-        if payload.get("kinematics") in {"direct_fk", "fitted_direct_fk"}:
-            continue
-        if str(payload.get("tool") or "") in {
-                "direct_fk_calibrate_cli", "hand_fk_fit_cli"}:
-            continue
-        matches.append(path)
-    if not matches:
-        raise RuntimeError(
-            f"No usable HAND2mm {side} IMU calibration JSON in {folder}")
-    return max(matches, key=lambda path: (path.stat().st_mtime_ns, path.name))
 
 
 def resolve_calibration_paths(
@@ -394,7 +153,8 @@ def resolve_calibration_paths(
         left = (Path(left_calib) if left_calib is not None
                 else DEFAULT_CALIBRATION_DIR / "imu_2d_calibration.json")
         right = (Path(right_calib) if right_calib is not None
-                 else DEFAULT_CALIBRATION_DIR / "imu_calibration.json")
+                 else DEFAULT_CALIBRATION_DIR
+                 / "imu_calibration_right_default.json")
     return {"left": left.expanduser(), "right": right.expanduser()}
 
 
@@ -601,333 +361,58 @@ def remap_hand_root_motion(
     return apply_hand_display_rotation(shown, R.from_matrix(correction))
 
 
-# Per-channel "flagged IMU" detection.  Every IMU frame carries the firmware's
-# own 16-bit per-channel health flag (``RawImuFrame.present_mask``, one bit per
-# physical channel); a clear bit means that channel's BNO055 is re-initialising,
-# quarantined, or absent.  The host reads that flag on *every* frame and derives
-# nothing of its own from the quaternions, so a channel that recovers -- either
-# when the firmware's re-init succeeds or when the glove is power-cycled --
-# stops being reported the moment its bit comes back.  The verdict is
-# deliberately not sticky: a latched host-side one outlived the fault it
-# described and kept warning about an IMU that was working again.
-# One clear frame is routine (a dropped read), so a channel has to stay clear
-# for this many consecutive frames before it is called out.
-_FLAGGED_IMU_FRAMES = 3
-
-
-class ImuFaultDetector:
-    """Report the physical IMU channels the firmware currently flags as bad.
-
-    ``present_mask`` is the frame's 16-bit health flag in firmware physical
-    order (index 0-15); a flagged channel is reported by its physical channel
-    index, which maps directly to the sensor position: 0 = wrist, 1-3 = thumb,
-    4-6 = index, 7-9 = middle, 10-12 = ring, 13-15 = pinky.
-    """
-
-    def __init__(self, n_channels: int = 16):
-        self._n_channels = int(n_channels)
-        self._clear_streak = np.zeros(self._n_channels, dtype=np.int32)
-
-    def update(self, present_mask: np.ndarray) -> list[int]:
-        """Feed one frame's 16-bit health flag; return flagged channel indices."""
-
-        flagged = ~np.asarray(present_mask, dtype=bool).reshape(self._n_channels)
-        self._clear_streak = np.where(flagged, self._clear_streak + 1, 0)
-        return [
-            int(index)
-            for index in np.flatnonzero(self._clear_streak >= _FLAGGED_IMU_FRAMES)
-        ]
-
-
-# How big an orientation step in one frame counts as a cliff rather than motion.
-#
-# The BNO055 fuses accelerometer, gyroscope and magnetometer.  When the field it
-# sits in changes abruptly the heading it reports *steps*: the correction the
-# magnetometer was applying is replaced by a different one, and the reported
-# attitude moves discontinuously.  A wrist snapping as fast as it can turns
-# roughly 10-15 deg per 1/80 s frame, so the bar sits above that.
-#
-# This is the one number to tune on hardware.  Set it too low and ordinary fast
-# hand motion asks the user to draw circles; too high and a real disturbance is
-# missed.  The detector returns the step it measured, so a tuning session can
-# read the numbers out of a real one, but the live view reports nothing at all:
-# it acts on the verdict and stays quiet about it.
-MAG_TRIGGER_JUMP_DEG = 30.0
-
-
-def _quat_step_deg(before: np.ndarray, after: np.ndarray) -> np.ndarray:
-    """Angle in degrees between two (N, 4) quaternion arrays, per row.
-
-    ``q`` and ``-q`` are the same rotation, so the dot product is taken as an
-    absolute value before the half-angle.  Non-finite rows come back as NaN,
-    which the caller drops.
-    """
-
-    dot = np.abs(np.sum(np.asarray(before, dtype=np.float64)
-                        * np.asarray(after, dtype=np.float64), axis=1))
-    with np.errstate(invalid="ignore"):
-        return np.degrees(2.0 * np.arccos(np.clip(dot, 0.0, 1.0)))
-
-
-class ImuJumpDetector:
-    """Report a cliff-edge step in the raw quaternion stream.
-
-    Per physical IMU, the angle between this frame's quaternion and the previous
-    frame's.  The largest of those is the frame's step: a disturbance moves every
-    IMU that sits in the same field, and a single sensor that jumps on its own is
-    worth reporting too.
-
-    Raw quaternions rather than the solved pose, because the solve smooths and
-    temporal smoothing is built precisely to hide a step.
-
-    ``update`` returns the step it measured alongside whether it crossed the bar,
-    so a caller that wants the numbers a threshold has to be chosen from can have
-    them; the live view takes only the verdict and stays quiet about the step.
-    Only channels *this* frame marks valid take part: an implausible reading --
-    zeros or a non-finite row -- is dropped rather than compared.  The previous
-    frame's mask is not kept, so a channel that was implausible last frame and is
-    plausible now is compared against that stale reading instead.
-    """
-
-    def __init__(self, threshold_deg: float = MAG_TRIGGER_JUMP_DEG,
-                 n_channels: int = 16):
-        self.threshold_deg = float(threshold_deg)
-        self._n_channels = int(n_channels)
-        self._previous: np.ndarray | None = None
-
-    def reset(self) -> None:
-        """Forget the last frame; the next one has nothing to be compared to."""
-
-        self._previous = None
-
-    def update(self, quaternions: np.ndarray,
-               valid_mask: np.ndarray) -> tuple[bool, float]:
-        """Feed one raw IMU frame; return ``(jumped, step_degrees)``."""
-
-        current = np.asarray(quaternions, dtype=np.float64).reshape(
-            self._n_channels, 4)
-        valid = np.asarray(valid_mask, dtype=bool).reshape(self._n_channels)
-        previous, self._previous = self._previous, current.copy()
-        if previous is None:
-            return False, 0.0
-
-        steps = _quat_step_deg(previous, current)
-        usable = valid & np.isfinite(steps)
-        if not usable.any():
-            return False, 0.0
-        step = float(np.max(steps[usable]))
-        return step >= self.threshold_deg, step
-
-
-class MagCalibrationMonitor:
-    """Decide when to ask for magnetometer circles, and when the spot is bad.
-
-    Per hand, driven by two streams: the type-0x05 calibration levels and the
-    raw attitude.  The gate is three quarters of the channels the newest 0x05
-    frame carried reading 3 (``mag_gate_met``, decided on the snapshot because
-    that is where the freshness mask is).
-
-    **A glove below the gate is not prompted for.**  The trigger is a cliff-edge
-    step in the attitude stream (:class:`ImuJumpDetector`): the magnetometer
-    correction being replaced by a different one moves the reported attitude
-    discontinuously, so a step is what "the field around the glove changed"
-    looks like from outside.  On a trigger the gate is read, and if it fails the
-    user gets ``CIRCLE_PROMPT_S`` to draw circles; reaching the gate inside the
-    window stops the prompt on that frame.  Still short when the window closes
-    means circles were not enough, which in practice means the ambient field is
-    too disturbed for the sensor to separate hard iron from the earth's field.
-
-    Prompting on the step rather than on the level is what keeps the card quiet:
-    a glove that has just been powered on sits below the gate for its first
-    10-30 s of motion (the BNO055 re-calibrates from scratch on every power-on
-    reset, MAG_TELEMETRY.md 3), and a monitor that spoke up for that would hold
-    a card over the view at every single start.
-
-    The bad-environment verdict is announced, not repeated: it is shown for
-    ``ENVIRONMENT_PROMPT_S`` and then the monitor falls silent.  A message that
-    never goes away is worse than no message -- it is the same countdown a user
-    has already failed to satisfy.  A fresh trigger re-arms it, so carrying the
-    glove somewhere else is asked about again.
-
-    Judging is held off until ``judge_ready`` -- IMU warm-up and the startup
-    hand-direction capture.  The fusion is settling through those, so a step
-    would say nothing about the field.
-
-    The magnetic-drift detection that used to live here is gone: type 0x05 no
-    longer carries the field vectors, so there is no |B| to record.
-    """
-
-    # 画圆窗口；超时仍未达标判为环境干扰。
-    CIRCLE_PROMPT_S = 30.0
-    # 环境干扰结论只提示这么久，之后彻底闭嘴（不达标也不再重复）。
-    ENVIRONMENT_PROMPT_S = 3.0
-
-    def __init__(self):
-        # When the current "below the gate" streak began.
-        self._needs_since: float | None = None
-        # The newest frame's (at 3, carried), shown next to the countdown.
-        self._counts = (0, 0)
-        self._prompt: dict | None = None
-
-    def _reset(self) -> None:
-        """Forget the streak and re-arm: the next trigger starts a new window.
-
-        Used both when the gate is met and while judging is held off, so a
-        re-capture or a recovered glove is announced again if it drops later.
-        """
-
-        self._needs_since = None
-        self._counts = (0, 0)
-        self._prompt = None
-
-    def _phase(self, now: float) -> dict | None:
-        """The prompt implied by the streak and the clock, re-derived per call.
-
-        Split out because it is a pure function of time while the streak runs:
-        the frame sequence only advances every 2 s, but the counts are seconds,
-        so a prompt recomputed only on a new frame would hold the 3 s message
-        for up to 4 s and tick its countdown in 2 s steps.
-        """
-
-        if self._needs_since is None:
-            self._prompt = None
-            return None
-        elapsed = now - self._needs_since
-        ready, carried = self._counts
-        if elapsed < self.CIRCLE_PROMPT_S:
-            self._prompt = {"kind": "circles",
-                            "remaining_s": self.CIRCLE_PROMPT_S - elapsed,
-                            "ready": ready, "carried": carried}
-        elif elapsed < self.CIRCLE_PROMPT_S + self.ENVIRONMENT_PROMPT_S:
-            self._prompt = {"kind": "environment", "remaining_s": 0.0,
-                            "ready": ready, "carried": carried}
-        else:
-            # Said its piece; stay quiet until the gate is met again.
-            self._prompt = None
-        return self._prompt
-
-    def update(self, now: float, ready: bool | None, counts=(0, 0),
-               triggered: bool = False,
-               judge_ready: bool = True) -> dict | None:
-        """Act on this frame; return the prompt, if any.
-
-        The gate itself is decided where the freshness mask is -- in
-        :class:`MagTelemetrySnapshot` -- and arrives here as ``ready``, with
-        ``counts`` = ``(at 3, carried)`` for the same frame.  ``ready is None``
-        means there is nothing to judge by: firmware that sends no type 0x05.
-
-        ``triggered`` is a cliff-edge step in the attitude stream
-        (:class:`ImuJumpDetector`) -- the event this whole thing waits for.  A
-        glove sitting below the gate is *not* prompted for; only a glove that
-        just moved discontinuously is, because that is what a change in the
-        field it sits in looks like.  A second trigger restarts the window, so
-        a user who carries the glove somewhere else is asked again.
-
-        The countdown is re-derived from the clock on every call rather than
-        advanced per frame: it is a function of time, and the caller is not the
-        only clock.  ``judge_ready`` is False while warm-up or the startup
-        direction capture is still running, where the fusion is settling and a
-        step would not mean anything about the field.
-
-        Returns ``None``, or a plain ``{"kind", "remaining_s", "ready",
-        "carried"}`` dict -- primitives only, since it is published through a
-        process queue.
-        """
-
-        if not judge_ready:
-            # Holding off is not a verdict about the glove, so nothing is
-            # prompted and the window starts fresh once it ends.
-            self._reset()
-            return None
-
-        if ready is None:
-            # No 0x05 on this firmware; the caller keeps its own prompt.
-            return self._prompt
-
-        if ready:
-            # Gate met: stop prompting on this frame, however it started.
-            self._reset()
-            return None
-
-        if triggered:
-            # A step in the attitude is the only thing that asks for circles, so
-            # this is what starts or restarts the window.
-            self._needs_since = now
-        elif self._needs_since is None:
-            # Below the gate and nothing happened: stay quiet.  This is the
-            # state a glove is in for its whole first minute, and prompting for
-            # it is what made the card feel permanent.
-            return None
-
-        self._counts = counts
-        return self._phase(now)
-
-
 @dataclass
 class HandRuntime:
+    """One hand's live state inside the SDK reader process.
+
+    The link, the stream and the solve belong to the SDK now, so what is kept
+    here is only what a frame does not carry: the local joint smoother and the
+    newest published values.  Everything on this object is display data --
+    joint positions, the solved mesh, and finger force already in newtons.
+    """
+
     side: str
-    config: CalibrationSettings
-    solver: HandSolver
-    stream: RawImuStream
-    tactile_stream: object
     smoother: JointPositionSmoother
-    tactile_pre: TactilePreprocessor
-    missing: list[str]
     latest_joints: np.ndarray | None = None
     latest_mesh_vertices: np.ndarray | None = None
     latest_smoothed: np.ndarray | None = None
     latest_uv: np.ndarray | None = None
-    latest_imu: np.ndarray | None = None
-    latest_raw_imu: np.ndarray | None = None
-    latest_raw_present: np.ndarray | None = None
-    latest_raw_valid: np.ndarray | None = None
-    latest_raw_device_timestamp_us: int | None = None
-    latest_tactile: np.ndarray | None = None
-    latest_tactile_raw: np.ndarray | None = None
+    latest_force: np.ndarray | None = None
+    latest_adc: np.ndarray | None = None
     latest_host_s: float = 0.0
     last_seq: int = -1
     safety: bool = False
     contact: str | None = None
     # No warm-up fields here on purpose.  Warm-up is reported per frame in
-    # ``keypoints.status.details`` and published from there; it is not something
-    # this object tracks or knows.  It used to carry ``warming_up`` /
+    # ``status.details`` and published from there; it is not something this
+    # object tracks or knows.  It used to carry ``warming_up`` /
     # ``warmup_completed`` / ``warmup_timed_out`` / ``warmup_remaining_s``
     # defaults that nothing ever wrote, and reading one of them as if it meant
-    # something held the magnetometer gate shut forever -- ``getattr`` with a
-    # default makes a field nobody assigns look like a real ``False``.
+    # something held a gate shut forever -- ``getattr`` with a default makes a
+    # field nobody assigns look like a real ``False``.
     fps: float = 0.0
-    tactile_version: int = 0
+    force_version: int = 0
 
 
 class _AbsentHandRuntime:
     """Stand-in runtime for a side whose glove is not connected.
 
     Keeps ``runtimes`` addressable as ``runtimes["left"]`` / ``runtimes["right"]``
-    so the recorder and result builders can treat both slots uniformly; every
-    sensor field stays ``None`` and the keypoints become NaN.
+    so the result builders can treat both slots uniformly; every sensor field
+    stays ``None`` and the keypoints become NaN.
     """
 
     def __init__(self, side: str):
         self.side = side
-        self.missing = [f"NO-DEVICE-{side.upper()}"]
 
     latest_joints = None
     latest_mesh_vertices = None
     latest_smoothed = None
-    latest_imu = None
-    latest_tactile = None
-    latest_tactile_raw = None
-    latest_raw_imu = None
-    latest_raw_present = None
-    latest_raw_valid = None
-    latest_mag_levels = None
-    latest_mag_unread = None
-    latest_mag_prompt = None
-    latest_raw_device_timestamp_us = None
+    latest_force = None
+    latest_adc = None
     last_seq = -1
     safety = False
     contact = None
-    broken = []
     warming_up = False
     warmup_remaining_s = 0.0
     warmup_completed = False
@@ -935,22 +420,23 @@ class _AbsentHandRuntime:
     latest_host_s = 0.0
     fps = 0.0
     device_fps = 0.0
+    tactile_fps = 0.0
     # Delivery shape plus the parser's cumulative error tally, as published by
     # the hand process.  ``None`` until the first solve message arrives.
     latest_link_health: dict | None = None
-    tactile_version = 0
+    force_version = 0
     firmware_version = None
     latency = None
+    link_kind = "usb"
 
 
 class PublishedHandState:
     """Parent-side mirror of one hand process's published ``latest_*`` state.
 
     Each hand's solver process copy-on-publishes through an inter-process
-    queue; the main loop drains it keep-newest under ``state_lock`` and the
-    recorder thread reads the same fields under the same lock.  Every field
-    starts at the same "no data yet" value as :class:`_AbsentHandRuntime`, so
-    both classes can back ``runtimes`` interchangeably.
+    queue; the main loop drains it keep-newest under ``state_lock``.  Every
+    field starts at the same "no data yet" value as :class:`_AbsentHandRuntime`,
+    so both classes can back ``runtimes`` interchangeably.
     """
 
     def __init__(self, side: str):
@@ -958,27 +444,8 @@ class PublishedHandState:
         self.latest_joints = None
         self.latest_mesh_vertices = None
         self.latest_smoothed = None
-        self.latest_imu = None
-        self.latest_raw_imu = None
-        self.latest_raw_present = None
-        self.latest_raw_valid = None
-        # Per-IMU BNO055 magnetometer levels, or ``None`` on firmware that
-        # sends no type 0x05.  A never-read channel is itself ``None``, so
-        # "unknown" and "level 0" stay distinguishable.
-        self.latest_mag_levels = None
-        # The IMUs the newest 0x05 frame did *not* report this round.  Not a
-        # fault: the device carries about twelve of the sixteen per frame and
-        # which ones varies, so these are the channels the gate's denominator
-        # left out.
-        self.latest_mag_unread = None
-        # The calibration monitor's verdict for this hand: ``None`` when there
-        # is nothing to prompt, otherwise the plain dict it published.
-        self.latest_mag_prompt = None
-        self.latest_raw_device_timestamp_us = None
-        self.latest_tactile = None
-        self.latest_tactile_raw = None
-        self.missing = []
-        self.broken = []
+        self.latest_force = None
+        self.latest_adc = None
         self.safety = False
         self.contact = None
         self.warming_up = False
@@ -987,27 +454,13 @@ class PublishedHandState:
         self.warmup_timed_out = False
         self.fps = 0.0
         self.device_fps = 0.0
+        self.tactile_fps = 0.0
         self.latest_link_health = None
         self.latest_host_s = 0.0
-        self.tactile_version = 0
+        self.force_version = 0
         self.firmware_version = None
         self.latency = None
-
-
-def _rounded_card_mask(height: int, width: int, radius: int = 12) -> np.ndarray:
-    """Return an antialiased-looking uint8 mask for a small rounded card."""
-
-    height, width = int(height), int(width)
-    radius = max(1, min(int(radius), height // 2, width // 2))
-    mask = np.zeros((height, width), np.uint8)
-    cv2.rectangle(mask, (radius, 0), (width - radius - 1, height - 1), 255, -1)
-    cv2.rectangle(mask, (0, radius), (width - 1, height - radius - 1), 255, -1)
-    for center in (
-            (radius, radius), (width - radius - 1, radius),
-            (radius, height - radius - 1),
-            (width - radius - 1, height - radius - 1)):
-        cv2.circle(mask, center, radius, 255, -1, cv2.LINE_AA)
-    return mask
+        self.link_kind = "usb"
 
 
 def draw_bimanual_tactile_overlay(
@@ -1024,58 +477,6 @@ def draw_bimanual_tactile_overlay(
         linear_fitted=linear_fitted)
 
 
-def _magnetometer_prompt_card(side_status) -> tuple[str, str] | None:
-    """The calibration monitor's card, or ``None`` when it has nothing to say.
-
-    Driven by the type-0x05 calibration levels: the monitor owns the deadline
-    and the per-frame counts, so every glove that reports levels gets this card.
-    Firmware older than v1.2.13 sends no 0x05 and gets no card at all -- its
-    only magnetometer signal was bit 15 of the sequence word, which is not a
-    verdict (it is the counter's own high bit) and is no longer read here.
-    """
-
-    prompts = {side: side_status.get(side, {}).get("mag_prompt")
-               for side in ("left", "right")}
-    prompts = {side: prompt for side, prompt in prompts.items() if prompt}
-    if not prompts:
-        return None
-
-    if len(prompts) == 2:
-        hand_text = L("双手", "BOTH HANDS")
-    elif "left" in prompts:
-        hand_text = L("左手", "LEFT HAND")
-    else:
-        hand_text = L("右手", "RIGHT HAND")
-
-    # The most advanced verdict names the card; the countdown below then comes
-    # from the worst hand.
-    if any(prompt["kind"] == "environment" for prompt in prompts.values()):
-        return (
-            L(f"{hand_text}磁场环境干扰较大",
-              f"{hand_text} MAGNETIC ENVIRONMENT TOO DISTURBED"),
-            L("画圆 30 秒后磁力计仍未完成校准，请更换环境",
-              "Circles for 30 s did not finish the calibration - move to "
-              "another location"),
-        )
-
-    remaining = min(prompt["remaining_s"] for prompt in prompts.values())
-    # The counts come from the same frame the gate was read from, so the
-    # denominator is that frame's own channel count rather than all 16 -- the
-    # device only carries about twelve of the sixteen at a time, and a number
-    # out of 16 next to a gate that is not out of 16 would just be wrong.
-    counts = []
-    for side, prompt in prompts.items():
-        label = L("左", "L") if side == "left" else L("右", "R")
-        counts.append(f"{label} {prompt['ready']}/{prompt['carried']}")
-    return (
-        L(f"{hand_text}磁力计尚未校准", f"{hand_text} MAGNETOMETER NOT CALIBRATED"),
-        L(f"磁力计就绪 {' · '.join(counts)} — 请缓慢画圆"
-          f"（剩 {remaining:.0f} 秒）",
-          f"Magnetometer ready {' · '.join(counts)} - draw slow circles "
-          f"({remaining:.0f} s left)"),
-    )
-
-
 class BimanualViewer(Live3DViewer):
     STARTUP_ALIGNMENT_DURATION_S = 3.0
     STARTUP_ALIGNMENT_SAMPLE_COUNT = 12
@@ -1085,23 +486,20 @@ class BimanualViewer(Live3DViewer):
                  left_root_rotvec_sign=None,
                  right_root_rotvec_sign=None,
                  display_config_path=DEFAULT_BIMANUAL_DISPLAY_CONFIG,
-                 recording_enabled=True, recording_state="idle",
-                 present_sides=None, mag_judge_event=None, **kwargs):
+                 present_sides=None,
+                 stop_event=None, **kwargs):
         self._bimanual_slots_cache: np.ndarray | None = None
         self._bimanual_mesh_slots_cache: list[np.ndarray | None] | None = None
         self._display_times: list[float] = []
         self._display_fps = 0.0
         self.present_sides = set(present_sides or ())
-        # The solver processes own the magnetometer monitor and its countdown,
-        # so the hold-off has to be published to them (see
-        # ``_publish_mag_judge_gate``).  ``None`` means no such process to tell.
-        self._mag_judge_event = mag_judge_event
-        self._mag_judge_published: bool | None = None
-        self._mag_warmup_seen = False
-        # After the IMU warm-up, give the user three seconds to hold each
-        # connected hand in the desired straight-ahead pose.  The captured
-        # palm direction is compared with the calibrated target basis and the
-        # resulting display-only correction is retained for the session.
+        # The session's own shutdown flag, so a worker stops waiting the moment
+        # the session ends rather than on its next timeout.
+        self._session_stop_event = stop_event
+        # Give the user three seconds to hold each connected hand in the
+        # desired straight-ahead pose.  The captured palm direction is compared
+        # with the calibrated target basis and the resulting display-only
+        # correction is retained for the session.
         self._startup_alignment_started_s: float | None = None
         self._startup_alignment_remaining_s = self.STARTUP_ALIGNMENT_DURATION_S
         self._startup_alignment_completed = False
@@ -1110,51 +508,53 @@ class BimanualViewer(Live3DViewer):
             side: deque(maxlen=self.STARTUP_ALIGNMENT_SAMPLE_COUNT)
             for side in ("left", "right")
         }
-        self.recording_enabled = bool(recording_enabled)
-        self.recording_state = str(recording_state)
-        self._record_action_requested: str | None = None
         self.side_status = {
-            "left": {"fps": 0.0, "device_fps": 0.0, "link_health": None,
-                     "missing": [], "safety": False,
-                     "contact": None, "firmware_version": None, "latency": None,
+            "left": {"fps": 0.0, "device_fps": 0.0, "tactile_fps": 0.0,
+                     "link_health": None,
+                     "safety": False, "contact": None,
+                     "warming_up": False, "warmup_completed": False,
+                     "warmup_remaining_s": 0.0,
+                     "firmware_version": None, "latency": None,
                      "connected": "left" in self.present_sides, "stale": False},
-            "right": {"fps": 0.0, "device_fps": 0.0, "link_health": None,
-                      "missing": [], "safety": False,
-                      "contact": None, "firmware_version": None, "latency": None,
+            "right": {"fps": 0.0, "device_fps": 0.0, "tactile_fps": 0.0,
+                      "link_health": None,
+                      "safety": False, "contact": None,
+                      "warming_up": False, "warmup_completed": False,
+                      "warmup_remaining_s": 0.0,
+                      "firmware_version": None, "latency": None,
                       "connected": "right" in self.present_sides, "stale": False},
         }
         self.tactile_frames = {"left": None, "right": None}
-        # Bluetooth-dongle reboot feedback shown in the HUD (set from the
-        # background worker spawned by the on-canvas "Reboot Dongle" button).
-        self._dongle_reboot_status = ""
-        self.tactile_calibrating_sides = {"left": True, "right": True}
-        # Pressure-matrix baseline control (glove-test v1.4 style): a toggle
-        # switches between the raw ADC map and the baseline-corrected map, and
-        # enabling it auto-collects a fresh empty-glove baseline (median of
-        # ``_baseline_target`` raw frames) that the recollect button can refresh.
+        # The raw ADC the forces above were fitted from, for the panel's ADC
+        # view.  Kept apart from ``tactile_frames`` because those newtons also
+        # drive the on-mesh tiles and points, which have no ADC scale.
+        self.tactile_adc_frames = {"left": None, "right": None}
+        # Pressure-matrix baseline (the admin edition's convention, shared with
+        # the standalone pressure tools).  ``use_baseline`` is the ADC card's
+        # view switch -- corrected or raw -- and it only picks what is drawn:
+        # the baseline itself is collected when the user presses 重新采集基线
+        # with the glove unloaded, and nothing is collected automatically.  It
+        # starts off, so a fresh start shows the raw map; until a baseline
+        # exists the corrected view falls back to that same raw map.
         self.tactile_raw_frames = {"left": None, "right": None}
         self.tactile_baseline = {"left": None, "right": None}
         self.use_baseline = False
         self._baseline_collecting = False
         self._baseline_buffer = {"left": [], "right": []}
         self._baseline_done = {"left": False, "right": False}
-        self._baseline_target = 40
-        # Two-phase acquisition: wait a fixed settle delay after the button is
-        # pressed, then collect ``_baseline_target`` frames for the median.
-        self._baseline_waiting = False
-        self._baseline_wait_until = 0.0
-        # The fixed tactile-card area is selectable and starts empty.  It can
-        # show either the pressure matrix or six independent force trends.
+        # The hands a running collection is for: both when both are connected,
+        # the one that is connected otherwise.  Set when the run starts.
+        self._baseline_sides = ("left", "right")
+        self._baseline_target = _BASELINE_FRAMES
+        # Bluetooth-dongle reboot feedback shown in the HUD (set from the
+        # background worker spawned by the on-canvas "Reboot Dongle" button).
+        self._dongle_reboot_status = ""
+        # The fixed force-card area is selectable and starts empty; the
+        # pressure matrix is the only view it draws.
         self.tactile_panel_mode = "off"
         # Set while the user drags a card's resize handle: the corner they
         # grabbed, and the geometry the drag is measured against.
         self._tactile_resize: dict | None = None
-        # Samples are retained continuously so selecting the force view
-        # immediately shows the preceding 10 seconds.
-        self._force_history = {
-            side: deque(maxlen=_FORCE_HISTORY_MAX_SAMPLES)
-            for side in ("left", "right")
-        }
         # Full-hand pressure visualization can be enabled in one of two
         # mutually exclusive modes; it is off by default so startup shows the
         # mesh without pressure points.
@@ -1219,7 +619,13 @@ class BimanualViewer(Live3DViewer):
         # The baseline controls follow the tactile panel, and the panel starts
         # off, so they start hidden too -- same rule as
         # ``_on_tactile_panel_mode`` applies when the user picks a view.
-        self._qcanvas.set_baseline_controls_visible(self.tactile_panel_mode != "off")
+        self._qcanvas.set_baseline_controls_visible(
+            self.tactile_panel_mode != "off")
+        # The canvas builds the switch unchecked; the controller owns the view
+        # state, so push it down.  Pushed without emitting: a signal here would
+        # arrive as a user click the user never made.
+        self._qcanvas.set_baseline_toggle(bool(self.use_baseline))
+        self._update_baseline_status()
         if self._mesh_faces is not None:
             for side in self.present_sides:
                 try:
@@ -1255,52 +661,52 @@ class BimanualViewer(Live3DViewer):
                 fw_parts.append(
                     side_tag + f"V{display_firmware_version(version)}")
             latency = status.get("latency")
-            # A missing measurement is normal on firmware older than v1.2.11,
-            # which does not answer the probe; show a dash rather than 0 ms.
+            # A missing measurement is normal on a Bluetooth link and on
+            # firmware older than v1.2.11, neither of which answers the probe;
+            # show a dash rather than 0 ms.
             latency_parts.append(
-                side_tag + (f"{latency.rtt_ms:.2f} ms"
+                side_tag + (f"{float(latency):.2f} ms"
                             if latency is not None else "—"))
         lines = []
         if fw_parts:
             lines.append(L("固件版本: ", "Firmware: ") + " / ".join(fw_parts))
         if latency_parts:
             lines.append(L("延迟: ", "Latency: ") + " / ".join(latency_parts))
-        lines.extend([
+        lines.append(
             L(f"界面: {self._display_fps:5.1f} FPS",
-              f"GUI: {self._display_fps:5.1f} FPS"),
-            L(f"双手已录制帧数: {self.frame_count}",
-              f"Bimanual recorded frames: {self.frame_count}"),
-        ])
+              f"GUI: {self._display_fps:5.1f} FPS"))
         for side in ("left", "right"):
             status = self.side_status[side]
             side_name = L("左手", "LEFT") if side == "left" else L("右手", "RIGHT")
             if not status.get("connected"):
                 lines.append(f"{side_name}: {L('未连接', 'NOT CONNECTED')}")
                 continue
+            # Solve rate first, then each device stream's own arrival rate:
+            # when they differ, the gap is the host dropping frames, not the
+            # glove withholding them, and that is the whole point of showing
+            # all three.  Attitude and pressure run as separate streams at the
+            # same nominal rate, so one number cannot stand in for the other --
+            # a hand whose IMUs settle would otherwise take its pressure rate
+            # with it, and a panel that looks frozen can be a stream that is
+            # genuinely delivering at half rate.
+            device_fps = float(status.get("device_fps") or 0.0)
+            tactile_fps = float(status.get("tactile_fps") or 0.0)
+            parts = [
+                f"{status['fps']:5.1f} FPS",
+                L(f"IMU {device_fps:5.1f} Hz", f"IMU {device_fps:5.1f} Hz"),
+                L(f"压力 {tactile_fps:5.1f} Hz", f"TACTILE {tactile_fps:5.1f} Hz"),
+            ]
+            if status.get("link") == "bluetooth":
+                parts.append(L("蓝牙", "BT"))
             # Only the countdown is worth the space; a finished warm-up is the
             # normal state and needs no announcement.
-            warmup_text = ""
             if status.get("warming_up"):
-                warmup_text = (
-                    L("  预热", "  WARM-UP")
+                parts.append(
+                    L("预热", "WARM-UP")
                     + f" {status.get('warmup_remaining_s', 0.0):.1f}s")
-            # Solve rate first, device arrival rate right behind it: when they
-            # differ, the gap is the host dropping frames, not the glove
-            # withholding them, and that is the whole point of showing both.
-            device_fps = float(status.get("device_fps") or 0.0)
-            lines.append(
-                f"{side_name}: {status['fps']:5.1f} FPS  "
-                + L(f"设备 {device_fps:5.1f} Hz  ", f"DEV {device_fps:5.1f} Hz  ")
-                + f"IMU {16-len(status['missing'])}/16"
-                + (L("  蓝牙", "  BT")
-                   if status.get("link") == "bluetooth" else "")
-                + warmup_text
-                + (L("  安全", "  SAFETY") if status["safety"] else ""))
-            broken = [int(channel) for channel in (status.get("broken") or [])]
-            if broken:
-                channels = "、".join(
-                    f"{L('第', 'CH')}{channel}{L('路', '')}" for channel in broken)
-                lines.append(f"{side_name}: {channels} {L('坏掉了', 'BROKEN')}")
+            if status["safety"]:
+                parts.append(L("安全", "SAFETY"))
+            lines.append(f"{side_name}: " + "  ".join(parts))
             # A batched link explains an FPS that sits under the device rate, so
             # it earns a row only when that gap is actually there -- a
             # Bluetooth link is batched all the time, and saying so while it
@@ -1328,10 +734,6 @@ class BimanualViewer(Live3DViewer):
             # The stale-pose readout is deliberately not shown either:
             # ``status["stale"]`` still marks the frame, it is just no longer a
             # HUD row.
-            # The magnetometer calibration readout is deliberately not shown:
-            # the per-IMU levels and the "x/16 calibrated" count stay in the
-            # monitor and remain what the prompt card is judged from, they are
-            # just no longer a HUD row.
         bluetooth = [
             self.side_status[side] for side in ("left", "right")
             if self.side_status[side].get("connected")
@@ -1483,51 +885,11 @@ class BimanualViewer(Live3DViewer):
                 return False
         return True
 
-    def _publish_mag_judge_gate(self) -> None:
-        """Tell the solver processes whether the magnetometer may be judged.
-
-        Held off until IMU warm-up *and* the startup direction capture are both
-        done.  Both steps have the glove deliberately still, so its MAG levels
-        are low for reasons that have nothing to do with the ambient field, and
-        the monitor's 30 s window would be spent before the user was ever asked
-        to draw anything.
-
-        Both facts live here, not in the solver process: warm-up arrives in
-        ``statuses`` from the solve loop, and the capture is this object's own.
-        The solver process only gets the verdict, because the monitor that owns
-        the countdown is down there next to the 0x05 cache.
-
-        Warm-up is latched once seen.  The solver stops reporting it after the
-        fact, and a gate that re-closed the moment the key went missing would
-        take the magnetometer prompt down with it.
-
-        Written only when the value changes, so this is not a per-frame syscall.
-        """
-
-        event = self._mag_judge_event
-        if event is None:
-            return
-        warmed = bool(self.present_sides)
-        for side in self.present_sides:
-            status = self.side_status.get(side, {})
-            if status.get("warming_up") or not status.get("warmup_completed"):
-                warmed = False
-        if warmed:
-            self._mag_warmup_seen = True
-        ready = bool(self._startup_alignment_completed) and self._mag_warmup_seen
-        if ready == self._mag_judge_published:
-            return
-        self._mag_judge_published = ready
-        if ready:
-            event.set()
-        else:
-            event.clear()
-
     def _orientation_recollect_label(self) -> str:
         return L("重新采集手方向", "Recapture hand direction")
 
     def _on_recollect_orientation(self) -> None:
-        """Restart the three-second direction capture without touching recording."""
+        """Restart the three-second direction capture."""
 
         self._startup_alignment_started_s = None
         self._startup_alignment_remaining_s = self.STARTUP_ALIGNMENT_DURATION_S
@@ -1548,10 +910,6 @@ class BimanualViewer(Live3DViewer):
 
     def _advance_startup_alignment(self, now_s: float) -> None:
         """Run the post-warm-up three-second orientation capture."""
-        # Published on every pass, including the early returns below: an
-        # in-progress capture is exactly a state the magnetometer gate has to
-        # stay held off in.
-        self._publish_mag_judge_gate()
         if self._startup_alignment_completed:
             return
         if self._startup_alignment_started_s is None:
@@ -1676,54 +1034,8 @@ class BimanualViewer(Live3DViewer):
                 position = tuple(points[index].astype(int) + np.array([8, -8]))
                 cv2.putText(img, label, position, cv2.FONT_HERSHEY_SIMPLEX,
                             0.9, color, 2, cv2.LINE_AA)
-        self._draw_record_button(img)
         self._draw_startup_alignment_guide(img)
-        self._draw_magnetometer_guide(img)
         return img
-
-    def _draw_magnetometer_guide(self, img: np.ndarray) -> None:
-        """Draw the magnetometer prompt card, if there is one to draw.
-
-        The wording lives in :func:`_magnetometer_prompt_card` so it can be
-        asserted without a canvas.
-        """
-
-        card = _magnetometer_prompt_card(self.side_status)
-        if card is None:
-            return
-        title, subtitle = card
-        title_scale = 0.92
-        subtitle_scale = 0.58
-        title_w, title_h = text_size(title, title_scale, 2)
-        subtitle_w, _ = text_size(subtitle, subtitle_scale, 1)
-        # The count wording is longer than the old prompt, and English runs much
-        # wider than Chinese, so size the card to its contents instead of
-        # clipping at the historical 620 px -- and if a line still cannot fit,
-        # shrink that line: the card is centred, so an over-wide one would start
-        # at a negative x and spill off the left edge.
-        max_w = self.canvas_w - 32
-        if title_w + 48 > max_w:
-            title_scale *= (max_w - 48) / title_w
-            title_w, title_h = text_size(title, title_scale, 2)
-        if subtitle_w + 48 > max_w:
-            subtitle_scale *= (max_w - 48) / subtitle_w
-            subtitle_w, _ = text_size(subtitle, subtitle_scale, 1)
-        card_w = max(620, title_w + 48, subtitle_w + 48)
-        card_h = 112
-        x0 = (self.canvas_w - card_w) // 2
-        y0 = 168 if not self._startup_alignment_completed else 28
-        x1, y1 = x0 + card_w, y0 + card_h
-        roi = img[y0:y1, x0:x1]
-        panel = np.full_like(roi, (35, 31, 48))
-        cv2.addWeighted(panel, 0.94, roi, 0.06, 0.0, dst=roi)
-        accent = (70, 170, 255)
-        cv2.rectangle(img, (x0, y0), (x1, y1), accent, 3, cv2.LINE_AA)
-        put_text(img, title,
-                 (x0 + (card_w - title_w) // 2, y0 + 42 + title_h // 2),
-                 title_scale, (250, 244, 232), 2)
-        put_text(img, subtitle,
-                 (x0 + (card_w - subtitle_w) // 2, y0 + 83),
-                 subtitle_scale, (230, 218, 202), 1)
 
     def _draw_startup_alignment_guide(self, img: np.ndarray) -> None:
         """Draw the pre-capture instruction prominently at the upper centre."""
@@ -1767,50 +1079,17 @@ class BimanualViewer(Live3DViewer):
             (x0 + (card_w - subtitle_w) // 2, y0 + 96),
             subtitle_scale, (220, 211, 198), 1)
 
-    def _record_button_rect(self) -> tuple[int, int, int, int]:
-        # Right-anchored, so it tracks the canvas width.  Draw and hit-test
-        # both go through here, which is what keeps them in agreement.
-        return self.canvas_w - 305, 18, self.canvas_w - 22, 66
-
-    def _draw_record_button(self, img: np.ndarray) -> None:
-        x0, y0, x1, y1 = self._record_button_rect()
-        if not self.recording_enabled:
-            color, label = (75, 75, 75), L("录制已禁用", "RECORDING DISABLED")
-        elif self.recording_state == "recording":
-            color, label = (45, 55, 220), L("停止并保存", "STOP & SAVE")
-        elif self.recording_state == "saved":
-            color, label = (55, 145, 75), L("开始新录制", "START NEW RECORDING")
-        else:
-            color, label = (55, 155, 70), L("开始录制", "START RECORDING")
-        cv2.rectangle(img, (x0, y0), (x1, y1), color, -1)
-        cv2.rectangle(img, (x0, y0), (x1, y1), (150, 165, 190), 1)
-        size = text_size(label, 0.62, 2)
-        origin = (
-            x0 + max(8, (x1 - x0 - size[0]) // 2),
-            y0 + (y1 - y0 + size[1]) // 2,
-        )
-        put_text(img, label, origin, 0.62, (245, 245, 245), 2)
-        if self.recording_enabled and self.recording_state != "saved":
-            put_text(
-                img, L("空格 = 开始 / 停止并保存", "SPACE = start / stop & save"),
-                (x0 + 18, y1 + 20), 0.42, (200, 195, 185), 1)
-
-    def _request_record_toggle(self) -> None:
-        if not self.recording_enabled:
-            return
-        self._record_action_requested = (
-            "stop" if self.recording_state == "recording" else "start")
-
     def _resizable_tactile_frames(self):
         """The frames whose card is on screen with a resize handle.
 
-        The two matrix panels are the resizable ones and each is drawn from a
-        different source, so the answer depends on the selected view.
+        Only the matrix panels draw a resizable card, and only while one of
+        them is the selected view.  Both views share the card's geometry, so the
+        handles follow whichever matrix that view is showing.
         """
         if self.tactile_panel_mode == "matrix":
             return self.tactile_frames
-        if self.tactile_panel_mode == "linear_matrix":
-            return self.tactile_raw_frames
+        if self.tactile_panel_mode == "adc":
+            return self.tactile_adc_frames
         return {}
 
     def _tactile_grip_at(self, x, y):
@@ -1877,10 +1156,6 @@ class BimanualViewer(Live3DViewer):
 
     def _on_mouse(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            x0, y0, x1, y1 = self._record_button_rect()
-            if x0 <= x <= x1 and y0 <= y <= y1:
-                self._request_record_toggle()
-                return
             grip = self._tactile_grip_at(x, y)
             if grip is not None:
                 # Claim the press: a resize must not also start a camera pan.
@@ -1897,196 +1172,88 @@ class BimanualViewer(Live3DViewer):
             return
         super()._on_mouse(event, x, y, flags, param)
 
-    def _key_command(self, key: int):
-        if key == ord(" "):
-            self._request_record_toggle()
-            return
-        super()._key_command(key)
-
-    def consume_record_action(self) -> str | None:
-        action = self._record_action_requested
-        self._record_action_requested = None
-        return action
-
     def consume_selector_request(self) -> bool:
         requested = self.request_selector
         self.request_selector = False
         return requested
 
-    def set_recording_state(self, state: str, frame_count: int = 0) -> None:
-        if state not in {"disabled", "idle", "recording", "saved"}:
-            raise ValueError(f"invalid recording state: {state}")
-        self.recording_state = state
-        self.frame_count = int(frame_count)
-        self._redraw_requested = True
+    def set_tactile_side(self, side, force_n, adc=None):
+        """Store one hand's force matrix, and the ADC it was fitted from.
 
-    def set_tactile_side(self, side, processed, raw=None):
-        # The overlay is driven by the raw ADC map so the baseline toggle can
-        # switch between raw and baseline-corrected display (glove-test style);
-        # the force curves use ``processed`` so their zero level and denoising
-        # remain stable regardless of the pressure-map display mode.
-        raw16 = (None if raw is None else
-                 np.asarray(raw, np.float32).reshape(16, 16))
+        ``force_n`` is the frame's ``force_n`` field: a (16, 16) float32 array
+        of newtons straight out of the client-edition SDK, with NaN in the cells
+        no fitted region covers and ``None`` when the frame carried no pressure
+        scan at all.  Nothing is converted or baseline-corrected here -- the
+        ADC-to-newton step already happened on the SDK side.
+
+        ``adc`` is that same frame's ``tactile_adc``: the raw 12-bit counts for
+        the panel's ADC view.  The raw scan is kept here -- it is what a running
+        baseline run averages -- and the ADC card draws
+        :meth:`_adc_display_value` of it: floor-clamped raw, or
+        ``max(0, adc - baseline)`` when 使用基线 is on.  See
+        ``_DISPLAY_ADC_FLOOR`` for why the floor belongs to the display and not
+        to the reading.  The newton matrix is deliberately not clamped: it has
+        a real zero, and a floor there would be a lie.
+        """
+        matrix = (None if force_n is None else
+                  np.asarray(force_n, np.float32).reshape(16, 16))
+        raw16 = (None if adc is None else
+                 np.asarray(adc, np.float32).reshape(16, 16))
+        self.tactile_frames[side] = matrix
         self.tactile_raw_frames[side] = raw16
-        self.tactile_calibrating_sides[side] = raw16 is None
         if self._baseline_collecting and raw16 is not None:
             self._baseline_sample(side, raw16)
-        self.tactile_frames[side] = self._tactile_display_value(side)
-        self._append_force_sample(side, processed)
-        # No _redraw_requested here: the tactile stream bumps at ~70 Hz and
-        # forcing a redraw per bump made the draw rate track the tactile rate
-        # instead of the display gate (visible as jitter while moving).  The
-        # panel is picked up by the next scheduled gate frame instead.
+        self.tactile_adc_frames[side] = self._adc_display_value(side)
+        # No _redraw_requested here: the pressure stream bumps faster than the
+        # display gate and forcing a redraw per bump made the draw rate track
+        # the sensor rate instead of the gate (visible as jitter while moving).
+        # The panel is picked up by the next scheduled gate frame instead.
 
-    def _tactile_display_value(self, side):
+    def _adc_display_value(self, side):
+        """The ADC card's picture for one hand: corrected or floor-clamped raw."""
+
         raw = self.tactile_raw_frames.get(side)
         if raw is None:
             return None
         if self.use_baseline and self.tactile_baseline.get(side) is not None:
             return np.maximum(0.0, raw - self.tactile_baseline[side])
-        return raw
+        # Uncalibrated: the floor keeps the dip around a contact from turning
+        # into a dark patch of its own.  See ``_DISPLAY_ADC_FLOOR``.
+        return np.maximum(_DISPLAY_ADC_FLOOR, raw)
 
-    def _append_force_sample(self, side: str, processed) -> None:
-        """Append one six-region force sample from the processed matrix."""
+    def _tactile_panel_label(self) -> str:
+        return L("触觉面板", "Tactile panel")
 
-        if processed is None or side not in self._force_history:
-            return
-        totals = _tactile_force_totals(
-            processed, side, threshold=float(self.tactile_threshold))
-        now = time.monotonic()
-        history = self._force_history[side]
-        history.append((now, totals))
-        cutoff = now - _FORCE_HISTORY_SECONDS
-        while history and history[0][0] < cutoff:
-            history.popleft()
+    def _tactile_panel_mode_options(self) -> list[tuple[str, str]]:
+        # Every mode the panel answers to is offered here, and this list is the
+        # only thing that decides which ones a user can reach: the guards
+        # (``_on_tactile_panel_mode``), the resize handle
+        # (``_resizable_tactile_frames``) and the draw branch in
+        # ``_draw_tactile`` are keyed by mode name alone.  Leaving an entry out
+        # hides a finished feature rather than disabling it.
+        return [
+            ("off", L("关闭", "Off")),
+            ("matrix", L("压力矩阵 (N)", "Pressure matrix (N)")),
+            ("adc", L("压力矩阵 (ADC)", "Pressure matrix (ADC)")),
+        ]
 
-    def _force_curve_snapshot(self):
-        """Return stable numpy copies for the force window's paint pass."""
-
-        now = time.monotonic()
-        cutoff = now - _FORCE_HISTORY_SECONDS
-        result = {}
-        for side, history in self._force_history.items():
-            visible = [(stamp, values) for stamp, values in history
-                       if stamp >= cutoff]
-            if visible:
-                result[side] = (
-                    np.asarray([item[0] for item in visible], np.float64),
-                    np.stack([item[1] for item in visible]).astype(
-                        np.float32, copy=False),
-                )
-        return result
-
-    def _clear_force_history(self) -> None:
-        for history in self._force_history.values():
-            history.clear()
-
-    def _on_tactile_thr(self, value) -> None:
-        previous = self.tactile_threshold
-        super()._on_tactile_thr(value)
-        # Historical samples cannot be re-thresholded because only their six
-        # totals are retained.  Start a clean time series after a threshold
-        # change instead of mixing two definitions in one curve.
-        if self.tactile_threshold != previous:
-            self._clear_force_history()
-
-    def _finish_baseline_if_complete(self):
-        if not self._baseline_collecting:
-            return
-        if all(self._baseline_done.get(side) for side in self.present_sides):
-            self._baseline_collecting = False
-            # Refresh the corrected map immediately for sides whose raw data is
-            # already available, without waiting for their next tactile frame.
-            for side in ("left", "right"):
-                if self.tactile_raw_frames.get(side) is not None:
-                    self.tactile_frames[side] = self._tactile_display_value(side)
-        self._update_baseline_status()
-
-    def _baseline_sample(self, side, raw16):
-        """Advance the baseline acquisition by one raw frame.
-
-        Phase 1 waits a fixed settle delay after the button is pressed so a
-        still-settling hand cannot seed a bad empty-glove baseline.  Phase 2
-        then collects ``_baseline_target`` frames for the median and runs to
-        completion once it starts.
-        """
-        if self._baseline_waiting:
-            if time.monotonic() < self._baseline_wait_until:
-                self._update_baseline_status()
-                return
-            self._baseline_waiting = False
-
-        if self._baseline_done.get(side, False):
-            return
-        self._baseline_buffer[side].append(raw16)
-        if len(self._baseline_buffer[side]) >= self._baseline_target:
-            stack = np.stack(
-                self._baseline_buffer[side][-self._baseline_target:], axis=0)
-            self.tactile_baseline[side] = np.median(
-                stack, axis=0).astype(np.float32)
-            self._baseline_done[side] = True
-        self._finish_baseline_if_complete()
-
-    def _start_baseline_collection(self):
-        self._baseline_collecting = True
-        self._baseline_waiting = True
-        self._baseline_wait_until = time.monotonic() + _BASELINE_SETTLE_DELAY_S
-        self._baseline_buffer = {"left": [], "right": []}
-        self._baseline_done = {"left": False, "right": False}
-        self._update_baseline_status()
-
-    def _update_baseline_status(self):
-        qcanvas = getattr(self, "_qcanvas", None)
-        if qcanvas is not None:
-            qcanvas.set_baseline_status(self._baseline_status_text())
-            if self._baseline_waiting:
-                qcanvas.show_baseline_overlay(
-                    L(f"{_BASELINE_SETTLE_DELAY_S:.0f}s后开始基线采集，请保持无接触",
-                      f"{_BASELINE_SETTLE_DELAY_S:.0f}s before baseline collection, please keep hands free"))
-            else:
-                qcanvas.hide_baseline_overlay()
-
-    def _baseline_status_text(self) -> str:
-        if self.use_baseline:
-            if self._baseline_collecting:
-                if self._baseline_waiting:
-                    return L(
-                        f"等待 {_BASELINE_SETTLE_DELAY_S:.0f} 秒后开始采集…",
-                        f"Waiting {_BASELINE_SETTLE_DELAY_S:.0f} s before collecting…")
-                counts = [len(self._baseline_buffer.get(side, []))
-                          for side in self.present_sides]
-                n = min(counts) if counts else 0
-                return L(
-                    f"正在采集基线… {n}/{self._baseline_target}",
-                    f"Collecting baseline… {n}/{self._baseline_target}")
-            return L(
-                f"已使用基线（{self._baseline_target}帧 · 中位数）",
-                f"Baseline active ({self._baseline_target} frames · median)")
-        return L("未使用基线", "Baseline off")
-
-    def _on_use_baseline_toggled(self, checked) -> None:
-        self.use_baseline = bool(checked)
-        qcanvas = getattr(self, "_qcanvas", None)
-        if self.use_baseline:
-            if qcanvas is not None:
-                qcanvas.set_baseline_button_enabled(True)
-            self._start_baseline_collection()
-        else:
-            self._baseline_collecting = False
-            self._baseline_waiting = False
-            self._baseline_buffer = {"left": [], "right": []}
-            self._baseline_done = {"left": False, "right": False}
-            if qcanvas is not None:
-                qcanvas.set_baseline_button_enabled(False)
-            for side in ("left", "right"):
-                self.tactile_frames[side] = self._tactile_display_value(side)
-            self._update_baseline_status()
+    def _on_tactile_panel_mode(self, mode: str) -> None:
+        mode = str(mode)
+        self.tactile_panel_mode = (
+            mode
+            if mode in {"off", "matrix", "adc"}
+            else "off"
+        )
+        # The pressure-baseline toggle acts on the ADC card's own map, so it
+        # rides with the panel: with the panel off there is nothing on screen
+        # to correct.  Only visibility changes; ``use_baseline`` is left alone.
+        self._qcanvas.set_baseline_controls_visible(
+            self.tactile_panel_mode != "off")
+        # Any resize in flight was aimed at a card that is no longer there.
+        self._tactile_resize = None
         self._redraw_requested = True
 
-    def _on_recollect_baseline(self) -> None:
-        if self.use_baseline:
-            self._start_baseline_collection()
-            self._redraw_requested = True
+    # ---- pressure baseline -------------------------------------------------
 
     def _baseline_toggle_label(self) -> str:
         return L("使用基线", "Use baseline")
@@ -2094,36 +1261,137 @@ class BimanualViewer(Live3DViewer):
     def _baseline_recollect_label(self) -> str:
         return L("重新采集基线", "Re-collect baseline")
 
-    def _tactile_panel_label(self) -> str:
-        return L("触觉面板", "Tactile panel")
-
-    def _tactile_panel_mode_options(self) -> list[tuple[str, str]]:
-        # "linear_matrix" (分区线性拟合) is deliberately kept out of the menu:
-        # the feature is whole -- the guard in ``_on_tactile_panel_mode``,
-        # ``_resizable_tactile_frames`` and the draw branch all still answer to
-        # it -- it is simply not offered.  Putting the one entry back below is
-        # the whole of re-enabling it.
-        return [
-            ("off", L("关闭", "Off")),
-            ("force", L("力变化趋势", "Force trends")),
-            ("matrix", L("压力矩阵", "Pressure matrix")),
-        ]
-
-    def _on_tactile_panel_mode(self, mode: str) -> None:
-        mode = str(mode)
-        self.tactile_panel_mode = (
-            mode
-            if mode in {"off", "force", "matrix", "linear_matrix"}
-            else "off"
-        )
-        # The pressure-baseline toggle acts on the tactile panel's own maps, so
-        # it rides with the panel: with the panel off there is nothing on screen
-        # to correct.  Only visibility changes; ``use_baseline`` is left alone.
-        self._qcanvas.set_baseline_controls_visible(
-            self.tactile_panel_mode != "off")
-        # Any resize in flight was aimed at a card that is no longer there.
-        self._tactile_resize = None
+    def _on_use_baseline_toggled(self, checked) -> None:
+        # Checking the box is itself the calibration: one press on 使用基线
+        # collects a fresh baseline for the connected hands -- both of them
+        # when both are connected, the single one otherwise -- and then shows
+        # the corrected map.  The overlay asks the user to keep the glove
+        # unloaded while it runs, because the reading it averages becomes zero.
+        #
+        # Unchecking is the opposite and nothing more: a pure view switch,
+        # which neither collects nor discards.  Dropping the baseline there
+        # would mean re-calibrating on every glance at the raw map, and the
+        # raw map is exactly what someone checks first when a number looks
+        # wrong.
+        self.use_baseline = bool(checked)
+        if self.use_baseline:
+            self._start_baseline_collection()
+        for side in ("left", "right"):
+            self.tactile_adc_frames[side] = self._adc_display_value(side)
+        self._update_baseline_status()
         self._redraw_requested = True
+
+    def _on_recollect_baseline(self) -> None:
+        # No ``use_baseline`` guard: calibration is not a property of the view
+        # in the reference tools, and neither is it here.  Pressing it again
+        # mid-collection restarts, which is also the way out of a run that is
+        # waiting on a hand that stopped sending frames -- so this button is
+        # never greyed out, and no separate "clear" control is needed.
+        self._start_baseline_collection()
+        self._redraw_requested = True
+
+    def _start_baseline_collection(self) -> None:
+        self._baseline_collecting = True
+        # One press covers both hands when both are connected, and just the one
+        # hand when only one is.  The fallback keeps the run open when it was
+        # started before any hand is known: the contributing-frames rule in
+        # ``_finish_baseline_if_complete`` then decides who counts.
+        targets = tuple(side for side in ("left", "right")
+                        if side in self.present_sides)
+        self._baseline_sides = targets or ("left", "right")
+        self._baseline_buffer = {"left": [], "right": []}
+        self._baseline_done = {"left": False, "right": False}
+        self._update_baseline_status()
+
+    def _baseline_sample(self, side, raw16) -> None:
+        """Advance the baseline calibration by one raw frame.
+
+        The first frame after the button press already counts -- there is no
+        settle delay, matching the standalone pressure tools, where the user is
+        told to press the button while the glove is unloaded and the next
+        ``_BASELINE_FRAMES`` frames are averaged.  Sides are independent: each
+        keeps sampling until it has its own ``_baseline_target`` frames, so a
+        two-hand run calibrates both hands from one press.
+        """
+        if self._baseline_done.get(side, False):
+            return
+        self._baseline_buffer[side].append(raw16)
+        if len(self._baseline_buffer[side]) >= self._baseline_target:
+            stack = np.stack(
+                self._baseline_buffer[side][-self._baseline_target:], axis=0)
+            # Mean, not median: the same per-cell average the admin edition
+            # computes, so a value read here matches one read there.
+            self.tactile_baseline[side] = np.mean(
+                stack, axis=0).astype(np.float32)
+            self._baseline_done[side] = True
+        self._finish_baseline_if_complete()
+
+    def _finish_baseline_if_complete(self) -> None:
+        if not self._baseline_collecting:
+            return
+        # "Every side that contributed frames", not "every side the runtimes
+        # announced".  Two failures hide behind the wrong test: with an empty
+        # ``present_sides`` the condition is vacuously true, so the collection
+        # retires and the status claims a baseline that was never collected
+        # (the corrected view would then silently keep showing raw numbers),
+        # while an announced side that stops delivering frames before its last
+        # sample would hold the collection open forever.
+        contributed = [side for side in ("left", "right")
+                       if self._baseline_buffer[side]]
+        if contributed and all(self._baseline_done.get(side)
+                               for side in contributed):
+            self._baseline_collecting = False
+            # Refresh the corrected map immediately for sides whose raw data is
+            # already available, without waiting for their next tactile frame.
+            for side in ("left", "right"):
+                if self.tactile_raw_frames.get(side) is not None:
+                    self.tactile_adc_frames[side] = self._adc_display_value(side)
+        self._update_baseline_status()
+
+    def _update_baseline_status(self) -> None:
+        qcanvas = getattr(self, "_qcanvas", None)
+        if qcanvas is None:
+            return
+        qcanvas.set_baseline_status(self._baseline_status_text())
+        # The collect button is left live even while a run is going: pressing
+        # it again restarts the run, which is how a collection that is waiting
+        # on a hand that stopped sending frames gets unstuck.
+        if self._baseline_collecting:
+            qcanvas.show_baseline_overlay(
+                L("基线采集中，请保持空载",
+                  "Collecting baseline, keep the glove unloaded"))
+        else:
+            qcanvas.hide_baseline_overlay()
+
+    def _baseline_exists(self) -> bool:
+        return any(self.tactile_baseline.get(side) is not None
+                   for side in ("left", "right"))
+
+    def _baseline_status_text(self) -> str:
+        """The baseline's own state, independent of which map is on screen.
+
+        The reference tools keep these separate -- a 基线: 已校准/未校准 readout
+        beside the 原始/校准后 switch -- so that looking at the raw map never
+        reads as "no baseline".
+        """
+
+        if self._baseline_collecting:
+            # The slowest hand taking part that is actually sending, matching
+            # the rule that retires the collection: a side that never delivers
+            # a frame is not part of the run and must not pin the readout at
+            # 0/N forever.
+            counts = [len(self._baseline_buffer.get(side, []))
+                      for side in self._baseline_sides
+                      if self._baseline_buffer.get(side)]
+            n = min(counts) if counts else 0
+            return L(
+                f"基线采集中… {n}/{self._baseline_target}（保持空载）",
+                f"Collecting baseline… {n}/{self._baseline_target} (keep free)")
+        if self._baseline_exists():
+            return L(
+                f"已校准（{self._baseline_target}帧 · 均值）",
+                f"Calibrated ({self._baseline_target} frames · mean)")
+        return L("未校准（显示原始值）", "Not calibrated (raw values)")
 
     def _pressure_display_mode_label(self) -> str:
         return L("压力显示", "Pressure display")
@@ -2142,59 +1410,60 @@ class BimanualViewer(Live3DViewer):
         self._redraw_requested = True
 
     def _draw_tactile(self, img):
+        # The on-mesh overlays paint ``force_n`` -- newtons already fitted by
+        # the SDK -- because the mesh has no ADC scale to colour against, and
+        # the newton panel does the same.  The ADC panel paints the other
+        # matrix: the raw scan those newtons were fitted from, in sensor counts.
+        # ``_adc_display_value`` already subtracted the baseline when 使用基线
+        # is on, so the colour bands have to follow the same per-hand answer --
+        # a corrected frame is 0..~500 and would all but vanish on the raw
+        # scale, while an uncalibrated ~2000 would go solid red on the
+        # corrected one.
+        #
+        # No threshold is forwarded to either card: the client edition has no
+        # ADC-count gate (the old tactile_thr slider is gone), and every force
+        # value here is 0..5 N, so the ADC scale it counted in has nothing to
+        # say.  The floor that separates contact from an idle sensor is
+        # ``_NEWTON_CONTACT_FLOOR_N`` inside ``gui.rendering.tactile_pressure_hand``.
+        newton_ready = {"left": False, "right": False}
+        # Per hand, because one glove can be calibrated while the other is not.
+        baseline_ready = {
+            side: bool(self.use_baseline
+                       and self.tactile_baseline.get(side) is not None)
+            for side in ("left", "right")
+        }
         if self.display_mode == "hand" and self._pressure_mappers:
             camera = self._camera()
             mesh_slots = self._controlled_display_mesh_slots()
-            baseline_ready = {
-                side: bool(self.use_baseline
-                           and self.tactile_baseline.get(side) is not None)
-                for side in ("left", "right")
-            }
             if self.pressure_display_mode == "tiles":
                 draw_pressure_tiles(
-                    img,
-                    camera,
-                    mesh_slots,
-                    self.tactile_frames,
-                    self._pressure_mappers,
-                    baseline_ready,
-                    threshold=float(self.tactile_threshold),
-                )
+                    img, camera, mesh_slots, self.tactile_frames,
+                    self._pressure_mappers, newton_ready, newtons=True)
             elif self.pressure_display_mode == "points":
                 draw_pressure_color_points(
-                    img,
-                    camera,
-                    mesh_slots,
-                    self.tactile_frames,
-                    self._pressure_mappers,
-                    baseline_ready,
-                    threshold=float(self.tactile_threshold),
-                )
+                    img, camera, mesh_slots, self.tactile_frames,
+                    self._pressure_mappers, newton_ready, newtons=True)
             # "none" -> draw nothing on the mesh surface
         if self.tactile_panel_mode == "matrix":
             draw_bimanual_tactile_overlay(
                 img,
                 self.tactile_frames,
-                threshold=self.tactile_threshold,
-                scale=self.tactile_scale,
-                baseline_corrected=self.use_baseline,
-            )
-        elif self.tactile_panel_mode == "linear_matrix":
-            # The fit always receives the raw 12-bit ADC matrix.  Its fixed
-            # 2048 -> 0 response conversion lives in pressure_linear_fit and
-            # is independent of this viewer's optional baseline toggle.
-            draw_bimanual_tactile_overlay(
-                img,
-                self.tactile_raw_frames,
-                threshold=self.tactile_threshold,
                 scale=self.tactile_scale,
                 baseline_corrected=False,
                 linear_fitted=True,
             )
-        elif self.tactile_panel_mode == "force":
-            _draw_force_trend_overlay(
-                img, self._force_curve_snapshot(), self.present_sides,
-                self.tactile_scale)
+        elif self.tactile_panel_mode == "adc":
+            # The same card fed the scan the newtons were fitted from, so the
+            # per-cell numbers are what the sensor reported instead of what the
+            # fit made of it -- on the raw band scale, or the corrected one once
+            # a baseline exists and 使用基线 is on.
+            draw_bimanual_tactile_overlay(
+                img,
+                self.tactile_adc_frames,
+                scale=self.tactile_scale,
+                baseline_corrected=baseline_ready,
+                linear_fitted=False,
+            )
 
 
 def _synthesize_single_hand_bases(initial: np.ndarray) -> np.ndarray:
@@ -2259,32 +1528,6 @@ class _LinkHealth:
         }
 
 
-def make_result(runtimes, projector, present_sides):
-    def slot_of(side: str, attr: str) -> np.ndarray:
-        value = getattr(runtimes[side], attr)
-        if value is None:
-            return np.full((21, 3), np.nan, np.float32)
-        return np.asarray(value, np.float32).reshape(21, 3)
-
-    hands3d = np.stack([slot_of("left", "latest_joints"),
-                        slot_of("right", "latest_joints")]).astype(np.float32)
-    smoothed = np.stack([slot_of("left", "latest_smoothed"),
-                         slot_of("right", "latest_smoothed")]).astype(np.float32)
-    hands2d = np.stack([projector.project(smoothed[index])[0] for index in range(2)])
-    ready = [len(runtimes[side].missing) == 0 for side in ("left", "right")]
-    presents = [side in present_sides for side in ("left", "right")]
-    return {
-        "hands2d": hands2d,
-        "hands3d": hands3d,
-        "smoothed": smoothed,
-        "labels": ["Left", "Right"],
-        "presents": presents,
-        "propagated": [False, False],
-        "stage2": ready,
-        "reprojection_error": [float("nan"), float("nan")],
-    }
-
-
 def _snapshot(runtimes, present_sides, state_lock):
     """Read the published per-side state under ``state_lock``.
 
@@ -2301,10 +1544,8 @@ def _snapshot(runtimes, present_sides, state_lock):
                 "joints": runtime.latest_joints,
                 "mesh_vertices": getattr(runtime, "latest_mesh_vertices", None),
                 "smoothed": runtime.latest_smoothed,
-                "tactile": runtime.latest_tactile,
-                "tactile_raw": runtime.latest_tactile_raw,
-                "missing": list(runtime.missing),
-                "broken": list(getattr(runtime, "broken", [])),
+                "force": getattr(runtime, "latest_force", None),
+                "adc": getattr(runtime, "latest_adc", None),
                 "safety": bool(runtime.safety),
                 "contact": runtime.contact,
                 "warming_up": bool(getattr(runtime, "warming_up", False)),
@@ -2312,23 +1553,16 @@ def _snapshot(runtimes, present_sides, state_lock):
                     getattr(runtime, "warmup_remaining_s", 0.0)),
                 "warmup_completed": bool(
                     getattr(runtime, "warmup_completed", False)),
-                "warmup_timed_out": bool(
-                    getattr(runtime, "warmup_timed_out", False)),
                 "fps": float(getattr(runtime, "fps", 0.0)),
                 "device_fps": float(getattr(runtime, "device_fps", 0.0)),
+                "tactile_fps": float(getattr(runtime, "tactile_fps", 0.0)),
                 "link_health": getattr(runtime, "latest_link_health", None),
                 "host_s": float(runtime.latest_host_s),
-                "tactile_version": int(
-                    getattr(runtime, "tactile_version", 0)),
-                "raw_present": (
-                    None if getattr(runtime, "latest_raw_present", None) is None
-                    else np.asarray(runtime.latest_raw_present, dtype=bool).reshape(16).copy()),
-                "mag_levels": getattr(runtime, "latest_mag_levels", None),
-                "mag_unread": getattr(runtime, "latest_mag_unread", None),
-                "mag_prompt": getattr(runtime, "latest_mag_prompt", None),
-                "firmware_version": getattr(
-                    runtime, "firmware_version", None),
+                "force_version": int(getattr(runtime, "force_version", 0)),
+                "firmware_version": getattr(runtime, "firmware_version", None),
                 "latency": getattr(runtime, "latency", None),
+                "link_kind": getattr(runtime, "link_kind", "usb"),
+                "connected": side in present_sides,
             }
     return snap
 
@@ -2357,6 +1591,30 @@ def _snap_mesh_or_none(snap, side) -> np.ndarray | None:
     return mesh
 
 
+def _snap_force_or_none(snap, side) -> np.ndarray | None:
+    """One hand's force matrix in newtons, or ``None`` if there is nothing."""
+
+    value = snap[side].get("force")
+    if value is None:
+        return None
+    matrix = np.asarray(value, np.float32)
+    return matrix if matrix.shape == (16, 16) else None
+
+
+def _snap_adc_or_none(snap, side) -> np.ndarray | None:
+    """One hand's raw pressure ADC matrix, or ``None`` if there is nothing.
+
+    Not floored here: this is still the reading the device sent.  The floor
+    belongs to the view, and ``set_tactile_side`` applies it.
+    """
+
+    value = snap[side].get("adc")
+    if value is None:
+        return None
+    matrix = np.asarray(value, np.float32)
+    return matrix if matrix.shape == (16, 16) else None
+
+
 def _publish_latest(state_queue, message) -> None:
     """Publish without allowing stale IPC state to block a solver process."""
 
@@ -2378,317 +1636,274 @@ def _publish_latest(state_queue, message) -> None:
         pass
 
 
-def hand_solver_process(side, port, usb_vid, usb_pid, calib_path,
-                        geometry_path, solve_rate, state_queue, stop_event,
-                        mag_judge_event=None):
-    """One process per hand: stream + solve + publish to the parent.
+# How long the SDK reader waits for a paired frame before giving the loop back.
+# A Bluetooth dongle hands its frames over one RF event at a time, so the window
+# is a dongle's own batch latency -- the same 250 ms the solve loop treats as
+# the boundary between "current" and "a timestamp jump".
+_READ_TIMEOUT_S = 0.25
+# Cap on frames drained per turn.  A producer that keeps handing frames over
+# must not keep the reader from ever publishing, which is the same guard the
+# parent's drain applies.
+_MAX_DRAIN = 8
+
+
+def _open_sdk_link(side, calib_paths, links, serials, registry_path):
+    """Open one hand, through the SDK's one entry point.
+
+    Every choice was already made in the parent -- calibration file, link kind
+    and serial -- and is handed over here, so opening the glove does not
+    re-discover any of it.  Each hand has its own process and so opens its own
+    link: ``open_glove`` rather than ``open_bimanual``, which would resolve and
+    pair both links inside one interpreter and put the two solvers back on each
+    other's GIL.
+    """
+
+    return open_glove(
+        side,
+        calibration=calib_paths[side],
+        link=links[side],
+        serial_number=serials[side],
+        registry=registry_path,
+    )
+
+
+def _read_newest(glove, timeout):
+    """The newest frame of this hand, never a replay of a backlog.
+
+    ``read`` hands back one queued frame at a time from the oldest end, so a
+    reader that fell behind would publish history rather than the current pose.
+    The newest frame is what this keeps, and a frame per hand is all a hand's
+    process can publish -- one process reads one glove, so there is no pairing
+    to do here.  ``timeout`` bounds the first read only, so an idle glove costs
+    nothing while the frames already queued are taken in one go.  Returns
+    ``({side: HandFrame}, frames_drained)``; the mapping is one entry wide and
+    keeps the publishing loop below keyed by side, which is also how the parent
+    mirrors it.
+    """
+
+    newest: dict[str, object] = {}
+    drained = 0
+    wait = timeout
+    while True:
+        try:
+            frame = glove.read(wait)
+        except StreamTimeoutError:
+            break
+        newest[str(frame.side)] = frame
+        drained += 1
+        # Bounded like the parent's own drain: a producer that keeps handing
+        # frames over must not keep this loop from ever publishing.
+        if drained >= _MAX_DRAIN:
+            break
+        wait = 0.0
+    return newest, drained
+
+
+def hand_solver_process(side, calib_paths, links, serials, registry_path,
+                        solve_rate, state_queue, stop_event):
+    """One process for one hand's SDK pipeline, publishing to the parent.
 
     The parent is the consumer: it drains ``state_queue`` keep-newest and
     mirrors the fields into a :class:`PublishedHandState` under its own lock.
-    Giving each hand its own process gives it its own GIL and its own core,
-    so solve bursts no longer preempt the GUI thread.  Fatal errors are
-    shipped as a ``{"type": "fatal"}`` message before the process exits.
+    One hand per process, because that is what gives the hand its own GIL: two
+    hands in one process solve at roughly 42 Hz each rather than the 60 Hz their
+    devices deliver, and under a Bluetooth dongle's batched arrival the backlog
+    that builds behind that shared interpreter is what the link then has to
+    carry.  Keeping the loop here rather than on the GUI's thread is what stops
+    a solve burst from preempting the draw.  Fatal errors are shipped as a
+    ``{"type": "fatal", "side": ...}`` message before the process exits.
     """
     try:
-        runtime = HandRuntime(
-            side=side,
-            config=load_calibration(Path(calib_path), side),
-            solver=HandSolver(side, Path(calib_path), Path(geometry_path)),
-            stream=RawImuStream(
-                str(port), usb_vid=int(usb_vid), usb_pid=int(usb_pid)),
-            tactile_stream=None,
-            smoother=JointPositionSmoother(0.015),
-            tactile_pre=TactilePreprocessor(
-                base_gate=0.0, dynamic_noise_ratio=0.0, temporal_smooth=0.15,
-                spatial_filter=False, calibration_frames=100, bypass_gates=False),
-            missing=[f"IMU-{index}" for index in range(16)],
-        )
-        runtime.tactile_stream = runtime.stream.tactile_stream()
-        runtime.stream.start()
-        runtime.tactile_stream.start()
+        glove = _open_sdk_link(
+            side, calib_paths, links, serials, registry_path)
     except BaseException as exc:
         _publish_latest(state_queue, {
             "type": "fatal",
+            "side": side,
             "error": f"{type(exc).__name__}: {exc}",
         })
         return
-    print(f"[{side}] solver process started (pid {os.getpid()})")
-    # IMU and tactile packets share the transport sequence counter, so using
-    # ``raw_frame.sequence % 4`` does *not* keep three of four IMU samples; in
-    # the usual alternating packet stream it drops about half of them.  Use
-    # device time as a fractional, non-blocking rate budget instead.  A frame
-    # is either solved immediately or discarded; there is no sleep, backlog,
-    # or replay of stale poses.
+    print(f"[SDK] {side} pipeline started (pid {os.getpid()})")
+    # The mesh is read through ``Glove.mesh_vertices_m``, the hand's own public
+    # facade: a frame carries the pose and not the mesh, which is the state that
+    # lives on the engine.  That property is the newest solved mesh rather than
+    # one keyed to a frame, which is what the renderer paints from.
+    runtime = HandRuntime(side=side, smoother=JointPositionSmoother(0.015))
+    # Solve-rate budget, per hand: the SDK pipeline solves every frame it
+    # receives, so this no longer saves the solve -- it keeps what is published
+    # (the drawn pose, the HUD's solve rate) at the cadence it had.  Device time
+    # is a fractional, non-blocking budget rather than a frame counter, so a
+    # burst is thinned out instead of discarded whole.
     solve_rate = min(max(float(solve_rate), 1.0), 80.0)
     solve_credit = 0.0
-    last_device_us: int | None = None
-    solve_times: list[float] = []
-    # Device arrival rate, tracked separately from the solve rate.  The two
-    # diverge whenever a solve cannot keep up with the USB rate, and showing
-    # only the solve rate makes a busy host look like a slow glove.
-    device_frame_total = 0
-    device_samples: list[tuple[float, int]] = []
-    # Delivery shape (burst size, arrival gaps) and the transport's own parser
-    # error counters, which nothing read before.  Together they decide whether
-    # a low FPS is the link's fault or the host discarding frames.
+    last_timestamp_us: int | None = None
+    # The last force matrix published for this hand, and the ADC it was fitted
+    # from.  The SDK re-attaches the newest pressure scan to every attitude
+    # frame until the next one lands, and re-publishing a repeat would drive the
+    # parent's force history at the attitude rate instead of the scan rate -- so
+    # only a scan that differs from the last published one goes out.  Both
+    # matrices are compared, because they are one scan and the parent draws
+    # either of them: ``equal_nan`` because the uncovered cells of a force
+    # matrix are NaN on purpose, which is also why the ADC has to be in the
+    # comparison at all -- a scan that moved only there is unchanged in the
+    # force matrix and very much changed on the ADC panel.
+    last_force: np.ndarray | None = None
+    last_adc: np.ndarray | None = None
+    publish_times: list[float] = []
+    # Delivery shape (frames per read, arrival gaps) and the transport's own
+    # parser error counters, which travel on the frame.  Together they decide
+    # whether a low FPS is the link's fault or the host discarding frames.
     link_health = _LinkHealth()
-    fault_detector = ImuFaultDetector()
-    # One calibration monitor per hand: it both reads the 0x05 cache and owns
-    # the countdown, so it lives here where the frames arrive rather than being
-    # fed through the parent at the display rate.  The jump detector sits beside
-    # it for the same reason -- it needs every raw attitude frame, and the
-    # parent only sees the ones that get published.
-    mag_monitor = MagCalibrationMonitor()
-    mag_jump_detector = ImuJumpDetector()
     try:
         while not stop_event.is_set():
-            saw_data = False
-            tactile_frames = runtime.tactile_stream.poll()
-            if tactile_frames:
-                # Tactile is a live overlay, not a history playback.  Publishing
-                # only the newest sample prevents stale pressure frames from
-                # delaying the latency-sensitive IMU solve after a USB backlog.
-                # Unlike the IMU frames below, keeping one here loses nothing a
-                # consumer could have seen: ``latest_tactile`` is replaced by
-                # each frame and the overlay redraws from it, so earlier frames
-                # of the same poll would only be overwritten.
-                tactile_frames = tactile_frames[-1:]
-            for tactile_frame in tactile_frames:
-                saw_data = True
-                tactile_raw = tactile_frame.samples.copy()
-                processed, _ = runtime.tactile_pre.process(
-                    tactile_frame.samples)
-                runtime.latest_tactile = (
-                    processed.copy() if processed is not None else None)
-                runtime.tactile_version += 1
-                _publish_latest(state_queue, {
-                    "type": "tactile",
-                    "tactile": runtime.latest_tactile,
-                    "tactile_raw": tactile_raw,
-                    "tactile_version": runtime.tactile_version,
-                })
-            raw_frames = runtime.stream.poll()
-            if raw_frames:
-                # Count arrivals before the backlog is discarded below; past
-                # this point the device rate is unobservable.
-                arrival = time.perf_counter()
-                device_frame_total += len(raw_frames)
-                device_samples.append((arrival, device_frame_total))
-                device_samples = [
-                    sample for sample in device_samples
-                    if arrival - sample[0] <= 1.0]
-                # Observed before the burst is trimmed below: how the link
-                # grouped the frames is the whole point, and it is only visible
-                # on the raw poll result.
-                link_health.observe(arrival, len(raw_frames))
-                # Real-time: drop only the part of the batch that is history by
-                # now, keep the rest.  Collapsing a whole batch to its last
-                # frame (what this did before) made a bursty link's solved rate
-                # equal its batch rate; the device-time credit accumulator below
-                # is what throttles the rate, and it cannot throttle frames that
-                # were discarded before it ever saw them.
-                raw_frames = recent_batch(raw_frames)
-            for raw_frame in raw_frames:
-                if raw_frame.sequence == runtime.last_seq:
-                    continue
-                saw_data = True
-                runtime.last_seq = raw_frame.sequence
-                if runtime.stream.firmware_version is not None:
-                    runtime.firmware_version = runtime.stream.firmware_version
-                real_version = firmware_real_version(
-                    runtime.firmware_version) if runtime.firmware_version else None
-                uses_mag_telemetry = bool(
-                    real_version is not None
-                    and real_version >= USB_FULL_SEQUENCE_FROM)
-                magnetic = (runtime.stream.mag_telemetry
-                            if uses_mag_telemetry else None)
-                # Everything the publish at the bottom of this loop reads must be
-                # defined before the branch that fills it.  A key only the
-                # telemetry path can produce became an UnboundLocalError rather
-                # than a missing field when it was defined inside that branch,
-                # which crashed the solver process on firmware without type 0x05.
-                # ``py_compile`` does not see it and neither did any offline test.
-                mag_levels = None
-                mag_unread: tuple[int, ...] = ()
-                mag_prompt = None
-                # Fed every frame, whatever the firmware: the step is what
-                # triggers the magnetometer check, and a step is only meaningful
-                # once there is a previous frame to compare against.  How big
-                # the step was is not reported anywhere -- not on screen and not
-                # in the terminal -- only whether it crossed the bar.
-                mag_triggered, _ = mag_jump_detector.update(
-                    raw_frame.quaternions_xyzw, raw_frame.valid_mask)
-                if uses_mag_telemetry:
-                    # ``mag_levels``, not ``levels_raw``: the wire carries the
-                    # whole CALIB_STAT byte, and MAG is its low two bits -- 0x03
-                    # for a calibrated channel (MAG_TELEMETRY.md 1.4).  Comparing
-                    # ``levels_raw`` against 3 would count that as 0, and reading
-                    # the high bits instead returns SYS, which sits near 0 on a
-                    # calibrated glove, so the gate would never open.  A
-                    # never-read channel stays ``None`` in both tuples, so
-                    # "unknown" is not level 0.
-                    mag_levels = None if magnetic is None else magnetic.mag_levels
-                    # Half of the channels *this 0x05 frame carried* must read 3.
-                    # That frame's mask is the only denominator the telemetry
-                    # licenses -- there is no usable "is this IMU working" signal
-                    # -- and it is what keeps the glove from being charged for
-                    # channels nobody read this round.
-                    mag_counts = ((0, 0) if magnetic is None
-                                  else magnetic.gate_counts)
-                    # ``None`` is "no 0x05 at all" rather than "not calibrated",
-                    # which the monitor must not treat as something to prompt for.
-                    mag_gate = (None if magnetic is None
-                                or not any(magnetic.level_seen)
-                                else magnetic.ready)
-                    mag_unread = (() if magnetic is None
-                                  else magnetic.unread_channels)
-                    # Judging waits for IMU warm-up and the startup direction
-                    # capture: the fusion is settling through both, so a step in
-                    # the attitude says nothing about the field and a trigger
-                    # arriving then is discarded rather than acted on.  The
-                    # parent owns both facts and publishes the combined verdict
-                    # -- warm-up rides in the solve status and the capture is the
-                    # viewer's, neither of which is here.
-                    judge_ready = (mag_judge_event is None
-                                   or mag_judge_event.is_set())
-                    mag_prompt = None if magnetic is None else mag_monitor.update(
-                        time.perf_counter(), mag_gate, mag_counts,
-                        triggered=mag_triggered, judge_ready=judge_ready)
-                # Read this frame's firmware health flag afresh; the previous
-                # frame's verdict is never carried over.
-                broken_channels = fault_detector.update(raw_frame.present_mask)
-                device_us = int(raw_frame.device_timestamp_us)
-                if last_device_us is None:
+            frames, drained = _read_newest(glove, _READ_TIMEOUT_S)
+            if not frames:
+                continue
+            # perf_counter (QPC) is system-wide monotonic, so the host_s
+            # published here is directly comparable across the process
+            # boundary in the parent.
+            now = time.perf_counter()
+            for hand_side, frame in frames.items():
+                # The frame's own force in newtons: the finger regions are
+                # already fitted, and the cells no fitted region covers arrive
+                # as NaN.  ``None`` means this frame carries no pressure scan.
+                force = frame.force_n
+                if force is not None:
+                    force = np.asarray(force, np.float32).reshape(16, 16).copy()
+                    # The raw ADC the newtons were fitted from rides the same
+                    # message: one scan, one version.  Both matrices are compared
+                    # before publishing, because in the ADC view a cell no fitted
+                    # region covers is a reading too -- it is NaN in the newton
+                    # matrix, so a scan that moved only there would otherwise be
+                    # dropped as unchanged.
+                    adc = frame.tactile_adc
+                    adc = (None if adc is None else
+                           np.asarray(adc, np.float32).reshape(16, 16).copy())
+                    if (last_force is None
+                            or not np.array_equal(
+                                force, last_force, equal_nan=True)
+                            or (adc is not None
+                                and (last_adc is None
+                                     or not np.array_equal(adc, last_adc)))):
+                        last_force = force
+                        last_adc = adc
+                        runtime.latest_force = force
+                        runtime.latest_adc = adc
+                        runtime.force_version += 1
+                        _publish_latest(state_queue, {
+                            "type": "force",
+                            "side": hand_side,
+                            "force": force,
+                            "adc": adc,
+                            "force_version": runtime.force_version,
+                        })
+                timestamp_us = int(frame.timestamp_us)
+                previous_us = last_timestamp_us
+                last_timestamp_us = timestamp_us
+                if previous_us is None:
                     # Publish the first pose immediately.
-                    last_device_us = device_us
+                    publish = True
                 elif solve_rate < 80.0:
                     # The firmware timestamp is a wrapping uint32 counter.
-                    elapsed_us = (device_us - last_device_us) & 0xFFFFFFFF
-                    last_device_us = device_us
+                    elapsed_us = (timestamp_us - previous_us) & 0xFFFFFFFF
                     if elapsed_us > 250_000:
                         # Reconnect/timestamp reset: do not accumulate a burst
                         # of historical solve credit.
                         solve_credit = 0.0
+                        publish = True
                     else:
                         solve_credit = min(
-                            solve_credit
-                            + elapsed_us * solve_rate / 1_000_000.0,
+                            solve_credit + elapsed_us * solve_rate / 1_000_000.0,
                             2.0,
                         )
-                        if solve_credit < 1.0:
-                            continue
-                        solve_credit -= 1.0
+                        publish = solve_credit >= 1.0
+                        if publish:
+                            solve_credit -= 1.0
                 else:
-                    last_device_us = device_us
-                keypoints = runtime.solver.process(raw_frame)
-                sample_s = keypoints.timestamp_us / 1_000_000.0
-                joints = np.asarray(keypoints.joints_m, np.float32).copy()
+                    publish = True
+                if not publish:
+                    continue
+                sample_s = timestamp_us / 1_000_000.0
+                joints = np.asarray(frame.joints_raw_m, np.float32).copy()
+                # The local smoother, on the raw joints and at its own
+                # parameters: the SDK's own smoothing is not what this view
+                # draws, and swapping it would change how the hand moves.
                 smoothed = np.asarray(
-                    runtime.smoother.update(keypoints.joints_m, sample_s),
+                    runtime.smoother.update(frame.joints_raw_m, sample_s),
                     np.float32).copy()
-                imu = np.asarray(keypoints.imu_xyzw, np.float32).copy()
-                missing = [
-                    f"IMU-{index}" for index in np.flatnonzero(
-                        ~np.isfinite(keypoints.sensor_age_s))]
-                # perf_counter (QPC) is system-wide monotonic, so the host_s
-                # published here is directly comparable across the process
-                # boundary in the parent.
-                now = time.perf_counter()
-                solve_times.append(now)
-                solve_times = [
-                    t for t in solve_times if now - t <= 1.0]
-                if len(solve_times) >= 2:
-                    solve_window_s = solve_times[-1] - solve_times[0]
+                publish_times.append(now)
+                publish_times = [
+                    stamp for stamp in publish_times if now - stamp <= 1.0]
+                if len(publish_times) >= 2:
+                    window_s = publish_times[-1] - publish_times[0]
                     measured_fps = (
-                        (len(solve_times) - 1) / solve_window_s
-                        if solve_window_s > 0.0 else 0.0)
+                        (len(publish_times) - 1) / window_s
+                        if window_s > 0.0 else 0.0)
                 else:
                     measured_fps = 0.0
-                # Frames delivered over the same one-second window.  Counted
-                # rather than timed because the transport hands over a burst
-                # per poll, so a per-batch timestamp would read as a stall.
-                if len(device_samples) >= 2:
-                    device_window_s = (
-                        device_samples[-1][0] - device_samples[0][0])
-                    device_fps = (
-                        (device_samples[-1][1] - device_samples[0][1])
-                        / device_window_s
-                        if device_window_s > 0.0 else 0.0)
-                else:
-                    device_fps = 0.0
+                status = frame.status
+                details = getattr(status, "details", None) or {}
                 _publish_latest(state_queue, {
                     "type": "solve",
+                    "side": hand_side,
                     "joints": joints,
-                    "mesh_vertices": _latest_solver_mesh_vertices(runtime.solver),
+                    "mesh_vertices": glove.mesh_vertices_m,
                     "smoothed": smoothed,
-                    "imu": imu,
-                    "raw_imu": raw_frame.quaternions_xyzw.copy(),
-                    "raw_present": raw_frame.present_mask.copy(),
-                    "raw_valid": raw_frame.valid_mask.copy(),
-                    # Plain tuples of int/None only: this crosses a process
-                    # queue, so no snapshot object may travel with it.
-                    "mag_levels": mag_levels,
-                    # Plain tuple of ints: the channels this round did
-                    # not report, which is why the count is out of twelve.
-                    # Empty on a glove with no 0x05 at all.
-                    "mag_unread": mag_unread,
-                    # None, or the monitor's plain {"kind", "remaining_s",
-                    # "ready", "carried"} dict, which is what the card renders
-                    # its counts from.
-                    "mag_prompt": mag_prompt,
-                    "raw_device_timestamp_us": raw_frame.device_timestamp_us,
-                    "missing": missing,
-                    "broken": broken_channels,
-                    "safety": bool(keypoints.status.safety_intervened),
-                    "contact": keypoints.status.active_contact,
-                    "warming_up": bool(
-                        keypoints.status.details.get("warming_up", False)),
+                    "safety": bool(status.safety_intervened),
+                    "contact": status.active_contact,
+                    "warming_up": bool(details.get("warming_up", False)),
                     "warmup_remaining_s": float(
-                        keypoints.status.details.get("warmup_remaining_s")
-                        or 0.0),
+                        details.get("warmup_remaining_s") or 0.0),
                     "warmup_completed": bool(
-                        keypoints.status.details.get("warmup_completed", False)),
-                    "warmup_timed_out": bool(
-                        keypoints.status.details.get("warmup_timed_out", False)),
+                        details.get("warmup_completed", False)),
                     "fps": measured_fps,
-                    "device_fps": device_fps,
+                    # The device's own arrival rate, counted by the SDK: the two
+                    # diverge whenever the publish budget above holds a frame
+                    # back, and showing only one makes a busy host look like a
+                    # slow glove.
+                    "device_fps": float(frame.device_fps or 0.0),
+                    # The pressure stream's own arrival rate, from the same
+                    # SDK-side window.  Independent of the attitude rate above:
+                    # the scan this frame carries may be the newest one standing
+                    # over from several frames back.
+                    "tactile_fps": float(frame.tactile_fps or 0.0),
                     "host_s": now,
-                    "firmware_version": getattr(runtime, "firmware_version", None),
-                    # Refreshed by the transport's own reader thread every ~2 s;
-                    # ``None`` until the device answers, and permanently
-                    # ``None`` on firmware older than v1.2.11.
-                    "latency": getattr(runtime.stream, "latency", None),
+                    "firmware_version": frame.firmware_version,
+                    # Host<->device round trip in milliseconds, or ``None`` on a
+                    # link that cannot measure it: a Bluetooth link is half
+                    # duplex, and firmware older than v1.2.11 does not answer.
+                    "latency": frame.latency_ms,
+                    "link_kind": frame.link_kind,
                     # Plain dict of numbers: this crosses the process queue.
                     # ``link_errors`` counts bytes the parser rejected,
                     # ``link_drops`` frames the link never delivered; neither
                     # rises for frames this loop deliberately discards, so
                     # together they say where the frames went.
-                    "link_health": link_health.snapshot(
-                        now, {
-                            **(getattr(runtime.stream, "link_errors", None)
-                               or {}),
-                            **(getattr(runtime.stream, "link_drops", None)
-                               or {}),
-                        }),
+                    "link_health": link_health.snapshot(now, {
+                        **(frame.link_errors or {}),
+                        **(frame.link_drops or {}),
+                    }),
                 })
-            if not saw_data:
-                stop_event.wait(0.001)
+            link_health.observe(now, drained)
     except BaseException as exc:  # shipped to the parent, not swallowed
         _publish_latest(state_queue, {
             "type": "fatal",
+            "side": side,
             "error": f"{type(exc).__name__}: {exc}",
         })
     finally:
-        runtime.stream.stop()
+        glove.close()
 
 
-def _drain_hand_queue(state_queue, state) -> dict | None:
+def _drain_hand_queue(state_queue, runtimes) -> dict | None:
     """Apply pending child messages to the parent-side mirror state.
 
-    Called by the main loop with ``state_lock`` held (the recorder thread
-    reads the same fields under the same lock).  Messages apply keep-newest,
-    so a slow GUI frame only ever sees the latest published values.  Returns
-    the fatal-error message when the hand process crashed, else ``None``.
+    Called by the main loop with ``state_lock`` held, once per hand's queue --
+    the hands used to share one, which let either hand's publisher evict the
+    other's unread messages.  Messages are applied keep-newest per hand and
+    kind, so a slow GUI frame only ever sees the latest published values.
+    Returns the fatal-error message when the reader process crashed, else
+    ``None``.
     """
     fatal = None
     latest_by_kind = {}
@@ -2703,112 +1918,32 @@ def _drain_hand_queue(state_queue, state) -> dict | None:
         kind = message.get("type")
         if kind == "fatal":
             fatal = message
-        elif kind in ("tactile", "solve"):
-            latest_by_kind[kind] = message
-    tactile_message = latest_by_kind.get("tactile")
-    if tactile_message is not None:
-        message = tactile_message
-        state.latest_tactile = message["tactile"]
-        state.latest_tactile_raw = message["tactile_raw"]
-        state.tactile_version = message["tactile_version"]
-    solve_message = latest_by_kind.get("solve")
-    if solve_message is not None:
-        message = solve_message
+        elif kind in ("force", "solve"):
+            latest_by_kind[(message.get("side"), kind)] = message
+    for (side, kind), message in latest_by_kind.items():
+        state = runtimes[side]
+        if kind == "force":
+            state.latest_force = message["force"]
+            state.latest_adc = message.get("adc")
+            state.force_version = message["force_version"]
+            continue
         state.latest_joints = message["joints"]
         state.latest_mesh_vertices = message.get("mesh_vertices")
         state.latest_smoothed = message["smoothed"]
-        state.latest_imu = message["imu"]
-        state.latest_raw_imu = message["raw_imu"]
-        state.latest_raw_present = message["raw_present"]
-        state.latest_raw_valid = message["raw_valid"]
-        state.latest_mag_levels = message.get("mag_levels")
-        state.latest_mag_unread = message.get("mag_unread")
-        state.latest_mag_prompt = message.get("mag_prompt")
-        state.latest_raw_device_timestamp_us = (
-            message["raw_device_timestamp_us"])
-        state.missing = message["missing"]
-        state.broken = list(message.get("broken") or [])
         state.safety = message["safety"]
         state.contact = message["contact"]
         state.warming_up = message["warming_up"]
         state.warmup_remaining_s = message["warmup_remaining_s"]
         state.warmup_completed = message["warmup_completed"]
-        state.warmup_timed_out = message["warmup_timed_out"]
         state.fps = message["fps"]
         state.device_fps = float(message.get("device_fps") or 0.0)
+        state.tactile_fps = float(message.get("tactile_fps") or 0.0)
         state.latest_link_health = message.get("link_health")
         state.latest_host_s = message["host_s"]
         state.firmware_version = message["firmware_version"]
         state.latency = message.get("latency")
+        state.link_kind = message.get("link_kind") or "usb"
     return fatal
-
-
-def recorder_loop(runtimes, present_sides, projector, args,
-                  state_lock, rec_lock, stop_event, shared):
-    """Sample ``latest_*`` onto the recording session at a fixed wall-clock
-    cadence (``args.record_fps``, default 60 Hz), independent of the solve loop.
-
-    Each hand's solver process can be busy for many milliseconds inside a poll
-    burst, so cadence checks bolted onto the acquire path would lag the 60 Hz
-    slots by up to one solve per burst.  This thread owns the sampling clock
-    instead: it wakes every
-    ``1/record_fps`` seconds and records the newest published state, so recorded
-    timestamps stay spaced by exactly ``interval`` regardless of burstiness.
-
-    Lock discipline: ``state_lock`` is held while reading the published state
-    (via :func:`make_result`) and while :meth:`BimanualRecordingSession.add`
-    reads the same fields; ``rec_lock`` guards session start/stop/add.  The
-    nesting here is always ``rec_lock`` then ``state_lock``; no thread acquires
-    them in the reverse order, so there is no lock ordering to violate.
-    """
-    record_fps = float(getattr(args, "record_fps", None) or args.fps)
-    interval = 1.0 / max(record_fps, 1.0)
-    next_record = 0.0
-    prev_recording_state = None
-    try:
-        while not stop_event.is_set():
-            # perf_counter (QPC): time.monotonic ticks at ~15.6 ms on Windows
-            # here, which quantized the recording gate to ~32 Hz.
-            now = time.perf_counter()
-            with rec_lock:
-                session = shared.session
-            if session is not None and session.state == "recording":
-                if prev_recording_state != "recording":
-                    next_record = now  # anchor the first sample of this take
-                prev_recording_state = "recording"
-                if now >= next_record:
-                    with state_lock:
-                        ready = all(
-                            runtimes[side].latest_joints is not None
-                            for side in present_sides)
-                        fresh = ready and all(
-                            now - runtimes[side].latest_host_s
-                            <= args.max_frame_age
-                            for side in present_sides)
-                        result = (
-                            make_result(runtimes, projector, present_sides)
-                            if fresh else None)
-                    if result is not None:
-                        with rec_lock:
-                            session = shared.session
-                            if (session is not None
-                                    and session.state == "recording"):
-                                with state_lock:
-                                    session.add(now, result, runtimes)
-                # Fixed-timestep accumulator.  Resetting from `now` added the
-                # loop's wake-up overshoot to every interval and drifted the
-                # rate ~8% slow; advancing the deadline keeps the long-term
-                # rate exactly record_fps and skips any beat the slow loop
-                # missed instead of bursting duplicate rows.
-                while now >= next_record:
-                    next_record += interval
-            else:
-                prev_recording_state = (
-                    session.state if session is not None else None)
-            stop_event.wait(
-                max(interval - (time.perf_counter() - now), 0.001))
-    except BaseException as exc:  # surfaced to the main loop, not swallowed
-        shared.recorder_error = (type(exc), exc, exc.__traceback__)
 
 
 def _parse_args(argv=None):
@@ -2831,28 +1966,22 @@ def _parse_args(argv=None):
         "--calibration-bindings", type=Path,
         default=DEFAULT_CALIBRATION_BINDINGS,
         help="JSON file remembering each glove's calibration file by USB serial")
-    parser.add_argument("--geometry", type=Path, default=DEFAULT_GEOMETRY_PATH,
-                        help="Hand geometry JSON")
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
-    parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--fps", type=float, default=60.0,
-        help="Preview refresh rate (Hz), default 60; recording uses --record-fps")
-    parser.add_argument(
-        "--record-fps", type=float, default=60.0,
-        help="Recording sample rate (Hz), default 60")
+        help="Preview refresh rate (Hz), default 60")
     parser.add_argument(
         "--solve-fps", type=float, default=0.0,
-        help="Per-hand solve decimation target in Hz; 0 = auto (60). "
-             "Each hand solves in its own process on its own "
-             "core, so the GUI no longer competes for the GIL; lower this "
-             "only on CPU-constrained machines.")
+        help="Per-hand publish decimation target in Hz; 0 = auto (60). "
+             "The SDK pipeline solves every frame it receives, so this caps "
+             "the pose/HUD update rate rather than the solve cost, and it is "
+             "what keeps a Bluetooth batch from being drawn as a backlog.")
     parser.add_argument("--startup-timeout", type=float, default=15.0)
     parser.add_argument("--max-frame-age", type=float, default=0.25)
     parser.add_argument(
         "--link-diag", action="store_true",
         help="Print one link-diagnostics line per hand per second: how many "
-             "frames each poll delivered, the longest arrival gap, and the "
+             "frames each read drained, the longest arrival gap, and the "
              "frame parser's error counters.  Off by default so a normal run "
              "stays quiet; this is what tells a slow link apart from a bursty "
              "one when FPS sits below the device rate.")
@@ -2875,95 +2004,187 @@ def _parse_args(argv=None):
                         help="Initial 3D display mode: bones or full gray hand mesh")
     parser.add_argument("--lang", choices=("zh", "en"), default="zh",
                         help="UI language: zh (default) or en")
-    parser.add_argument("--checkpoint-frames", type=int, default=600)
-    parser.add_argument("--episode-index", type=int, default=0)
-    parser.add_argument("--task-index", type=int, default=0)
-    parser.add_argument("--no-save", action="store_true")
-    parser.add_argument(
-        "--record-on-start", action="store_true",
-        help="Start recording when data is ready; default waits for the GUI button")
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--max-frames", type=int, default=0)
     args = parser.parse_args(argv)
-    if args.no_save and args.record_on_start:
-        parser.error("--no-save and --record-on-start cannot be combined")
-    if args.no_display and not (args.no_save or args.record_on_start):
-        parser.error("--no-display requires --record-on-start or --no-save")
     return args
 
 
-def _run_live_session(args) -> int | str:
-    """Run one live-viewer session.
+@dataclass
+class _DetectedHands:
+    """Which gloves are on the bus right now, and how each one is reached.
 
-    Returns an int exit code, ``"calibrate"`` when the in-app Calibrate
-    button was pressed (the launcher then switches to the calibration screen),
-    or ``"selector"`` when the in-app "back to calibration selector" button was
-    pressed (the launcher re-opens the calibration-file picker).
+    Built from scratch by :func:`detect_gloves` on every detection -- once at
+    startup and again every time the calibration selector's Refresh button is
+    pressed -- so those two callers cannot drift apart: a glove the Refresh
+    finds is resolved exactly like one that was there when the app started.
     """
-    # Resolve each bound hand independently: a missing glove is skipped, not
-    # fatal.  Only when no glove at all is detected do we abort.
-    device_manager = DeviceManager(args.registry)
-    # A glove link that no registry entry claims is probed once for the hand
-    # side its firmware reports.  This is what makes a freshly plugged Bluetooth
-    # dongle usable on the first launch: the dongle hides the glove's STM32
-    # serial, so there is no other way to tell which hand is behind it.
+
+    sides: list[str] = field(default_factory=list)
+    ports: dict[str, str] = field(default_factory=dict)
+    serials: dict[str, str] = field(default_factory=dict)
+    links: dict[str, str] = field(default_factory=dict)
+    # Hands found behind a link no registry entry claims.  A Bluetooth dongle
+    # hides the glove's STM32 serial, so only the glove's own firmware can say
+    # which hand it is; the caller remembers these to skip the probe next time.
+    auto_detected: dict[str, str] = field(default_factory=dict)
+
+    def adopt_into(self, present_sides: list[str], ports: dict[str, str],
+                   serials: dict[str, str], links: dict[str, str]) -> None:
+        """Make this detection the live session's view of the bench.
+
+        In place, and that is the point: the session holds these four
+        containers for its whole life, and its readers -- the recorder thread,
+        the viewer's status builder, each solver process -- captured the
+        objects rather than the names.  Replacing them would leave every one
+        of those readers on the startup snapshot; the Refresh button writing
+        nothing here at all is what made the hand it found show up as
+        connected and then never open.
+        """
+
+        present_sides[:] = self.sides
+        ports.clear()
+        ports.update(self.ports)
+        serials.clear()
+        serials.update(self.serials)
+        links.clear()
+        links.update(self.links)
+
+
+def detect_gloves(device_manager, registry: Path,
+                  announce: bool = False) -> _DetectedHands:
+    """Resolve whichever hands are plugged in right now.
+
+    The registry is consulted first, then every unclaimed STM32 link is probed
+    once for the hand side its firmware reports.  That probe is what makes a
+    freshly plugged Bluetooth dongle usable on the first launch, and it is just
+    as necessary on a later Refresh: a dongle that appeared after startup is
+    not in the registry either, so ``resolve_port`` alone would never find it.
+
+    ``announce`` prints what was found, for a console the user is watching; the
+    startup summary lines are the caller's, since only the startup knows
+    whether an empty bench is worth a warning.
+    """
+
     try:
-        unbound_links = detect_unbound_glove_links(args.registry)
+        unbound_links = detect_unbound_glove_links(registry)
     except Exception as exc:  # probing is best-effort, never fatal
         print(f"[WARN] unbound glove probe failed: {exc}", file=sys.stderr)
         unbound_links = {}
-    present_sides: list[str] = []
-    ports: dict[str, str] = {}
-    serials: dict[str, str] = {}
-    links: dict[str, str] = {}
-    auto_detected: dict[str, str] = {}
+    found = _DetectedHands()
     used_ports: set[str] = set()
     for side in ("left", "right"):
         try:
             port, serial = device_manager.resolve_port(side)
+        except GloveHandMismatchError as exc:
+            # The link is here, and says which hand it is -- it is just filed on
+            # the other side.  Reported rather than swallowed into "NOT
+            # CONNECTED", because the two failures send the user to different
+            # places: one to the registry entry, the other to a cable.
+            if announce:
+                print(f"{side} device: {exc}", file=sys.stderr)
+            continue
         except DeviceNotFoundError:
             discovered = unbound_links.get(side)
             if discovered is None:
-                print(f"{side} device: NOT CONNECTED (skipped)")
+                if announce:
+                    print(f"{side} device: NOT CONNECTED (skipped)")
                 continue
             port, serial = discovered
-            auto_detected[side] = serial
-            print(
-                f"{side} device: firmware reports this hand; unbound "
-                f"link={link_kind_for_device(port) or 'usb'}  port={port}")
+            found.auto_detected[side] = serial
+            if announce:
+                print(
+                    f"{side} device: firmware reports this hand; unbound "
+                    f"link={link_kind_for_device(port) or 'usb'}  port={port}")
         # A bimanual runtime must never open one physical CDC port twice.  This
         # is a defensive guard for stale registries, unusual USB drivers, or a
         # future resolver fallback: the second logical side is absent rather
         # than being fed the first hand's frames.
         if port in used_ports:
-            print(
-                f"{side} device: DUPLICATE PORT {port} (skipped; "
-                "already assigned to another hand)")
+            if announce:
+                print(
+                    f"{side} device: DUPLICATE PORT {port} (skipped; "
+                    "already assigned to another hand)")
             continue
         used_ports.add(port)
-        present_sides.append(side)
-        ports[side] = port
-        serials[side] = serial
+        found.sides.append(side)
+        found.ports[side] = port
+        found.serials[side] = serial
         link = link_kind_for_device(port) or "usb"
-        links[side] = link
+        found.links[side] = link
         # A "bluetooth" link means the serial below is the dongle's, not the
         # glove's: the glove behind it is not a USB device, so the dongle is
         # what the registry and the calibration bindings key on.
-        print(
-            f"{side} device: link={link}  serial={serial}  port={port}")
+        if announce:
+            print(f"{side} device: link={link}  serial={serial}  port={port}")
+    return found
+
+
+def refresh_detected_hands(device_manager, registry: Path,
+                           present_sides: list[str], ports: dict[str, str],
+                           serials: dict[str, str],
+                           links: dict[str, str]) -> dict[str, bool]:
+    """Re-detect the bench, adopt the result, and report it to the selector.
+
+    What the calibration selector's Refresh button runs.  The detection is
+    *adopted*, not merely reported: the dialog can only draw its ✓/✗ from the
+    mapping returned here, while every open path in the live session --
+    ``PublishedHandState`` versus ``_AbsentHandRuntime``, the registry serial,
+    the calibration binding, the solver process's port -- reads those four
+    containers.  Updating the labels alone is why a glove powered on after
+    startup (or a Bluetooth dongle plugged in later) was shown as connected
+    and then opened no hand at all.
+
+    A hand that vanished is dropped just as it would be at startup: the four
+    containers always describe one detection, never a merge of two.
+    """
+
+    fresh = detect_gloves(device_manager, registry, announce=True)
+    fresh.adopt_into(present_sides, ports, serials, links)
+    remember_auto_links(fresh.auto_detected, registry)
+    return {side: side in present_sides for side in ("left", "right")}
+
+
+def remember_auto_links(auto_detected: dict[str, str], registry: Path) -> None:
+    """Persist hands found behind a link the registry does not know yet.
+
+    What the probe just worked out, so the next launch resolves the link by
+    serial instead of probing every unclaimed port again (up to two seconds
+    each).
+    """
+
+    for side, serial in auto_detected.items():
+        try:
+            set_glove_serial(side, serial, registry)
+        except Exception as exc:  # a read-only registry must not stop the run
+            print(f"[WARN] could not remember {side} link: {exc}",
+                  file=sys.stderr)
+        else:
+            print(f"{side} device: remembered {side} -> serial {serial}")
+
+
+def _run_live_session(args) -> int | str:
+    """Run one live-viewer session.
+
+    Returns an int exit code, ``"selector"`` when the in-app "back to the
+    calibration selector" button was pressed, or ``"calibrate"`` when the
+    selector's Calibrate button was (the launcher then runs the calibration
+    program, and afterwards re-opens the picker).
+    """
+    # Resolve each bound hand independently: a missing glove is skipped, not
+    # fatal.  Only when no glove at all is detected do we abort.
+    device_manager = DeviceManager(args.registry)
+    detected = detect_gloves(device_manager, args.registry, announce=True)
+    present_sides: list[str] = []
+    ports: dict[str, str] = {}
+    serials: dict[str, str] = {}
+    links: dict[str, str] = {}
+    detected.adopt_into(present_sides, ports, serials, links)
     if not present_sides:
         print("No STM32 glove connected; opening the calibration selector.", file=sys.stderr)
     else:
         print(f"Connected gloves: {', '.join(present_sides)}")
-    # Persist what the probe just worked out, so the next launch resolves the
-    # link by serial and skips the (up to two-second) port probe entirely.
-    for side, serial in auto_detected.items():
-        try:
-            set_glove_serial(side, serial, args.registry)
-        except Exception as exc:  # a read-only registry must not stop the run
-            print(f"[WARN] could not remember {side} link: {exc}", file=sys.stderr)
-        else:
-            print(f"{side} device: remembered {side} -> serial {serial}")
+    remember_auto_links(detected.auto_detected, args.registry)
 
     # Apply remembered calibration bindings first (serial -> calibration file),
     # so a previously-bound glove reuses its file on the next launch without a
@@ -2982,8 +2203,8 @@ def _run_live_session(args) -> int | str:
                 f"(serial {serials[side]})")
 
     # Prompt for sides lacking a calibration; --select-calibration forces the
-    # picker for every connected side.  The picker itself offers a Calibrate
-    # button that switches to the calibration program (returning "calibrate").
+    # picker for every connected side.  The picker's Refresh button re-detects
+    # USB presence, so a glove plugged in after startup can be bound here.
     if not args.no_select_calibration and not args.no_display:
         pick_sides = tuple(
             side for side in present_sides
@@ -2999,16 +2220,9 @@ def _run_live_session(args) -> int | str:
 
             def recheck_connection() -> dict[str, bool]:
                 """Re-detect USB presence for the Refresh button."""
-                status = {}
-                used_refresh_ports: set[str] = set()
-                for side in ("left", "right"):
-                    try:
-                        port, _ = device_manager.resolve_port(side)
-                        status[side] = port not in used_refresh_ports
-                        used_refresh_ports.add(port)
-                    except DeviceNotFoundError:
-                        status[side] = False
-                return status
+                return refresh_detected_hands(
+                    device_manager, args.registry,
+                    present_sides, ports, serials, links)
 
             try:
                 select_dir = args.calibration_dir or DEFAULT_CALIBRATION_DIR
@@ -3025,6 +2239,10 @@ def _run_live_session(args) -> int | str:
                 print(f"[Calibration selection error] {exc}", file=sys.stderr)
                 return 2
             if selected == "calibrate":
+                # The selector's Calibrate button: this session is over, and
+                # ``main()`` runs the calibration program before re-opening the
+                # selector.  Without this the button's answer fell through as
+                # whatever came next and the app just quit.
                 return "calibrate"
             if selected is None:
                 print("Calibration selection cancelled.")
@@ -3075,63 +2293,25 @@ def _run_live_session(args) -> int | str:
     else:
         separation_m = 0.30
 
+    # The calibration files are checked for presence here and for usability by
+    # the hand process itself: ``open_glove`` validates the file and reports an
+    # unusable one back as a fatal message, which the loop below turns into the
+    # same RuntimeError a parent-side probe used to raise.
     runtimes: dict[str, object] = {}
-    runtime_backend = None
-    registry: dict[str, dict] = {}
-    configs: dict[str, CalibrationSettings] = {}
     for side in ("left", "right"):
         if side not in present_sides:
             runtimes[side] = _AbsentHandRuntime(side)
-            registry[side] = {
-                "usb_serial": "",
-                "hardware_id": f"stm32-glove-{side}",
-                "channel_to_hand": [],
-            }
             continue
         if not calib_paths[side].is_file():
             raise RuntimeError(
                 f"Missing {side} calibration: {calib_paths[side]}")
-        config = load_calibration(calib_paths[side], side)
-        configs[side] = config
-        try:
-            # Parent-side probe: validate the calibration and lock the solver
-            # backend so both hands use the same pipeline.  The live solver
-            # runs in its own process (hand_solver_process) and is not shared.
-            solver = HandSolver(side, calib_paths[side], args.geometry)
-            selected_backend = solver.backend
-            if runtime_backend is None:
-                runtime_backend = selected_backend
-            elif runtime_backend["backend"] != selected_backend["backend"]:
-                raise RuntimeError("Left and right solver backends do not match")
-        except (OSError, ValueError, KeyError, RuntimeError) as exc:
-            raise RuntimeError(f"{side} calibration is not usable: {exc}") from exc
         runtimes[side] = PublishedHandState(side)
-        registry[side] = {
-            "usb_serial": serials[side],
-            "hardware_id": config.hardware_id,
-            "channel_to_hand": config.channel_to_hand,
-        }
-
-    if runtime_backend is None:
-        # No glove connected: the pipeline label and recording metadata below
-        # still need a backend name. hand_pinky_plus_2mm is the fixed local
-        # backend (algorithm/runtime_backend.py), so default to it rather than
-        # dereferencing None.
-        runtime_backend = {"backend": "hand_pinky_plus_2mm"}
 
     print(f"Left IMU calibration: {calib_paths['left'].resolve()}")
     print(f"Right IMU calibration: {calib_paths['right'].resolve()}")
+    print("Pipeline: sdk.open_glove -> 21 solved keypoints + finger force in "
+          "newtons")
 
-    if runtime_backend["backend"] == "hand_pinky_plus_2mm":
-        print("Pipeline: 32 raw IMUs -> protected HAND solver -> 42 keypoints")
-    elif runtime_backend["backend"] == "retargeted_direct":
-        print("Pipeline: 32 raw IMUs -> calibrated retargeting -> 42 keypoints")
-    elif runtime_backend["backend"] == "fitted_direct":
-        print("Pipeline: 32 raw IMUs -> fitted direct FK -> 42 keypoints")
-    else:
-        print("Pipeline: 32 raw IMUs -> protected direct FK -> 42 keypoints")
-
-    projector = SkeletonRenderer()
     right_view = LiveViewState(args.view_reference_config)
     view_state = LiveViewState(args.view_config)
     saved_view = (saved_display.get("view", {})
@@ -3153,15 +2333,10 @@ def _run_live_session(args) -> int | str:
     viewer = None
     startup_initialized = False
 
-    output_path = args.out or (
-        PROJECT_ROOT / "data/keypoints_21_bimanual" /
-        datetime.now().strftime("%Y%m%d_%H%M%S") / "chunk-000.parquet")
-    recording_session: BimanualRecordingSession | None = None
     # perf_counter (QPC) everywhere: time.monotonic ticks at ~15.6 ms on
-    # Windows here, which quantized the preview/recording gates to ~32 Hz.
-    # 1 ms timer resolution so time.sleep() actually sleeps what it is asked
-    # (the Windows default quantum is ~15.6 ms, which capped the main loop at
-    # ~30-60 Hz and limited recording to ~31.5 Hz).
+    # Windows here, which quantized the preview gate to ~32 Hz.  1 ms timer
+    # resolution so time.sleep() actually sleeps what it is asked (the Windows
+    # default quantum is ~15.6 ms, which capped the main loop at ~30-60 Hz).
     if sys.platform == "win32":
         import ctypes
         ctypes.windll.winmm.timeBeginPeriod(1)
@@ -3175,18 +2350,16 @@ def _run_live_session(args) -> int | str:
     started = time.perf_counter()
     processed_frame_index = 0
     state_lock = threading.Lock()
-    rec_lock = threading.Lock()
     stop_event = multiprocessing.Event()
-    # Held off until the viewer's startup direction capture finishes, then set
-    # for the rest of the session (cleared again if the user re-captures).  The
-    # magnetometer monitor lives in the solver process and owns the 30 s
-    # window, so it has to hear this from the GUI side.
-    mag_judge_event = multiprocessing.Event()
-    shared = SimpleNamespace(session=None, recorder_error=None)
-    hand_procs: dict[str, multiprocessing.Process] = {}
-    hand_queues: dict[str, multiprocessing.Queue] = {}
-    recorder = None
-    last_tactile_versions = {side: -1 for side in present_sides}
+    # One reader process per hand, and one queue back each.  A hand that is not
+    # connected has no runtime to feed and is never opened.
+    readers: dict[str, multiprocessing.Process] = {}
+    state_queues: dict[str, multiprocessing.Queue] = {}
+    # The force matrix the panel is currently showing, per hand, so a repeat of
+    # the same scan is not pushed again: the SDK re-attaches the newest scan to
+    # every attitude frame, and the panel would otherwise be redrawn at the
+    # attitude rate instead of the scan rate.
+    last_force_versions = {side: -1 for side in present_sides}
     # Last pose actually drawn per hand.  A hand that goes stale keeps its last
     # drawn pose while the other keeps moving, so a stalled link freezes one
     # hand instead of blanking the frame or freezing both.
@@ -3203,47 +2376,47 @@ def _run_live_session(args) -> int | str:
         side: None for side in present_sides}
     session_result: int | str = 0
     try:
-        # One solver process per hand: each owns its USB stream, tactile
-        # preprocessing and HAND solver on its own core/GIL, so solve bursts
-        # no longer preempt the GUI thread.  Published state flows back
-        # through a per-hand queue, drained keep-newest by the main loop.
+        # One reader process per hand: the SDK pipeline owns the link and the
+        # solve, and running it off the GUI's thread is what keeps a solve
+        # burst from preempting the draw.  A process per hand is also what keeps
+        # the two solvers off each other's GIL, and what stops a bursty link's
+        # backlog from being shared between the hands.  Published state flows
+        # back through one queue per hand, drained keep-newest by the main loop.
         for side in present_sides:
-            config = configs[side]
             # Live state is replaceable: cap IPC backlog so a slow GUI frame
             # cannot turn into visible pose latency on the following frames.
-            hand_queues[side] = multiprocessing.Queue(maxsize=8)
-            hand_procs[side] = multiprocessing.Process(
+            state_queue = multiprocessing.Queue(maxsize=8)
+            reader = multiprocessing.Process(
                 target=hand_solver_process,
-                args=(side, ports[side], config.usb_vid, config.usb_pid,
-                      calib_paths[side], args.geometry,
-                      solve_rate, hand_queues[side], stop_event,
-                      mag_judge_event),
-                name=f"solver-{side}",
+                args=(side, calib_paths, links, serials,
+                      args.registry, solve_rate, state_queue, stop_event),
+                name=f"sdk-{side}",
                 daemon=True,
             )
-            hand_procs[side].start()
-        recorder = threading.Thread(
-            target=recorder_loop,
-            args=(runtimes, present_sides, projector, args,
-                  state_lock, rec_lock, stop_event, shared),
-            name="recorder", daemon=True)
-        recorder.start()
+            state_queues[side] = state_queue
+            readers[side] = reader
+            reader.start()
         next_display = started
         display_interval = 1.0 / max(float(args.fps), 1.0)
         next_link_diag = started
         while True:
             now = time.perf_counter()
-            for side in present_sides:
+            if readers:
+                fatal = None
                 with state_lock:
-                    fatal = _drain_hand_queue(
-                        hand_queues[side], runtimes[side])
+                    for side in present_sides:
+                        fatal = _drain_hand_queue(
+                            state_queues[side], runtimes) or fatal
                 if fatal is not None:
                     raise RuntimeError(
-                        f"{side} solver process failed: {fatal['error']}")
-                if not hand_procs[side].is_alive():
-                    raise RuntimeError(
-                        f"{side} solver process exited unexpectedly "
-                        f"(exitcode={hand_procs[side].exitcode})")
+                        f"SDK {fatal.get('side') or ''} pipeline process "
+                        f"failed: {fatal['error']}")
+                for side in present_sides:
+                    reader = readers[side]
+                    if not reader.is_alive():
+                        raise RuntimeError(
+                            f"SDK {side} pipeline process exited unexpectedly "
+                            f"(exitcode={reader.exitcode})")
             snap = _snapshot(runtimes, present_sides, state_lock)
             if args.link_diag and now >= next_link_diag:
                 next_link_diag = now + 1.0
@@ -3261,10 +2434,11 @@ def _run_live_session(args) -> int | str:
                     previous_loss = prev_link_drops[side] or loss
                     prev_link_drops[side] = loss
                     latency = snap[side].get("latency")
-                    # ``None`` on firmware older than v1.2.11, which does not
-                    # answer the probe; a dash says so rather than 0 ms.
+                    # ``None`` on a Bluetooth link and on firmware older than
+                    # v1.2.11, neither of which answers the probe; a dash says so
+                    # rather than 0 ms.
                     latency_text = ("--" if latency is None
-                                    else f"{latency.rtt_ms:.2f}ms")
+                                    else f"{float(latency):.2f}ms")
                     # English, like every other terminal line in this file; the
                     # on-screen HUD is what carries the bilingual labels.
                     # ``loss+`` is frames the device sent that never arrived, in
@@ -3272,7 +2446,8 @@ def _run_live_session(args) -> int | str:
                     # bytes the parser binned, and the two are unrelated.
                     print(
                         f"[{side}] FPS {snap[side]['fps']:5.1f}  "
-                        f"DEV {snap[side]['device_fps']:5.1f} Hz  "
+                        f"IMU {snap[side]['device_fps']:5.1f} Hz  "
+                        f"TACT {snap[side]['tactile_fps']:5.1f} Hz  "
                         f"burst {float(health.get('burst_mean') or 0.0):4.1f}"
                         f"/poll (max {int(health.get('burst_max') or 0)})  "
                         f"gap<={float(health.get('gap_max_s') or 0.0):.3f}s  "
@@ -3285,14 +2460,14 @@ def _run_live_session(args) -> int | str:
                         f"lat {latency_text}",
                         flush=True)
             if viewer:
-                # Tactile frames arrive at ~70 Hz from the hand processes;
-                # push them to the overlay whenever a new one is published.
+                # The force panel follows the SDK's own scan counter, not the
+                # attitude frames the scan rides on.
                 for side in present_sides:
-                    if snap[side]["tactile_version"] != last_tactile_versions[side]:
-                        last_tactile_versions[side] = snap[side]["tactile_version"]
+                    if snap[side]["force_version"] != last_force_versions[side]:
+                        last_force_versions[side] = snap[side]["force_version"]
                         viewer.set_tactile_side(
-                            side, snap[side]["tactile"],
-                            snap[side]["tactile_raw"])
+                            side, _snap_force_or_none(snap, side),
+                            _snap_adc_or_none(snap, side))
             ready = all(
                 snap[side]["joints"] is not None
                 for side in present_sides)
@@ -3316,7 +2491,8 @@ def _run_live_session(args) -> int | str:
                 if palm_target_bases is None:
                     both_present = len(present_sides) == 2
                     if both_present:
-                        # Use the first frame on explicit relearn or a missing default, and persist it immediately.
+                        # Use the first frame on explicit relearn or a missing
+                        # default, and persist it immediately.
                         left_rotation = align_left_to_right_reference(
                             initial[0], initial[1])
                         initial_display = initial.copy()
@@ -3352,64 +2528,6 @@ def _run_live_session(args) -> int | str:
                             file=sys.stderr)
                 fixed_rotations = fixed_bimanual_display_rotations(
                     initial, palm_target_bases)
-                recording_metadata = {
-                    "mode": "bimanual_auto",
-                    "app_version": APP_VERSION,
-                    "sides": list(present_sides),
-                    "sample_fps": float(
-                        getattr(args, "record_fps", None) or args.fps),
-                    "devices": {
-                        side: {
-                            "usb_serial": registry[side]["usb_serial"],
-                            "hardware_id": registry[side]["hardware_id"],
-                            "channel_to_hand": registry[side]["channel_to_hand"],
-                        }
-                        for side in ("left", "right")
-                    },
-                    "calibration_files": {
-                        side: str(calib_paths[side].resolve())
-                        for side in ("left", "right")
-                    },
-                    "view": view_state_metadata(view_state),
-                    "display": {
-                        "recorded_source": "raw",
-                        "separation_m": separation_m,
-                        "palm_target_bases": palm_target_bases,
-                        "fixed_rotation_matrices": np.stack([
-                            (rotation.as_matrix() if rotation is not None
-                             else np.eye(3))
-                            for rotation in fixed_rotations
-                        ]),
-                        "stabilize_palm_bases": False,
-                        "left_root_rotvec_sign": left_root_rotvec_sign,
-                        "right_root_rotvec_sign": right_root_rotvec_sign,
-                        "default_config": str(args.display_config.resolve()),
-                    },
-                    "kinematics": {
-                        "type": runtime_backend["backend"],
-                        "geometry": str(Path(args.geometry).resolve()),
-                    },
-                    "public_interfaces": [
-                        "RawImuStream", "TactileStream", "HandSolver.process"
-                    ],
-                }
-                recording_session = BimanualRecordingSession(
-                    output_path, args.episode_index, args.task_index,
-                    args.checkpoint_frames,
-                    serials={
-                        side: registry[side]["usb_serial"]
-                        for side in ("left", "right")
-                    },
-                    metadata=recording_metadata,
-                    enabled=not args.no_save,
-                )
-                with rec_lock:
-                    shared.session = recording_session
-                if args.record_on_start:
-                    with rec_lock:
-                        recording_session.start(now)
-                    print(
-                        f"Automatic adaptive recording started: {recording_session.output_path}")
                 if not args.no_display:
                     viewer = BimanualViewer(
                         view_state, initial,
@@ -3419,11 +2537,9 @@ def _run_live_session(args) -> int | str:
                         left_root_rotvec_sign=left_root_rotvec_sign,
                         right_root_rotvec_sign=right_root_rotvec_sign,
                         display_config_path=None,
-                        recording_enabled=not args.no_save,
-                        recording_state=recording_session.state,
                         present_sides=present_sides,
                         display_mode=args.display_mode,
-                        mag_judge_event=mag_judge_event,
+                        stop_event=stop_event,
                         redraw_interval_s=1.0 / max(float(args.fps), 1.0))
                 startup_initialized = True
             if any_fresh and now >= next_display:
@@ -3434,22 +2550,16 @@ def _run_live_session(args) -> int | str:
                             statuses[side] = {
                                 "fps": snap[side]["fps"],
                                 "device_fps": snap[side]["device_fps"],
+                                "tactile_fps": snap[side]["tactile_fps"],
                                 "link_health": snap[side]["link_health"],
-                                "missing": snap[side]["missing"],
-                                "broken": snap[side]["broken"],
                                 "safety": snap[side]["safety"],
                                 "contact": snap[side]["contact"],
                                 "warming_up": snap[side]["warming_up"],
                                 "warmup_remaining_s": snap[side]["warmup_remaining_s"],
                                 "warmup_completed": snap[side]["warmup_completed"],
-                                "warmup_timed_out": snap[side]["warmup_timed_out"],
-                                "raw_present": snap[side]["raw_present"],
-                                "mag_levels": snap[side]["mag_levels"],
-                                "mag_unread": snap[side]["mag_unread"],
-                                "mag_prompt": snap[side]["mag_prompt"],
                                 "firmware_version": snap[side]["firmware_version"],
                                 "latency": snap[side]["latency"],
-                                "link": links.get(side, "usb"),
+                                "link": snap[side]["link_kind"],
                                 "connected": True,
                                 # Abnormal, so the HUD shows it: this hand's
                                 # pose above is the last good one, not this
@@ -3459,28 +2569,18 @@ def _run_live_session(args) -> int | str:
                         else:
                             statuses[side] = {
                                 "fps": 0.0, "device_fps": 0.0,
+                                "tactile_fps": 0.0,
                                 "link_health": None,
-                                "missing": snap[side]["missing"],
-                                "broken": [],
                                 "safety": False, "contact": None,
                                 "warming_up": False,
                                 "warmup_remaining_s": 0.0,
                                 "warmup_completed": False,
-                                "warmup_timed_out": False,
-                                "raw_present": None,
-                                "mag_levels": None,
-                                "mag_unread": None,
-                                "mag_prompt": None,
                                 "firmware_version": None,
                                 "latency": None,
                                 "link": "usb",
                                 "connected": False,
                                 "stale": False,
                             }
-                    frame_count = 0
-                    with rec_lock:
-                        if shared.session is not None:
-                            frame_count = shared.session.frame_count
                     # Refresh only the hands that are fresh.  A stale hand keeps
                     # its last drawn pose, so it freezes in place while the
                     # other keeps moving -- the alternative, a NaN slot, makes
@@ -3502,7 +2602,7 @@ def _run_live_session(args) -> int | str:
                         shown[side] = entry
                     viewer.update_both(
                         shown["left"][0], shown["right"][0],
-                        frame_count, statuses,
+                        processed_frame_index, statuses,
                         mesh_slots=[shown["left"][1], shown["right"][1]])
                 processed_frame_index += 1
                 # Fixed-timestep accumulator.  Resetting from `now` added the
@@ -3521,58 +2621,23 @@ def _run_live_session(args) -> int | str:
 
             if viewer:
                 keep_running = viewer.tick()
-                action = viewer.consume_record_action()
-                if action == "start":
-                    with rec_lock:
-                        session = shared.session
-                        if (session is not None
-                                and session.start(time.perf_counter())):
-                            viewer.set_recording_state("recording", 0)
-                            print(
-                                f"Adaptive recording started: {session.output_path}")
-                elif action == "stop":
-                    with rec_lock:
-                        session = shared.session
-                        if session is not None:
-                            saved = session.stop_and_save(
-                                view_state_metadata(view_state))
-                            viewer.set_recording_state(
-                                "saved", session.frame_count)
-                            if saved is not None:
-                                print(f"Adaptive recording saved: {saved}")
-                            else:
-                                print(
-                                    "No valid bimanual frames; no file was created.")
                 if viewer.consume_selector_request():
                     session_result = "selector"
                     break
                 if not keep_running:
                     break
-            if shared.recorder_error is not None:
-                _, error_value, error_tb = shared.recorder_error
-                raise error_value.with_traceback(error_tb)
             # Deadline-aware pacing: sleep only until the next display slot
             # (clamped 1-10 ms) instead of a fixed 10 ms.  When the loop runs
-            # behind the 65 Hz gate the fixed sleep was pure overhead; the
-            # floor avoids busy-waiting when there is nothing due.
+            # behind the gate the fixed sleep was pure overhead; the floor
+            # avoids busy-waiting when there is nothing due.
             time.sleep(max(
                 0.001, min(0.010, next_display - time.perf_counter())))
     finally:
         stop_event.set()
-        for proc in hand_procs.values():
-            proc.join(timeout=5.0)
-            if proc.is_alive():
-                proc.terminate()
-        if recorder is not None:
-            recorder.join(timeout=3.0)
-        with rec_lock:
-            session = shared.session
-            if (session is not None
-                    and session.state == "recording"):
-                saved = session.stop_and_save(
-                    view_state_metadata(view_state))
-                if saved is not None:
-                    print(f"Adaptive recording saved: {saved}")
+        for reader in readers.values():
+            reader.join(timeout=5.0)
+            if reader.is_alive():
+                reader.terminate()
         if viewer:
             viewer.close()
     elapsed = time.perf_counter() - started
@@ -3585,6 +2650,7 @@ def _run_live_session(args) -> int | str:
 
 def _run_calibration_session(args) -> int | str:
     """Run one calibration-GUI session; returns ``"done"`` or an exit code."""
+
     from gui import imu_calibration_gui
     calib_args = imu_calibration_gui._parse_args([])
     calib_args.registry = Path(args.registry)
@@ -3601,7 +2667,9 @@ def main(argv=None):
     while True:
         # The live session opens the calibration-file selector (with a
         # Calibrate button).  Selecting files -> live viewer -> exit code;
-        # Calibrate -> run the calibration program -> loop back to the selector.
+        # Calibrate -> run the calibration program -> loop back to the
+        # selector; the in-app "back to selector" button loops back into a
+        # fresh live session (which re-opens the selector).
         result = _run_live_session(args)
         if result == "calibrate":
             result = _run_calibration_session(args)
@@ -3609,8 +2677,6 @@ def main(argv=None):
                 continue
             return result
         if result == "selector":
-            # The in-app "back to selector" button: force a re-pick and loop
-            # back into a fresh live session (which re-opens the selector).
             args.select_calibration = True
             continue
         return result

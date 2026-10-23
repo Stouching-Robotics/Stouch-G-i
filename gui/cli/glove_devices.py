@@ -13,13 +13,22 @@ def _sdk_root(start):
             return parent
     raise RuntimeError("cannot locate SDK root")
 
-PROJECT_ROOT = _sdk_root(Path(__file__).resolve().parent)
+# The walk-up has to be *behind* the frozen test, not in front of it (the
+# sibling viewers do it this way): frozen, the modules live inside the bundle's
+# archive, so ``__file__`` and every parent of it are fiction and the walk
+# raises before the frozen branch is ever reached.  That is exactly how this
+# command used to die inside the packaged app -- ``Stouch_glove_toolkit.exe
+# devices`` printed ``cannot locate SDK root`` and quit.  What is real frozen is
+# ``_MEIPASS`` for imports and the exe's own folder for data.
 if getattr(sys, "frozen", False):
-    PROJECT_ROOT = Path(sys._MEIPASS)
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+    BUNDLE_ROOT = Path(sys._MEIPASS)
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    BUNDLE_ROOT = PROJECT_ROOT = _sdk_root(Path(__file__).resolve().parent)
+if str(BUNDLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(BUNDLE_ROOT))
 
-from glove_io.device_registry import (  # noqa: E402
+from sdk.device import (  # noqa: E402
     DEFAULT_REGISTRY,
     GloveDeviceError,
     clear_glove_bindings,

@@ -98,7 +98,7 @@ _LIVE_FRAME_LO, _LIVE_FRAME_HI, _LIVE_FRAME_SAMPLES = 0.28, 0.70, 42
 
 
 def _default_calibration_path(side: str) -> Path:
-    name = "imu_2d_calibration.json" if side == "left" else "imu_calibration.json"
+    name = "imu_2d_calibration.json" if side == "left" else "imu_default_right.json"
     return PROJECT_ROOT / "calibration" / name
 
 

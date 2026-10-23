@@ -54,7 +54,7 @@ from gui.live_3d_bimanual import (  # noqa: E402
 from gui.rendering.tactile_overlay import (  # noqa: E402
     draw_bimanual_tactile_overlay,
 )
-from glove_io.session import load_session_metadata  # noqa: E402
+from sdk.io.session import load_session_metadata  # noqa: E402
 
 N_HANDS, N_KPTS = 2, 21
 W, H = 1280, 720

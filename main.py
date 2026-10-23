@@ -10,8 +10,12 @@ Passing a known application name dispatches to that application, equivalent to
 the old ``python -m apps.entrypoint <app>``::
 
     python main.py devices
-    python main.py calibration
+    python main.py live_3d
     python main.py replay data/.../chunk-000.parquet
+
+This is the client edition: the SDK hands over solved joint positions in metres
+and finger force in newtons plus pressure ADC, so the raw-IMU and magnetometer
+programs (and the pressure-fit writer) are not part of this toolkit.
 
 Any other leading argument is forwarded to the live-3D viewer together with
 ``--select-calibration``.
@@ -81,13 +85,10 @@ def _install_crash_log() -> None:
 
 _APPLICATIONS = {
     "devices": ("gui.cli.glove_devices", "main"),
-    "imu_live": ("gui.imu_live", "main"),
-    "imu_live_bimanual": ("gui.imu_live_bimanual", "main"),
-    "calibration": ("gui.imu_calibration_gui", "main"),
     "live_3d": ("gui.live_3d", "main"),
     "live_3d_bimanual": ("gui.live_3d_bimanual", "main"),
     "live_3d_bimanual_auto": ("gui.live_3d_bimanual_auto", "main"),
-    "tactile": ("gui.tactile_live", "main"),
+    "calibration": ("gui.imu_calibration_gui", "main"),
     "replay": ("gui.rendering.replay", "main"),
 }
 
@@ -104,16 +105,7 @@ def run_application(name: str, argv: list[str] | None = None) -> int:
         # render window) instead of argparse's usage error.
         from gui.replay_launcher import run
         return run()
-    if name == "imu_live":
-        previous = sys.argv
-        try:
-            sys.argv = [module_name, *args]
-            result = function()
-        finally:
-            sys.argv = previous
-    else:
-        result = function(args)
-    return int(result or 0)
+    return int(function(args) or 0)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -60,7 +60,7 @@ from common.enums import (  # noqa: E402
     MoCapCalibrateShapeType,
     MoCapCalibrateFistType,
 )
-from glove_io.device_registry import (  # noqa: E402
+from sdk.io.device_registry import (  # noqa: E402
     GloveDeviceError,
     clear_glove_bindings as _clear_registry_bindings,
     link_kind_of,

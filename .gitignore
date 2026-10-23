@@ -3,6 +3,12 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 本机环境与运行数据
+.venv/
+.pytest_cache/
+data/
+*.log
+
 # 固件只分发原始 .bin 镜像，不分发 Intel HEX（.hex）
 *.hex
 
