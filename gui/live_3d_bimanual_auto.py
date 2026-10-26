@@ -2339,8 +2339,11 @@ def _run_live_session(args) -> int | str:
                 f"Missing {side} calibration: {calib_paths[side]}")
         from sdk.calibration import prepare_viewer_calibration
         calib_paths[side] = prepare_viewer_calibration(calib_paths[side], side)
-        config = load_calibration(calib_paths[side], side)
-        shape = config.param_shape_calib or {}
+        # Profile resolution already validates the file and hand side. Only
+        # metadata is needed here; the worker owns the solver configuration.
+        shape = json.loads(
+            calib_paths[side].read_text(encoding="utf-8-sig")
+        ).get("param_shape_calib") or {}
         pose_postprocess[side] = (
             "sensor-motion-refit-v1" if "sensor_motion_refit" in shape
             else "gesture-retarget-v1" if "gesture_retarget" in shape
