@@ -68,3 +68,31 @@ def from_snapshot(snapshot: MagTelemetrySnapshot | None) -> MagStatus | None:
         seen=tuple(snapshot.level_seen),
         ready=bool(snapshot.ready),
     )
+
+
+class MagCalibrationDropMonitor:
+    """Edges in actual fresh physical-channel levels, independent of pose motion.
+
+    A partial report does not mean a missing channel lost calibration. Repeated
+    cached 0x05 reports are ignored. Recovery to 3 arms the next falling edge.
+    """
+    def __init__(self):
+        self._levels = [None] * 16
+        self._last_report = None
+
+    def update(self, report: MagStatus | None) -> tuple[tuple[int, int], ...]:
+        if report is None:
+            return ()
+        key = (report.host_timestamp_us, report.device_timestamp_us, report.sequence)
+        if key == self._last_report:
+            return ()
+        self._last_report = key
+        dropped = []
+        for channel, fresh in enumerate(report.fresh):
+            if not fresh:
+                continue
+            level = (report.frame_levels_raw[channel] >> MAG_LEVEL_SHIFT) & MAG_LEVEL_MASK
+            if self._levels[channel] == MAG_READY_LEVEL and level < MAG_READY_LEVEL:
+                dropped.append((channel, level))
+            self._levels[channel] = level
+        return tuple(dropped)

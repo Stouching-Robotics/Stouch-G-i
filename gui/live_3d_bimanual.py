@@ -124,10 +124,10 @@ def resolve_calibration_paths(
                  else find_latest_hand2mm_calibration(folder, "right"))
     else:
         left = (Path(left_calib) if left_calib is not None
-                else DEFAULT_CALIBRATION_DIR / "imu_2d_calibration.json")
+                else DEFAULT_CALIBRATION_DIR / "imu_calibration_left.json")
         right = (Path(right_calib) if right_calib is not None
                  else DEFAULT_CALIBRATION_DIR
-                 / "imu_calibration_right_default.json")
+                 / "imu_calibration_right.json")
     return {"left": left.expanduser(), "right": right.expanduser()}
 
 
@@ -686,8 +686,8 @@ def main(argv=None):
         if not calib_paths[side].is_file():
             raise RuntimeError(
                 f"Missing {side} calibration: {calib_paths[side]}")
-        # Parsed only to reject an unreadable or wrong-side calibration before
-        # the SDK is asked to open a glove with it.
+        from sdk.calibration import prepare_viewer_calibration
+        calib_paths[side] = prepare_viewer_calibration(calib_paths[side], side)
         load_calibration(calib_paths[side], side)
         runtimes[side] = HandRuntime(
             side=side, smoother=JointPositionSmoother(0.035))
@@ -845,6 +845,19 @@ def main(argv=None):
                         display_mode=args.display_mode,
                         initial_mesh_vertices=hands["right"].mesh_vertices_m,
                         redraw_interval_s=1.0 / max(args.fps, 1.0))
+                    def set_contacts(enabled, blend):
+                        for hand in hands.values():
+                            hand.set_contact_controls(enabled, blend)
+                    def set_root_limits(enabled):
+                        for hand in hands.values():
+                            hand.set_root_limits_enabled(enabled)
+                    viewer.bind_root_limits(set_root_limits)
+                    viewer.bind_contact_controls(
+                        set_contacts,
+                        experimental=any(hand.backend.get('pose_postprocess') == 'gesture-retarget-v1'
+                                         for hand in hands.values()),
+                        source_refit=any(hand.backend.get('pose_postprocess') == 'sensor-motion-refit-v1'
+                                         for hand in hands.values()))
                 startup_initialized = True
             if fresh and now >= next_sample:
                 if viewer:

@@ -1,57 +1,59 @@
 # Stouch Glove 跨平台工具包（Stouch-G-i）
 
-Stouch-G-i 是 GitHub 半开源用户发行仓库，提供 SDK/GUI 源码与受保护的算法模块，用于数据手套设备识别、姿态标定、21 关键点求解、触觉显示及已有数据回放。
+Stouch-G-i 是 GitHub 半开源用户发行仓库，提供 SDK／GUI 源码与受保护算法，用于设备识别、佩戴标定、21 关键点解算、压力／力值显示及已有数据回放。
 
-当前 SDK 版本：`2.3.1`；GUI 版本：`2.0.11`。
+SDK：`2.3.1`；GUI：`2.0.12`；文档日期：`2026-10-26`。本版为 PyArmor 9.2.8 trial 试用／测试交付。
 
-本仓库提供可直接运行的用户版源码，桌面 EXE 使用独立发行包。
+本仓库根目录直接对应 Python SDK 根目录。所有安装和运行命令均在 `Stouch-G-i/` 内执行；桌面 EXE 由独立发行包提供。
+
+**验证状态：**公开接口与示例已完成静态核对和模拟验证。Windows 明文及保护 SDK 的离线解算、GUI 控件和回放检查通过；配套桌面包的 EXE 启动与合成回放检查通过。Linux 和手套硬件未测试，示例尚未连接设备验证。
 
 ## 主要功能
 
-- 设备发现与左右手绑定，支持 USB / 蓝牙链路自动选择。
-- GUI 单手/双手 IMU 标定，单手、双手及自适应双手 3D 实时显示。
-- 输出 21×3 手部关键点（米）、16×16 触觉 ADC 和拟合力值（牛顿）。
-- 回放已有 Parquet 数据，并渲染 MP4 / PNG。
-- 通过 `sdk.open_glove` / `sdk.open_bimanual` 集成用户帧。
+- USB／蓝牙 dongle 设备发现与左右手绑定。
+- 单手／双手标定，单手、双手及自适应实时 3D 显示。
+- 输出 `(21, 3)` 关键点（米）、`(16, 16)` 压力 ADC（计数）与拟合力值（牛顿）。
+- 新佩戴标定保存补偿与对指兜底，计算后通过独立返回平展验证才可保存。
+- 四指关节约束默认开启；对指修正默认开启，Blend `1.0`，可通过 GUI 或 SDK 调节。
+- 回放已有 Parquet，渲染 MP4／PNG；通过 `sdk.open_glove()` / `sdk.open_bimanual()` 集成用户帧。
 
 ## 目录结构
 
-所有安装和运行命令均在 `Stouch-G-i` 仓库根目录执行：
-
 ```text
 Stouch-G-i/
-├── README.md
-├── .gitignore
-├── main.py                       # GUI 与设备管理统一入口
-├── replay_entry.py               # 回放辅助入口
-├── requirements.txt              # Python 3.10 依赖
-├── sdk/                          # 用户 SDK
-│   └── io/                       # 内部通信、协议与数据文件处理
-├── algorithm/                    # 含受保护模块的标定与求解算法
-├── common/                       # 公共类型、常量和路径工具
-├── gui/                          # 标定、实时显示和回放
-├── assets/                       # 手部模型、几何与显示资源
-├── calibration/                  # 随包标定及用户标定结果
-├── config/                       # 设备绑定、标定绑定和显示配置
-├── firmware/                     # 固件文件
-└── pyarmor_runtime_000000/        # Windows / Linux x86_64 保护运行时
+├─ README.md
+├─ main.py                       # GUI 与设备管理入口
+├─ replay_entry.py               # 回放辅助入口
+├─ requirements.txt              # Python 3.10 依赖
+├─ sdk/                          # 用户 SDK
+├─ algorithm/                    # 含受保护模块的标定与解算实现
+├─ common/                       # 类型、常量与资源路径
+├─ gui/                          # 标定、实时显示和回放
+├─ assets/                       # 模型与显示资源，含模型许可
+├─ calibration/                  # canonical 双手默认文件及用户标定
+├─ config/                       # 设备、标定绑定与显示配置
+├─ firmware/
+└─ pyarmor_runtime_000000/        # 对应平台的算法保护运行时
 ```
+
+本仓库不额外嵌套 `src/`，也不包含 `release/` 或桌面 EXE。
 
 ## 环境与安装
 
-使用 **Python 3.10 x86_64**。首次安装需要网络和 Git；`manotorch` 从固定 GitHub commit 安装。依赖包括 CPU 版 PyTorch、NumPy、SciPy、PySide6、OpenCV、Polars 和串口库。
+使用 **Python 3.10 x86_64**。首次安装需要网络与 Git；`manotorch` 从固定 Git 提交安装。随包依赖包含 CPU PyTorch、NumPy、SciPy、PySide6、OpenCV、Polars 与串口库。
 
 ### Windows
 
 ```powershell
 py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -c "import sdk, gui; print(sdk.get_version(), gui.APP_VERSION)"
+python -c "import sdk, gui; print(sdk.get_version(), gui.APP_VERSION); print(sdk.__file__)"
 ```
 
-如 `chumpy==0.70` 构建失败，在已激活的环境中执行后重试：
+预期版本输出为 `2.3.1 2.0.12`，模块路径应位于本仓库。
+
+如 `chumpy==0.70` 构建失败，可在已激活环境中执行后重试：
 
 ```powershell
 python -m pip install numpy==1.22.4 scipy==1.11.4 six
@@ -59,101 +61,110 @@ python -m pip install --no-build-isolation --no-deps chumpy==0.70
 python -m pip install -r requirements.txt
 ```
 
-### Linux
+### Linux（安装参考，未测试）
 
-先安装 Python 3.10、Git 和对应发行版的 Qt/XCB 运行依赖（如 `libxcb-cursor0`）：
+先安装 Python 3.10、Git 和发行版需要的 Qt/XCB 依赖（例如 `libxcb-cursor0`），并配置串口权限：
 
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -c "import sdk, gui; print(sdk.get_version(), gui.APP_VERSION)"
+python -c "import sdk, gui; print(sdk.get_version(), gui.APP_VERSION); print(sdk.__file__)"
 ```
 
-请按部署环境配置串口设备权限。包内包含 Linux x86_64 保护运行时；Linux 尚未实机验收。Windows 与 Linux 使用相同的 `python main.py ...` 命令。
+保护运行时面向 Windows / Linux x86_64；随附运行时不代表 Linux 已完成验收。
 
 ## 手部模型（MANO）
 
-21 关键点求解与 3D 显示使用随包分发的 MANO 模型及派生资源：
+关键点解算与 3D 显示使用以下随包资源：
 
 | 文件 | 用途 |
-|---|---|
-| [MANO_LEFT.pkl](assets/hand/models/MANO_LEFT.pkl) / [MANO_RIGHT.pkl](assets/hand/models/MANO_RIGHT.pkl) | 官方模型资源 |
-| [HAND_LEFT_PINKY_PLUS_2MM.npz](assets/hand/HAND_LEFT_PINKY_PLUS_2MM.npz) / [HAND_RIGHT_PINKY_PLUS_2MM.npz](assets/hand/HAND_RIGHT_PINKY_PLUS_2MM.npz) | 求解与显示使用的派生网格 |
+| --- | --- |
+| [HAND_LEFT_PINKY_PLUS_2MM.npz](assets/hand/HAND_LEFT_PINKY_PLUS_2MM.npz) / [HAND_RIGHT_PINKY_PLUS_2MM.npz](assets/hand/HAND_RIGHT_PINKY_PLUS_2MM.npz) | 左右手派生骨架、网格与前向运动学资源 |
+| [MANO_LEFT.pkl](assets/hand/models/MANO_LEFT.pkl) / [MANO_RIGHT.pkl](assets/hand/models/MANO_RIGHT.pkl) | 手部模型资源，用于网格显示 |
 
-MANO 由 Max-Planck 提供，许可限非商业科研/教育等用途；完整条款见 [assets/hand/LICENSE.txt](assets/hand/LICENSE.txt)。商业用途请联系 Max-Planck（ps-license@tue.mpg.de）。
+请保留文件名、目录结构及 [assets/hand/LICENSE.txt](assets/hand/LICENSE.txt)。模型与派生资源须遵守随附 MANO 许可；用途范围及商业授权条件以原文为准。另见 [资源说明](assets/hand/README.md)。
 
 ## 设备绑定
 
-插入手套后查看设备，将下面的占位字符串替换为对应设备的 USB 序列号：
+插入设备后列举并登记，将占位字符串替换为设备序列号：
 
 ```powershell
 python main.py devices --list
-python main.py devices --set-serial left --serial "LEFT_USB_SERIAL"
-python main.py devices --set-serial right --serial "RIGHT_USB_SERIAL"
+python main.py devices --set-serial left --serial "LEFT_DEVICE_SERIAL"
+python main.py devices --set-serial right --serial "RIGHT_DEVICE_SERIAL"
 python main.py devices --check-both
 ```
 
-绑定保存在 `config/glove_devices.json`。需要重新绑定时，可用 `python main.py devices --clear` 清空记忆，再按上述步骤设置。
+绑定位于 `config/glove_devices.json`；`python main.py devices --clear` 清除登记后可重新配置。`link="auto"` 同时发现 USB 与蓝牙时优先 USB。无线使用前断开手套 USB，并保持 dongle 与手套配对；蓝牙登记使用 dongle 序列号。同一串口只由一个程序占用。
 
 ## GUI 与命令行用法
 
-`main.py` 的应用白名单为 `devices`、`calibration`、`live_3d`、`live_3d_bimanual`、`live_3d_bimanual_auto`、`replay`。
-
-| 功能 | 命令 |
-|---|---|
-| 标定选择器 → 自适应单手/双手 3D | `python main.py` |
+| 用途 | 命令 |
+| --- | --- |
+| 标定选择器 → 自适应单手／双手 3D | `python main.py` |
 | 标定 GUI（默认右手） | `python main.py calibration` |
 | 左手标定 GUI | `python main.py calibration --side left` |
-| 单手 3D，并选择标定 | `python main.py live_3d --side right --select-calibration` |
-| 双手 3D，并选择标定 | `python main.py live_3d_bimanual --select-calibration` |
-| 自适应实时 3D，复用有效标定记忆 | `python main.py live_3d_bimanual_auto` |
-| 自适应实时 3D，强制重选标定 | `python main.py live_3d_bimanual_auto --select-calibration` |
-| 回放文件选择器 | `python main.py replay` |
-| 将已有 Parquet 渲染为 MP4 | `python main.py replay "recording.parquet" --out "preview.mp4"` |
-| 将指定帧渲染为 PNG | `python main.py replay "recording.parquet" --frame 0` |
+| 单手 3D 并选择标定 | `python main.py live_3d --side right --select-calibration` |
+| 双手 3D 并选择标定 | `python main.py live_3d_bimanual --select-calibration` |
+| 自适应 3D，复用有效标定记忆 | `python main.py live_3d_bimanual_auto` |
+| 自适应 3D，强制重新选择 | `python main.py live_3d_bimanual_auto --select-calibration` |
+| 回放选择器 | `python main.py replay` |
+| 已有 Parquet → MP4 | `python main.py replay "recording.parquet" --out "preview.mp4"` |
+| 指定帧 → PNG | `python main.py replay "recording.parquet" --frame 0` |
 
-回放示例中的 `recording.parquet` 是用户提供的已有文件；请替换为实际路径。PNG 输出固定为输入文件同目录的 `preview_frame0.png`。
+`recording.parquet` 为用户已有文件的占位路径。PNG 写入输入文件同目录的 `preview_frame0.png`。可调度的应用为 `devices`、`calibration`、`live_3d`、`live_3d_bimanual`、`live_3d_bimanual_auto`、`replay`。
 
 ### 标定文件如何选择
 
-- GUI 选择器按左右手筛选兼容文件，并按修改时间从新到旧列出。自适应实时程序通过 `config/calibration_bindings.json` 记忆设备序列号对应的标定；`python main.py` 会强制进入选择器。
-- GUI 未指定文件/标定目录、未经过选择且无有效标定绑定时，文件回退值为左手 `calibration/imu_2d_calibration.json`、右手 `calibration/imu_calibration_right_default.json`。
-- API 省略标定参数时，在仓库 `calibration/`（或 `calibration_dir`）内按左右手和 HAND2mm 兼容性筛选，取修改时间最新的文件；时间相同再按文件名排序取最大值。API 不使用 GUI 的标定绑定。
-- 随包提供多份标定。建议使用 GUI 生成适配当前手套的文件，并在集成时显式指定，避免文件修改时间变化影响选择。以下示例显式选用随包文件，实际使用请换成对应手套的标定。
+- canonical 双手默认文件为 `calibration/imu_calibration_left.json` 和 `calibration/imu_calibration_right.json`。随包文件包含佩戴校正及通过的平展验证记录，是具体佩戴的示例，应为当前手套重新标定。
+- GUI 按手别筛选、按修改时间列出标定。自适应程序通过 `config/calibration_bindings.json` 记忆设备对应文件；`python main.py` 强制打开选择器。
+- API 显式 `calibration` 优先；否则在 `calibration_dir`（默认本仓库 `calibration/`）下筛选当前手别的 HAND2mm JSON。存在可用 canonical 文件时，排除旧默认兼容别名，再与新增标定按修改时间取最新；时间相同时取文件名排序较大者。不递归扫描子目录。
+- API 不读取 GUI 标定绑定，显式加载旧文件也不会自动改为其他配套。正式集成建议显式指定文件，避免复制／更新时间后选到另一份。
+
+### 新标定与运行控制
+
+按向导完成根部转动、安装平展、四次对指、握拳等步骤；计算后回到安装平展的手型与手腕朝向，静止完成独立验证，通过才可保存。返回平展只验收，不重新拟合。计算失败暂停自动采集；采集或末次验证失败可按提示静止重采，亦可取消自动采集查看原因。
+
+旧文件保持可读，GUI 会区分佩戴校正、已有配套校正与旧标定兼容；多个配套需显式选择。旧文件读取成功不代表取得新版平展验收。
+
+“四指关节约束”默认开启，限制食指、中指、无名指和小指的指根扭转、侧偏及关节屈伸。“对指兜底”（旧标定可能显示“对指吸附”）默认开启、Blend 100%。对新佩戴校正文件，关闭对指或将 Blend 设为 0 只关闭接触修正，佩戴补偿和末两节单轴约束继续生效。对指修正不代表完整碰撞保证或真实指尖精度验收。
 
 ## Python SDK
 
-推荐从 `sdk` 导入 `open_glove` / `open_bimanual`。单手默认 `side="right"`、`link="auto"`、`sample_rate_hz=80`、`include_tactile=True`、`smoothing_ms=35.0`。可用 `calibration` 显式指定文件，或用 `calibration_dir` 指定扫描目录。
+使用 `from sdk import open_glove, open_bimanual`。单手默认 `side="right"`、`link="auto"`、`sample_rate_hz=80`、`include_tactile=True`、`smoothing_ms=35.0`。`sample_rate_hz` 是配置默认值，不是稳定 80 Hz 保证。
 
-用户版 `HandFrame` 字段如下：
+用户 `HandFrame` 保持 16 个字段：
 
 | 字段 | 含义 |
-|---|---|
-| `side`、`sequence`、`timestamp_us` | 左右手、帧序号与微秒时间戳 |
-| `joints_raw_m`、`joints_smoothed_m` | 未平滑/已平滑的关键点，均为 `(21, 3)`，单位米 |
-| `tactile_adc` | `(16, 16)` 原始 12-bit 触觉 ADC，计数范围 0–4095；无扫描时为 `None` |
-| `force_n` | `(16, 16)` 拟合力值，单位牛顿；未拟合区域为 `NaN`，无扫描时为 `None` |
-| `force_fresh` | 上述 ADC 与力值共用的新鲜度标志，`False` 时可能沿用之前的扫描 |
-| `status` | 求解状态；`details["warming_up"]` 为真时，关键点为预热占位姿态 |
-| `firmware_version`、`link_kind` | 固件版本（可能为 `None`）与当前链路类型 |
-| `device_fps`、`tactile_fps` | 姿态帧与触觉扫描各自的到达帧率 |
-| `link_drops`、`link_errors` | 链路丢帧与错误统计字典 |
-| `latency_ms` | 延迟估计，可能为 `None` |
+| --- | --- |
+| `side`、`sequence`、`timestamp_us` | 手别、逐手帧序号、SDK 微秒时间线 |
+| `joints_raw_m`、`joints_smoothed_m` | `float32 (21, 3)`，腕心关键点，米；后者进一步低通平滑 |
+| `force_n` | `float32 (16, 16)` 牛顿；无拟合覆盖为 `NaN`，无扫描为 `None` |
+| `tactile_adc` | `float32 (16, 16)` 原始 12-bit 计数 0–4095，无扫描为 `None` |
+| `status` | 解算状态；通过 `details.get("warming_up", False)` 跳过预热占位姿态 |
+| `force_fresh` | ADC／力值共享的新扫描标志；旧扫描可附在后续姿态帧中 |
+| `firmware_version`、`link_kind` | 固件上报字符串（可为 `None`）与链路 |
+| `device_fps`、`tactile_fps` | 姿态帧与压力扫描各自的主机到达率，Hz |
+| `link_drops`、`link_errors` | 链路统计字典，按 `.get()` 读取 |
+| `latency_ms` | 往返探测时延，毫秒；未知／蓝牙为 `None` |
 
-`force_fresh` 同时适用于 `tactile_adc` 与 `force_n`；累计或滤波时只处理新扫描，并跳过非有限力值。SDK 版本与固件版本独立，SDK 版本可用 `sdk.get_version()` 查询。
+关键点 `0` 为腕，`1–4` 为拇指，`5–8` 为食指，`9–12` 为中指，`13–16` 为无名指，`17–20` 为小指；每条指链由根到尖。两手索引顺序一致，按各自模型和标定解算。每帧以腕为平移原点，保留腕部朝向；列为 `[x, y, z]`，轴向不能直接当作屏幕坐标，接入外部引擎需核对标定与坐标变换。
 
-### 单手：在有限时间内读取一帧
+`joints_raw_m` 仍包含当前解算补偿与约束，raw 只表示未作输出低通。ADC 为物理矩阵行列顺序，不因左右手重排；矩阵索引不等同于关键点索引。使用力值时处理 `None` 和 `NaN`；零值不是缺失值。滤波／积分只在新扫描更新；使用 `latest()` 或双手组合时还应逐手按序号去重。
+
+### 单手：有限次数读取
 
 ```python
-from time import monotonic
 import numpy as np
 from sdk import StreamTimeoutError, open_glove
 
-with open_glove("right", calibration="calibration/imu_default_right.json") as glove:
-    deadline = monotonic() + 10.0
-    while monotonic() < deadline:
+with open_glove(
+    "right", calibration="calibration/imu_calibration_right.json",
+) as glove:
+    glove.set_root_limits_enabled(True)
+    glove.set_contact_controls(True, blend=0.5)
+    for _ in range(100):
         try:
             frame = glove.read(timeout=0.5)
         except StreamTimeoutError:
@@ -162,61 +173,83 @@ with open_glove("right", calibration="calibration/imu_default_right.json") as gl
             continue
         if not np.isfinite(frame.joints_smoothed_m).all():
             continue
-        print("关键点形状：", frame.joints_smoothed_m.shape)
+        print("关键点：", frame.joints_smoothed_m.shape)
         if frame.force_fresh:
             if frame.tactile_adc is not None:
-                print("触觉 ADC 形状：", frame.tactile_adc.shape)
+                print("ADC：", frame.tactile_adc.shape)
             if frame.force_n is not None:
                 values = frame.force_n[np.isfinite(frame.force_n)]
                 if values.size:
-                    print("有效力值均值（N）：", float(values.mean()))
+                    print("有效单元平均力 (N)：", float(values.mean()))
         break
     else:
-        print("读取阶段 10 秒内未取得可用姿态帧")
+        print("本次读取未取得可用姿态帧，请检查连接和预热状态")
 ```
 
-`read(timeout=...)` 超时会抛出 `StreamTimeoutError`；单手 `latest()` 不阻塞，首帧前可能返回 `None`。`health()` 可查看连接状态，`info()` 可查看版本与链路信息。`with` 退出时释放串口与采集资源。
+`with` 进入时启动、退出时释放。每次 `timeout` 限制等帧时间，不是连接／预热全过程总时限。`StreamTimeoutError` 可按健康状态重试；其他错误可捕获 `GloveSdkError`。`latest()` 不阻塞，首帧前可为 `None`，也可重复返回同一帧。
 
-### 双手：读取同步关键点
+### 双手：逐手设置与组合读取
 
 ```python
-from time import monotonic
 import numpy as np
 from sdk import StreamTimeoutError, open_bimanual
 
 with open_bimanual(
-    left_calibration="calibration/imu_default_left.json",
-    right_calibration="calibration/imu_default_right.json",
+    left_calibration="calibration/imu_calibration_left.json",
+    right_calibration="calibration/imu_calibration_right.json",
 ) as gloves:
-    deadline = monotonic() + 10.0
-    while monotonic() < deadline:
+    gloves.left.set_contact_controls(False)
+    gloves.right.set_contact_controls(True, blend=1.0)
+    gloves.left.set_root_limits_enabled(True)
+    gloves.right.set_root_limits_enabled(True)
+    last_sequences = None
+    for _ in range(100):
         try:
             frame = gloves.read(timeout=0.5)
         except StreamTimeoutError:
             continue
         hands = (frame.left, frame.right)
-        if any(h.status.details.get("warming_up", False) for h in hands):
+        sequences = tuple(hand.sequence for hand in hands)
+        previous = last_sequences
+        last_sequences = sequences
+        if any(hand.status.details.get("warming_up", False) for hand in hands):
             continue
-        if not all(np.isfinite(h.joints_smoothed_m).all() for h in hands):
+        if not all(np.isfinite(hand.joints_smoothed_m).all() for hand in hands):
             continue
-        print(frame.left.joints_smoothed_m.shape, frame.right.joints_smoothed_m.shape)
-        print("同步误差（ms）：", frame.synchronization_error_ms)
-        break
-    else:
-        print("读取阶段 10 秒内未取得可用双手姿态帧")
+        if previous is not None and any(
+            current == old for current, old in zip(sequences, previous)
+        ):
+            continue
+        print(frame.left.joints_smoothed_m.shape,
+              frame.right.joints_smoothed_m.shape,
+              "两侧帧时间差 (ms)：", frame.synchronization_error_ms)
 ```
 
-双手帧的 `left` / `right` 均为上述用户版 `HandFrame`；读取两侧触觉或力值时，分别检查各自的 `force_fresh`、`None` 与非有限值。
+一侧暂无新帧时 SDK 可能复用其最近帧；示例只消费两侧都更新的组合。各手 ADC／力值仍需分别检查序号、新鲜度及有效值。`synchronization_error_ms` 是两侧时间戳绝对差，不是硬件同步精度。时间线由主机到达时间建立起点并按设备计数增量推进，不能作精确 UTC 授时依据。
+
+### 公开对象与设置
+
+单手保留 `start()`、`read(timeout=None)`、`latest()`、`info()`、`health()`、`neutral_joints()`、`wait_for_firmware_version(timeout_s=5.0)`、`close()` 和上下文管理；还提供 `side`、`port`、`serial_number`、`mesh_vertices_m`、`backend` 属性。
+
+新增 `set_contact_controls(enabled: bool, blend: float = 1.0) -> None` 和 `set_root_limits_enabled(enabled: bool) -> None`。Blend 须为 `[0, 1]` 内有限数，否则抛出 `ValueError`；默认对指开启且 Blend 为 `1.0`，四指约束开启。设置作用于后续解算，已排队帧可能仍反映之前设置。
+
+双手保留 `start()`、`read(timeout=None)`、`health()`、`close()`、上下文管理及 `left` / `right` 单手对象；也可调用双手对象的同名设置方法统一设置两侧。SDK 版本查询为 `sdk.get_version()`，GUI 为 `gui.APP_VERSION`，固件用 `info().firmware_version` 读取并通过 `display_firmware_version()` 显示、`firmware_real_version()` 比较；未知固件为 `None`，不能用 SDK 版本代填。
 
 ## 保护与验证状态
 
-部分算法模块使用 **PyArmor 9.2.8 trial** 保护；运行所需的 Windows / Linux x86_64 运行时已包含在仓库。模型使用边界见随附许可证。
+部分算法采用 PyArmor 代码混淆与运行时保护，须保留 `pyarmor_runtime_000000/`。本版为 **PyArmor 9.2.8 trial 试用／测试版本**，已通过上述 Windows 离线检查。保护不等于模型、配置及全部资源加密，模型许可见随包 LICENSE。
 
-Windows 离线验证已通过；Linux 仅随包提供运行时，尚未真机验收，手套硬件未测。
+公开用户接口提供关键点、ADC、力值和诊断，不提供原始 IMU 流、逐传感器磁力计状态、管理员拟合参数读写或 SDK 原始录制方法。回放入口使用用户已有会话。
 
 ## 常见问题
 
-- **依赖无法加载**：确认使用 Python 3.10 x86_64，且在当前虚拟环境完整安装 `requirements.txt`。
-- **找不到手套/双手无法启动**：运行 `python main.py devices --list` 核对设备，再检查左右手绑定及所选标定文件。
-- **Linux 串口权限不足**：按部署环境配置串口访问权限，并重新连接设备。
-- **Qt 缺少 `libxcb-cursor.so.0`**：安装对应发行版的 Qt/XCB 依赖（如 `libxcb-cursor0`）。
+- **依赖或保护运行时加载失败**：核对 Python 3.10 x86_64、依赖、运行时目录及 `sdk.__file__`。
+- **找不到设备或双手无法启动**：运行 `python main.py devices --list`，检查左右手登记、链路、标定手别及串口占用。
+- **自动标定选择变化**：按修改时间核对候选，集成时显式传入 canonical 或自采文件；API 不读取 GUI 标定绑定。
+- **无法保存新标定**：完成计算和最后返回平展验证，按界面提示重采。
+- **预热后姿态仍异常**：联合检查 `warmup_timed_out` 和 `health()`，确认佩戴与所用标定匹配。
+- **出现 `[WARNING][MAG]`**：新上报通道的磁力计校准从等级 3 下降，检查磁环境并缓慢画圆重新校准。没有警告不代表全部传感器都已合格。
+- **压力或力值重复／缺失**：逐手去重并检查 `force_fresh`、`None`、`np.isfinite()` 和 `tactile_fps`。
+- **Linux 串口／Qt 问题**：配置串口访问权限及 Qt/XCB 依赖；本轮未完成 Linux 验收。
+
+反馈时提供版本、链路与健康信息，发送日志前隐去设备序列号和个人路径。

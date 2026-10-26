@@ -372,7 +372,7 @@ class PressureHandMapper:
 
         for index, target in enumerate(targets):
             nearest_vertex = int(np.argmin(
-                np.einsum("ij,ij->i", self.neutral_vertices - target, 
+                np.einsum("ij,ij->i", self.neutral_vertices - target,
                            self.neutral_vertices - target)))
             candidates = np.flatnonzero(
                 np.any(self.faces == nearest_vertex, axis=1))

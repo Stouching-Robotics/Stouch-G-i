@@ -55,7 +55,6 @@ from sdk.io.streams import (
     PressureFitWriteOutcome,
     RawParamReadOutcome,
     RawParamWriteOutcome,
-    write_pressure_fit_shards,
 )
 from sdk.io.usb_protocol import (
     PARAM_ACK_PAYLOAD_SIZE,
@@ -132,6 +131,6 @@ __all__ = [
     "decode_pressure_fit_payload", "decode_param_ack_payload",
     "pressure_fit_crc32", "pressure_fit_quantize",
     "pressure_fit_set_summary", "supports_pressure_fit_params",
-    "hand_side_from_code", "write_pressure_fit_shards",
+    "hand_side_from_code",
     "SYNTHETIC_PRESSURE_FIT_SEED", "synthetic_pressure_fit_blob",
 ]

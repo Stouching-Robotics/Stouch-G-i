@@ -303,6 +303,14 @@ class UserGlove:
 
         return self._inner.backend
 
+    def set_contact_controls(self, enabled: bool, blend: float = 1.0) -> None:
+        """Set contact correction strength for subsequent solved frames."""
+        self._inner.set_contact_controls(enabled, blend)
+
+    def set_root_limits_enabled(self, enabled: bool) -> None:
+        """Enable or disable the default four-finger joint limits."""
+        self._inner.set_root_limits_enabled(enabled)
+
     def close(self) -> None:
         self._inner.close()
 
@@ -339,6 +347,24 @@ class UserBimanualGlove:
     @property
     def right(self) -> UserGlove:
         return UserGlove(self._inner.right)
+
+    def set_contact_controls(self, enabled: bool, blend: float = 1.0) -> None:
+        """Apply the same contact controls to both hands."""
+        forward = getattr(self._inner, "set_contact_controls", None)
+        if callable(forward):
+            forward(enabled, blend)
+        else:
+            self.left.set_contact_controls(enabled, blend)
+            self.right.set_contact_controls(enabled, blend)
+
+    def set_root_limits_enabled(self, enabled: bool) -> None:
+        """Apply the same four-finger limits switch to both hands."""
+        forward = getattr(self._inner, "set_root_limits_enabled", None)
+        if callable(forward):
+            forward(enabled)
+        else:
+            self.left.set_root_limits_enabled(enabled)
+            self.right.set_root_limits_enabled(enabled)
 
     def close(self) -> None:
         self._inner.close()

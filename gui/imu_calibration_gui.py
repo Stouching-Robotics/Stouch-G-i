@@ -232,10 +232,19 @@ def calibration_steps(side: str) -> tuple[CalibrationStep, ...]:
         CalibrationStep(
             L("计算四指握拳标定", "Compute Fist Calibration"),
             L("此计算无需任何姿势。", "No pose is required for this calculation."),
-            L("握拳位姿用于实测四指弯曲时的横向偏移，运行时自动减去。",
-              "The fist pose measures the four fingers' lateral offset during "
-              "flexion, subtracted automatically at runtime."),
+            L("记录四指弯曲姿态；随后返回平展，独立检查恢复效果。",
+              "Record the four-finger curl, then return to the open pose "
+              "for an independent recovery check."),
             L("计算", "Compute"), "fist", MoCapCalibrateFistType.CALC),
+        CalibrationStep(
+            L("返回平展验证", "Return-Open Verification"),
+            L("松开握拳，保持与安装标定时相同的手掌和手腕朝向，自然平放手掌。",
+              "Release the fist and rest the hand naturally in the same open "
+              "pose and hand/wrist orientation used for installation calibration."),
+            L("不要强行掰直手指。保持静止，完成独立平展验证后才能保存。",
+              "Do not force the fingers straight. Hold still; this independent "
+              "open-hand check must pass before saving."),
+            L("采集并验证", "Capture and Verify"), "shape", MoCapCalibrateShapeType.VERIFY_OPEN),
     )
 
 
@@ -543,10 +552,6 @@ def format_root_angle(snapshot: dict) -> tuple[str, tuple[int, int, int], str]:
               verdict=verdict, axis=axis_note, restart=restart_note,
               moving=moving_note),
         color, history)
-
-
-def contains_han(text: str) -> bool:
-    return any("一" <= character <= "鿿" for character in str(text))
 
 
 def validate_hand2mm_runtime(path: Path | None = None) -> dict:
@@ -913,7 +918,8 @@ class CalibrationController:
         with self._lock:
             self._steps = calibration_steps(self.side)
 
-    def _start_worker(self, target, name: str) -> bool:
+    def _start_worker(self, target, name: str, *,
+                      pause_auto_on_error: bool = False) -> bool:
         with self._lock:
             if self.busy:
                 return False
@@ -924,17 +930,14 @@ class CalibrationController:
             try:
                 target()
             except BaseException as exc:  # Keep background errors inside the GUI.
-                message = str(exc).strip() or exc.__class__.__name__
-                if contains_han(message):
-                    # Keep the real (possibly Chinese) detail visible instead of
-                    # hiding it behind the generic text, so failures are debuggable.
-                    message = L(
-                        "操作失败。请检查手套连接与姿势后重试。\n详情：{detail}",
-                        "The operation failed. Check the glove connection and "
-                        "pose, then retry.\nDetail: {detail}").format(detail=message)
+                message = (str(getattr(exc, "user_message", None) or exc).strip()
+                           or exc.__class__.__name__)
                 with self._lock:
                     self._error = (message, message)
                     self._status = ("操作失败。", "Operation failed.")
+                    if pause_auto_on_error:
+                        self.auto_capture = False
+                        self._auto_stable_since = None
             finally:
                 with self._lock:
                     self.busy = False
@@ -1068,7 +1071,7 @@ class CalibrationController:
                 self._health_count = backend.hand.buffer.get_counter()
         return self._start_worker(work, "hand2mm-calibration-connect")
 
-    def start_new_session(self) -> bool:
+    def start_new_session(self, *, enable_auto: bool = True) -> bool:
         def work():
             backend = self.backend
             if backend is None:
@@ -1084,6 +1087,9 @@ class CalibrationController:
                 self.completed_steps.clear()
                 self.current_step = 0
                 self.saved_path = None
+                self.auto_capture = enable_auto
+                self._auto_stable_since = None
+                self._auto_last_step = -1
                 self._status = (
                     "新标定会话已开始。请采集水平姿势。",
                     "New calibration session started. Capture the level pose.")
@@ -1098,6 +1104,9 @@ class CalibrationController:
         """
         step_index = int(step_index)
         step = self._steps[step_index]
+        with self._lock:
+            self.completed_steps = {index for index in self.completed_steps if index < step_index}
+            self.saved_path = None
         backend = self.backend
         if backend is None or not self.connected:
             raise RuntimeError(L("采集标定数据前请先连接手套。",
@@ -1127,20 +1136,16 @@ class CalibrationController:
             raise RuntimeError(L("标定命令未完成。",
                                  "The calibration command did not complete."))
         if not state.last_calibration_ok:
-            message = state.last_calibration_message
-            if contains_han(message):
-                message = L("标定被拒绝。请保持所需姿势静止并重试。",
-                            "Calibration was rejected. Hold the required pose "
-                            "still and retry.")
-            raise RuntimeError(message)
+            raise RuntimeError(state.last_calibration_message)
         result_message = state.last_calibration_message
         with self._lock:
             self.completed_steps.add(step_index)
-            # 计算步骤（指根/安装/精细/握拳）把结果摘要追加到状态里，
+            # 计算步骤与最后平展验证把结果摘要追加到状态里，
             # 让用户能看到例如"握拳偏移 index twist +3.1° spread -2.0°"或
             # "精细接触标定残差 1.2mm"这类量化结果。
             detail = ""
-            if self._is_compute_step(step) and result_message:
+            if (self._is_compute_step(step)
+                    or step.trigger == MoCapCalibrateShapeType.VERIFY_OPEN) and result_message:
                 detail = "\n" + result_message
             if step_index + 1 < len(self._steps):
                 self.current_step = step_index + 1
@@ -1156,7 +1161,8 @@ class CalibrationController:
         step_index = self.current_step
         return self._start_worker(
             lambda: self._execute_step(step_index),
-            f"hand2mm-calibration-step-{step_index}")
+            f"hand2mm-calibration-step-{step_index}",
+            pause_auto_on_error=self._is_compute_step(self._steps[step_index]))
 
     def go_to_step(self, index: int) -> None:
         with self._lock:
@@ -1282,7 +1288,8 @@ class CalibrationController:
     def auto_capture_tick(self) -> None:
         """Drive the hands-free capture flow; called from the GUI tick.
 
-        Compute steps fire on arrival (with a retry cooldown).  Capture steps
+        Compute steps fire on arrival. A failed compute switches auto-capture
+        off until explicit retry. Failed captures repeat after stability. Capture steps
         fire once the motion RMS stays below ``rms_threshold`` and, for root
         poses, the live angle stays in the good band for the stable duration.
         """
@@ -1317,8 +1324,8 @@ class CalibrationController:
                     "Auto-capture: running the compute step...")
             else:
                 self._auto_status = (
-                    "自动采集：计算步骤未完成，稍后自动重试…",
-                    "Auto-capture: compute step pending; will retry shortly...")
+                    "自动采集：等待计算步骤完成…",
+                    "Auto-capture: waiting for the compute step to finish...")
             return
 
         backend = self.backend
@@ -1520,9 +1527,11 @@ class BimanualCalibrationController:
         self._lock = threading.RLock()
         self._busy = False
         self._worker: threading.Thread | None = None
+        self._capture_step_index: int | None = None
 
     # -- helpers ------------------------------------------------------------
-    def _start_worker(self, target, name: str) -> bool:
+    def _start_worker(self, target, name: str, *,
+                      pause_auto_on_error: bool = False) -> bool:
         with self._lock:
             if self._busy:
                 return False
@@ -1533,15 +1542,15 @@ class BimanualCalibrationController:
             try:
                 target()
             except BaseException as exc:  # Keep background errors inside the GUI.
-                message = str(exc).strip() or exc.__class__.__name__
-                if contains_han(message):
-                    message = L(
-                        "操作失败。请检查手套连接与姿势后重试。\n详情：{detail}",
-                        "The operation failed. Check the glove connection and "
-                        "pose, then retry.\nDetail: {detail}").format(detail=message)
+                message = (str(getattr(exc, "user_message", None) or exc).strip()
+                           or exc.__class__.__name__)
                 with self._lock:
                     self._error = (message, message)
                     self._status = ("操作失败。", "Operation failed.")
+                    if pause_auto_on_error:
+                        self.auto_capture = False
+                        self._auto_stable_since = None
+                        self._auto_last_compute_attempt_s = None
             finally:
                 with self._lock:
                     self._busy = False
@@ -1626,6 +1635,7 @@ class BimanualCalibrationController:
         hands = dict(self.hands)
         self.hands = {}
         self.saved_paths = {}
+        self._capture_step_index = None
         self._auto_stable_since = None
         self._auto_last_step = -1
         self._auto_status = ("", "")
@@ -1633,8 +1643,15 @@ class BimanualCalibrationController:
 
     def start_new_session(self) -> bool:
         for hand in self.hands.values():
-            hand.start_new_session()
+            hand.start_new_session(enable_auto=False)
         with self._lock:
+            self.auto_capture = True
+            self._auto_stable_since = None
+            self._auto_last_compute_attempt_s = None
+            self._auto_last_step = -1
+            self._capture_step_index = None
+            self._error = ("", "")
+            self.saved_paths = {}
             self._status = (
                 "双手新标定会话已开始。请双手同时采集水平姿势。",
                 "Dual-hand session started. Capture the level pose with both "
@@ -1642,16 +1659,32 @@ class BimanualCalibrationController:
         return True
 
     def capture_current_step(self) -> bool:
+        self._finish_capture_attempt()
         left = self.hands["left"]
         right = self.hands["right"]
-        if left.current_step != right.current_step:
+        if (getattr(self, "_busy", False)
+                or any(getattr(hand, "busy", False)
+                       for hand in self.hands.values())):
+            return False
+        step_index = min(left.current_step, right.current_step)
+        if any(hand.current_step != step_index
+               and step_index not in hand.completed_steps
+               for hand in self.hands.values()):
             self.report_error(L(
                 "左右手步骤不同步，请返回当前步骤后重试。",
                 "Left and right steps are out of sync. Return to the current "
                 "step and retry."))
+            self.auto_capture = False
             return False
-        step_index = left.current_step
         step = self._steps[step_index]
+        # A completed side keeps its successful result while its partner is
+        # retried. An explicit recapture after both succeeded reruns both sides.
+        pending = {side: hand for side, hand in self.hands.items()
+                   if step_index not in hand.completed_steps}
+        if not pending:
+            pending = dict(self.hands)
+        self._error = ("", "")
+        self.saved_paths = {}
 
         if left._is_compute_step(step):
             def compute_sequentially():
@@ -1659,22 +1692,29 @@ class BimanualCalibrationController:
                 # are not safe to run concurrently in two Python threads.
                 # Pose acquisition remains simultaneous; only compute-only
                 # steps are deliberately serialized here.
-                for side, hand in self.hands.items():
+                errors = []
+                for side, hand in pending.items():
                     side_zh = "左手" if side == "left" else "右手"
                     side_en = "left hand" if side == "left" else "right hand"
                     with self._lock:
                         self._status = (
                             f"正在计算{side_zh}标定，请稍候…",
                             f"Computing {side_en} calibration; please wait...")
+                    with hand._lock:
+                        hand._error = ("", "")
                     try:
                         hand._execute_step(step_index)
                     except Exception as exc:
-                        detail = str(exc).strip() or exc.__class__.__name__
-                        raise RuntimeError(L(
+                        detail = (str(getattr(exc, "user_message", None) or exc).strip()
+                                  or exc.__class__.__name__)
+                        hand.report_error(detail)
+                        errors.append(L(
                             "{side}计算失败：{detail}",
                             "{side} computation failed: {detail}").format(
                                 side=side_zh if not is_en() else side_en,
-                                detail=detail)) from exc
+                                detail=detail))
+                if errors:
+                    raise RuntimeError("\n".join(errors))
                 with self._lock:
                     self._status = (
                         "双手计算完成，请继续下一步。",
@@ -1682,20 +1722,41 @@ class BimanualCalibrationController:
 
             return self._start_worker(
                 compute_sequentially,
-                f"hand2mm-bimanual-compute-step-{step_index}")
+                f"hand2mm-bimanual-compute-step-{step_index}",
+                pause_auto_on_error=True)
 
         # Capture steps must sample the two live streams at the same time, so
         # retain their existing parallel acquisition behavior.
-        started = [hand.capture_current_step() for hand in self.hands.values()]
+        started = [hand.capture_current_step() for hand in pending.values()]
+        self._capture_step_index = step_index
         if not all(started):
             self.report_error(L(
                 "双手采集未能同时启动，请等待当前操作完成后重试。",
                 "Both-hand capture could not start together. Wait for the "
                 "current operation to finish and retry."))
+            self._auto_stable_since = None
             return False
         return True
 
+    def _finish_capture_attempt(self) -> None:
+        """Settle simultaneous acquisition before another timer can retry it."""
+        step_index = getattr(self, "_capture_step_index", None)
+        if (step_index is None
+                or any(hand.busy for hand in self.hands.values())):
+            return
+        self._capture_step_index = None
+        if not all(step_index in hand.completed_steps
+                   for hand in self.hands.values()):
+            with self._lock:
+                self._auto_stable_since = None
+                self._auto_last_compute_attempt_s = None
+                self._status = ("操作失败。", "Operation failed.")
+
     def go_to_step(self, index: int) -> None:
+        if self._busy or any(hand.busy for hand in self.hands.values()):
+            return
+        self._capture_step_index = None
+        self._error = ("", "")
         for hand in self.hands.values():
             hand.go_to_step(index)
 
@@ -1708,6 +1769,7 @@ class BimanualCalibrationController:
         for hand in self.hands.values():
             any_connected = hand.reset_session() or any_connected
         self.saved_paths = {}
+        self._capture_step_index = None
         self._auto_stable_since = None
         self._auto_last_compute_attempt_s = None
         self._auto_last_step = -1
@@ -1756,6 +1818,7 @@ class BimanualCalibrationController:
 
     # -- snapshot ------------------------------------------------------------
     def snapshot(self) -> dict:
+        self._finish_capture_attempt()
         left = self.hands["left"].snapshot()
         right = self.hands["right"].snapshot()
         connected = left["connected"] and right["connected"]
@@ -1763,7 +1826,10 @@ class BimanualCalibrationController:
         busy = self._busy or left["busy"] or right["busy"]
         complete = left["complete"] and right["complete"]
         progress = (left["progress"] + right["progress"]) / 2.0
-        errors = [error for error in (left["error"], right["error"]) if error]
+        errors = [label + ": " + state["error"]
+                  for label, state in ((L("左手", "Left hand"), left),
+                                       (L("右手", "Right hand"), right))
+                  if state["error"]]
         with self._lock:
             status_pair = self._status
             error_pair = self._error
@@ -1775,17 +1841,20 @@ class BimanualCalibrationController:
             status = L(
                 "双手 16 个 IMU 已就绪。开始新的标定会话。",
                 "Both hands have 16 IMUs ready. Start a new calibration session.")
+        elif complete and not self.saved_paths:
+            status = (L("左手", "Left hand") + ": " + left["status"] + "\n"
+                      + L("右手", "Right hand") + ": " + right["status"])
         else:
             status = L(*status_pair)
-        error = " | ".join(errors) if errors else L(*error_pair)
+        error = "\n".join(errors) if errors else L(*error_pair)
         return {
             "mode": "dual",
             "side": "dual",
             "output": self._output_text(),
             "connected": connected,
             "session_started": session,
-            "current_step": left["current_step"],
-            "completed_steps": left["completed_steps"],
+            "current_step": min(left["current_step"], right["current_step"]),
+            "completed_steps": left["completed_steps"] & right["completed_steps"],
             "busy": busy,
             "complete": complete,
             "progress": progress,
@@ -1811,6 +1880,7 @@ class BimanualCalibrationController:
     # -- auto-capture gate ----------------------------------------------------
     def auto_capture_tick(self) -> None:
         """Joint capture gate: fire only when both hands are ready together."""
+        self._finish_capture_attempt()
         if not self.auto_capture:
             self._auto_stable_since = None
             return
@@ -1830,19 +1900,13 @@ class BimanualCalibrationController:
             self._auto_stable_since = None
             return
 
-        # Heal a rare asymmetric failure (one hand advanced, the other was
-        # rejected) by rolling both back to the lagging hand's step.
-        if left.current_step != right.current_step:
-            target = min(left.current_step, right.current_step)
-            left.go_to_step(target)
-            right.go_to_step(target)
-
-        if left.current_step != self._auto_last_step:
+        step_index = min(left.current_step, right.current_step)
+        if step_index != self._auto_last_step:
             self._auto_stable_since = None
             self._auto_last_compute_attempt_s = None
-            self._auto_last_step = left.current_step
+            self._auto_last_step = step_index
 
-        step = self._steps[left.current_step]
+        step = self._steps[step_index]
 
         if left._is_compute_step(step):
             now = time.monotonic()
@@ -1856,20 +1920,23 @@ class BimanualCalibrationController:
                     "Auto-capture: computing left then right...")
             else:
                 self._auto_status = (
-                    "自动采集：计算步骤未完成，稍后自动重试…",
-                    "Auto-capture: compute step pending; will retry shortly...")
+                    "自动采集：等待计算步骤完成…",
+                    "Auto-capture: waiting for the compute step to finish...")
             return
 
-        l_warm, l_rms, l_angle = left.auto_capture_readiness()
-        r_warm, r_rms, r_angle = right.auto_capture_readiness()
+        l_warm, l_rms, l_angle = (
+            (True, True, True) if step_index in left.completed_steps
+            else left.auto_capture_readiness())
+        r_warm, r_rms, r_angle = (
+            (True, True, True) if step_index in right.completed_steps
+            else right.auto_capture_readiness())
         if l_warm and r_warm and l_rms and r_rms and l_angle and r_angle:
             now = time.monotonic()
             if self._auto_stable_since is None:
                 self._auto_stable_since = now
             if now - self._auto_stable_since >= _AUTO_STABLE_DURATION_S:
                 self._auto_stable_since = None
-                left.capture_current_step()
-                right.capture_current_step()
+                self.capture_current_step()
                 return
             self._auto_status = (
                 "自动采集：双手保持当前姿势…",
@@ -2233,6 +2300,8 @@ class CalibrationWindow(QWidget):
         self._wrap(self._status_text)
         right_layout.addWidget(self._status_text)
         self._error_text = QLabel()
+        self._error_text.setTextFormat(Qt.PlainText)
+        self._error_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._error_text.setStyleSheet("color: #FF6969;")
         self._wrap(self._error_text)
         right_layout.addWidget(self._error_text)
@@ -2364,6 +2433,7 @@ class CalibrationWindow(QWidget):
         if self._dual_controller is not None:
             self._dual_controller.auto_capture = value
             self._dual_controller._auto_stable_since = None
+            self._dual_controller._auto_last_compute_attempt_s = None
 
     def _rms_threshold_changed(self, value: float) -> None:
         for controller in self._glove_controllers():
@@ -2883,7 +2953,9 @@ class CalibrationWindow(QWidget):
             self._step_title.setText(step.title)
             self._instruction.setText(step.instruction)
             self._hold.setText(step.hold)
-        self._action_btn.setText(step.action)
+        self._action_btn.setText(
+            L("重试当前步骤", "Retry current step") if state["error"]
+            else step.action)
 
         self._status_text.setText(state["status"])
         self._error_text.setText(state["error"])
@@ -2894,6 +2966,10 @@ class CalibrationWindow(QWidget):
         busy = state["busy"]
         connected = state["connected"]
         session = state["session_started"]
+        if self._auto_capture_check.isChecked() != state["auto_capture"]:
+            blocked = self._auto_capture_check.blockSignals(True)
+            self._auto_capture_check.setChecked(state["auto_capture"])
+            self._auto_capture_check.blockSignals(blocked)
         self._update_side_badge(controller, dual, connected)
         self._refresh_btn.setEnabled(not busy)
         self._disconnect_btn.setEnabled(
@@ -3036,12 +3112,17 @@ class CalibrationWindow(QWidget):
         return "<br/>".join(lines)
 
     def _apply_preview(self, state: dict) -> None:
+        preview_index = state["current_step"]
+        steps = self._controller._steps
+        if steps[preview_index].trigger == MoCapCalibrateShapeType.VERIFY_OPEN:
+            preview_index = next(index for index, step in enumerate(steps)
+                                 if step.trigger == MoCapCalibrateInstallationType.POSE_0)
         if state.get("mode") == "dual":
             key = ("dual", state["current_step"])
             if key != self._shown_preview_key:
                 self._shown_preview_key = key
                 bgr = self._preview.render_bimanual_bgr(
-                    state["current_step"])
+                    preview_index)
                 self._preview_bgr = bgr
                 self._set_preview_pixmap()
                 self._preview_caption.setText(
@@ -3057,7 +3138,7 @@ class CalibrationWindow(QWidget):
         key = (state["side"], state["current_step"])
         if key != self._shown_preview_key:
             self._shown_preview_key = key
-            bgr = self._preview.render_bgr(*key)
+            bgr = self._preview.render_bgr(state["side"], preview_index)
             self._preview_bgr = bgr  # keep alive for the zero-copy QImage
             self._set_preview_pixmap()
             side_label = L("左", "LEFT") if state["side"] == "left" else L("右", "RIGHT")

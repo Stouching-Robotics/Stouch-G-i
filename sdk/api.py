@@ -6,11 +6,12 @@ Call :func:`open_glove` and nothing else in this package.  What arrives on
 ======================  ==========================================
 21-keypoint position    ``joints_raw_m`` / ``joints_smoothed_m``
 finger force (newtons)  ``force_n`` (16x16, like the pressure matrix)
+pressure matrix ADC    ``tactile_adc`` (16x16, sensor counts)
 fitness of that force   ``force_fresh``
 solver state            ``status`` -- read this before trusting a frame
 firmware version        ``firmware_version`` (raw) / ``display_firmware_version``
 SDK version             ``GloveInfo.sdk_version`` from :meth:`Glove.info`
-link diagnostics        ``device_fps``, ``link_drops``, ``latency_ms``
+link diagnostics        ``device_fps``, ``tactile_fps``, ``link_drops``, ``latency_ms``
 ======================  ==========================================
 
 Neither link needs naming: ``link="auto"`` finds whichever of the wired USB

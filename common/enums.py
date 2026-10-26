@@ -32,6 +32,7 @@ class MoCapCalibrateShapeType(str, Enum):
     LITTLE = "little"
     RESET = "reset"
     CALC = "calc"  #
+    VERIFY_OPEN = "verify_open"
 
 
 class MoCapCalibrateFistType(str, Enum):

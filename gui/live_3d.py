@@ -3,8 +3,7 @@
 
 Everything arrives from the one SDK entry point: ``sdk.open_glove`` ->
 ``Glove.read`` -> :class:`sdk.HandFrame`, which hands over the 21 solved
-keypoints (metres), finger force (newtons) and the link diagnostics -- and
-nothing raw.  The display is the spherical-coordinate perspective camera from
+keypoints (metres), finger force (newtons), pressure ADC and link diagnostics.  The display is the spherical-coordinate perspective camera from
 ``render_21_points.py``: fingers colored by BGR, brightness by depth, z=0
 ground grid + RGB axes, with keyboard live view rotation and saving (view
 parameters stored in ``view_config_3d.json``, so config.json and the lite
@@ -615,8 +614,7 @@ class Live3DViewer:
                  show_tactile_toggle: bool = True,
                  show_orientation_button: bool = False,
                  show_selector_button: bool = False,
-                 show_dongle_reboot_button: bool = False,
-                 show_pressure_fit_buttons: bool = False):
+                 show_dongle_reboot_button: bool = False):
         self.view = view_state
         # The reset target is the state with which this particular window was
         # opened (including values loaded from its view JSON), not hard-coded
@@ -657,6 +655,8 @@ class Live3DViewer:
         self.missing_labels: list[str] = []
         self.safety_intervened = False
         self.active_contact: str | None = None
+        self._contact_controls_callback = None
+        self._root_limits_callback = None
         self._kpts_slots = np.asarray(initial_slots, np.float32).reshape(2, 21, 3)
         self._mesh_slots: list[np.ndarray | None] = [None, None]
         if initial_mesh_vertices is not None:
@@ -701,8 +701,7 @@ class Live3DViewer:
             show_tactile_toggle=show_tactile_toggle,
             show_orientation_button=show_orientation_button,
             show_selector_button=show_selector_button,
-            show_dongle_reboot_button=show_dongle_reboot_button,
-            show_pressure_fit_buttons=show_pressure_fit_buttons)
+            show_dongle_reboot_button=show_dongle_reboot_button)
         self._refresh_canvas_size()
         self._canvas = self._draw()
         self._qcanvas.set_canvas(self._canvas)
@@ -1046,6 +1045,28 @@ class Live3DViewer:
         put_text(img, L(f"触觉 x{s:.1f}  [ / ] 缩放", f"Tactile x{s:.1f}  [ / ] resize"),
                  (x0, y0 - 6), 0.45, (200, 195, 185), 1)
 
+    def bind_root_limits(self, callback):
+        self._root_limits_callback = callback
+        self._qcanvas._root_limits_toggle.setEnabled(True)
+        callback(self._qcanvas._root_limits_toggle.isChecked())
+
+    def _on_root_limits_changed(self, enabled):
+        callback = getattr(self, '_root_limits_callback', None)
+        if callback is not None:
+            callback(bool(enabled))
+
+    def bind_contact_controls(self, callback, *, experimental: bool = False,
+                              source_refit: bool = False) -> None:
+        """Bind the original solver (or its IPC control), without re-solving here."""
+        self._contact_controls_callback = callback
+        self._qcanvas.set_contact_experimental(experimental, source_refit=source_refit)
+        self._qcanvas.set_contact_controls_available(True)
+        self._on_contact_controls_changed(True, 1.0)
+
+    def _on_contact_controls_changed(self, enabled: bool, blend: float) -> None:
+        if self._contact_controls_callback is not None:
+            self._contact_controls_callback(enabled, blend)
+
     def update(self, joints: np.ndarray, fps: float, frame_count: int,
                missing_labels: list[str], safety_intervened: bool,
                active_contact: str | None = None,
@@ -1225,8 +1246,7 @@ def _selected_calibration(args) -> Path | None:
         return Path(args.calib).expanduser().resolve()
     # The two files this edition ships: a bare checkout has exactly one
     # calibration per side, so the fallback below always finds something.
-    filename = ("imu_2d_calibration.json" if args.side == "left"
-                else "imu_calibration_right_default.json")
+    filename = f"imu_calibration_{args.side}.json"
     return (PROJECT_ROOT / "calibration" / filename).resolve()
 
 
@@ -1255,14 +1275,14 @@ def main(argv=None) -> int:
         return 2
 
     try:
+        from sdk.calibration import prepare_viewer_calibration
+        calibration = prepare_viewer_calibration(calibration, args.side)
         glove = open_glove(
-            args.side,
-            calibration=calibration,
+            args.side, calibration=calibration,
             serial_number=_port_serial(args.serial_port),
-            registry=DEFAULT_REGISTRY,
-            smoothing_ms=args.joint_smoothing_ms,
+            registry=DEFAULT_REGISTRY, smoothing_ms=args.joint_smoothing_ms,
         ).start()
-    except CalibrationError as exc:
+    except (CalibrationError, OSError, RuntimeError, ValueError, KeyError) as exc:
         print(f"[Calibration error] {exc}", file=sys.stderr)
         return 2
     except Exception as exc:
@@ -1291,7 +1311,8 @@ def main(argv=None) -> int:
         view_state.dist = float(np.clip(
             args.dist, LiveViewState.DIST_MIN, LiveViewState.DIST_MAX))
 
-    backend = glove.backend
+    source = glove
+    backend = source.backend
 
     viewer = None
     if not args.no_display:
@@ -1310,6 +1331,11 @@ def main(argv=None) -> int:
             initial_mesh_vertices=glove.mesh_vertices_m,
             redraw_interval_s=1.0 / max(args.fps, 1.0),
         )
+        viewer.bind_root_limits(source.set_root_limits_enabled)
+        viewer.bind_contact_controls(
+            source.set_contact_controls,
+            experimental=backend.get('pose_postprocess') == 'gesture-retarget-v1',
+            source_refit=backend.get('pose_postprocess') == 'sensor-motion-refit-v1')
 
     print(f"Calibration: {calibration}")
     print(f"Link: {info.link_kind} {info.port} [{info.serial_number}]")

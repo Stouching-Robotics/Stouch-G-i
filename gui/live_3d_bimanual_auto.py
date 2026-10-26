@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import copy
 import json
 import multiprocessing
 import os
@@ -151,10 +152,10 @@ def resolve_calibration_paths(
                  else find_latest_hand2mm_calibration(folder, "right"))
     else:
         left = (Path(left_calib) if left_calib is not None
-                else DEFAULT_CALIBRATION_DIR / "imu_2d_calibration.json")
+                else DEFAULT_CALIBRATION_DIR / "imu_calibration_left.json")
         right = (Path(right_calib) if right_calib is not None
                  else DEFAULT_CALIBRATION_DIR
-                 / "imu_calibration_right_default.json")
+                 / "imu_calibration_right.json")
     return {"left": left.expanduser(), "right": right.expanduser()}
 
 
@@ -680,6 +681,9 @@ class BimanualViewer(Live3DViewer):
             side_name = L("左手", "LEFT") if side == "left" else L("右手", "RIGHT")
             if not status.get("connected"):
                 lines.append(f"{side_name}: {L('未连接', 'NOT CONNECTED')}")
+                continue
+            if status.get("waiting_for_data"):
+                lines.append(f"{side_name}: {L('等待首帧数据', 'WAITING FOR FIRST FRAME')}")
                 continue
             # Solve rate first, then each device stream's own arrival rate:
             # when they differ, the gap is the host dropping frames, not the
@@ -1636,6 +1640,23 @@ def _publish_latest(state_queue, message) -> None:
         pass
 
 
+def _cancel_stopped_worker_queue_joins(stop_event, *output_queues) -> None:
+    """Do not flush abandoned preview/results after a requested session stop.
+
+    Queue.put() only feeds a local buffer. At process exit multiprocessing
+    normally joins its feeder until the pipe is drained; the parent has already
+    stopped consuming these session queues and is waiting in Process.join().
+    Drop that unread tail only on an explicit stop. Unexpected failures still
+    flush their fatal report while the parent continues to consume messages.
+    Recording is owned by the parent and does not use these feeder buffers as
+    its save queue. Call this after closing the glove, never instead of it.
+    """
+    if stop_event.is_set():
+        for output_queue in output_queues:
+            if output_queue is not None:
+                output_queue.cancel_join_thread()
+
+
 # How long the SDK reader waits for a paired frame before giving the loop back.
 # A Bluetooth dongle hands its frames over one RF event at a time, so the window
 # is a dongle's own batch latency -- the same 250 ms the solve loop treats as
@@ -1700,7 +1721,8 @@ def _read_newest(glove, timeout):
 
 
 def hand_solver_process(side, calib_paths, links, serials, registry_path,
-                        solve_rate, state_queue, stop_event):
+                        solve_rate, state_queue, stop_event,
+                        contact_control=None, root_limits_control=None):
     """One process for one hand's SDK pipeline, publishing to the parent.
 
     The parent is the consumer: it drains ``state_queue`` keep-newest and
@@ -1756,6 +1778,11 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
     link_health = _LinkHealth()
     try:
         while not stop_event.is_set():
+            if contact_control is not None:
+                strength = contact_control.value
+                glove.set_contact_controls(strength >= 0.0, max(0.0, strength))
+            if root_limits_control is not None:
+                glove.set_root_limits_enabled(bool(root_limits_control.value))
             frames, drained = _read_newest(glove, _READ_TIMEOUT_S)
             if not frames:
                 continue
@@ -1892,7 +1919,11 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
             "error": f"{type(exc).__name__}: {exc}",
         })
     finally:
-        glove.close()
+        try:
+            glove.close()
+        finally:
+            _cancel_stopped_worker_queue_joins(
+                stop_event, state_queue)
 
 
 def _drain_hand_queue(state_queue, runtimes) -> dict | None:
@@ -2298,6 +2329,7 @@ def _run_live_session(args) -> int | str:
     # unusable one back as a fatal message, which the loop below turns into the
     # same RuntimeError a parent-side probe used to raise.
     runtimes: dict[str, object] = {}
+    pose_postprocess = {}
     for side in ("left", "right"):
         if side not in present_sides:
             runtimes[side] = _AbsentHandRuntime(side)
@@ -2305,6 +2337,14 @@ def _run_live_session(args) -> int | str:
         if not calib_paths[side].is_file():
             raise RuntimeError(
                 f"Missing {side} calibration: {calib_paths[side]}")
+        from sdk.calibration import prepare_viewer_calibration
+        calib_paths[side] = prepare_viewer_calibration(calib_paths[side], side)
+        config = load_calibration(calib_paths[side], side)
+        shape = config.param_shape_calib or {}
+        pose_postprocess[side] = (
+            "sensor-motion-refit-v1" if "sensor_motion_refit" in shape
+            else "gesture-retarget-v1" if "gesture_retarget" in shape
+            else "legacy-contact")
         runtimes[side] = PublishedHandState(side)
 
     print(f"Left IMU calibration: {calib_paths['left'].resolve()}")
@@ -2351,6 +2391,8 @@ def _run_live_session(args) -> int | str:
     processed_frame_index = 0
     state_lock = threading.Lock()
     stop_event = multiprocessing.Event()
+    contact_control = multiprocessing.Value("d", 1.0)
+    root_limits_control = multiprocessing.Value("b", True)
     # One reader process per hand, and one queue back each.  A hand that is not
     # connected has no runtime to feed and is never opened.
     readers: dict[str, multiprocessing.Process] = {}
@@ -2389,7 +2431,8 @@ def _run_live_session(args) -> int | str:
             reader = multiprocessing.Process(
                 target=hand_solver_process,
                 args=(side, calib_paths, links, serials,
-                      args.registry, solve_rate, state_queue, stop_event),
+                      args.registry, solve_rate, state_queue, stop_event,
+                      contact_control, root_limits_control),
                 name=f"sdk-{side}",
                 daemon=True,
             )
@@ -2468,7 +2511,7 @@ def _run_live_session(args) -> int | str:
                         viewer.set_tactile_side(
                             side, _snap_force_or_none(snap, side),
                             _snap_adc_or_none(snap, side))
-            ready = all(
+            ready = not present_sides or any(
                 snap[side]["joints"] is not None
                 for side in present_sides)
             # Freshness is judged per hand.  An ``all()`` over both hands meant
@@ -2477,8 +2520,9 @@ def _run_live_session(args) -> int | str:
             # application.  On a Bluetooth link that is the common case rather
             # than the exception: the two dongles share the 2.4 GHz band, so
             # one hand dropping past the age limit while the other runs on is
-            # ordinary.  ``ready`` stays an ``all()`` -- a hand that has never
-            # produced a pose is not something to freeze.
+            # ordinary. A detected hand with no first frame must not block the
+            # other hand's viewport. It stays NaN until it actually publishes;
+            # recorder_loop independently requires every selected hand.
             fresh_sides = {
                 side for side in present_sides
                 if now - snap[side]["host_s"] <= args.max_frame_age}
@@ -2489,7 +2533,8 @@ def _run_live_session(args) -> int | str:
                     _snap_joints_or_nan(snap, "right"),
                 ]).astype(np.float32)
                 if palm_target_bases is None:
-                    both_present = len(present_sides) == 2
+                    both_present = (len(present_sides) == 2 and all(
+                        snap[side]["joints"] is not None for side in present_sides))
                     if both_present:
                         # Use the first frame on explicit relearn or a missing
                         # default, and persist it immediately.
@@ -2522,7 +2567,7 @@ def _run_live_session(args) -> int | str:
                         # anchor.  A partial config is never persisted.
                         palm_target_bases = _synthesize_single_hand_bases(initial)
                         print(
-                            "[WARN] Only one hand connected and no saved display "
+                            "[WARN] Only one hand has data and no saved display "
                             "config; bimanual anchors derived from the connected "
                             "hand and not persisted.",
                             file=sys.stderr)
@@ -2541,6 +2586,15 @@ def _run_live_session(args) -> int | str:
                         display_mode=args.display_mode,
                         stop_event=stop_event,
                         redraw_interval_s=1.0 / max(float(args.fps), 1.0))
+                    def set_contacts(enabled, blend):
+                        contact_control.value = blend if enabled else -1.0
+                    def set_root_limits(enabled):
+                        root_limits_control.value = bool(enabled)
+                    viewer.bind_root_limits(set_root_limits)
+                    viewer.bind_contact_controls(
+                        set_contacts,
+                        experimental='gesture-retarget-v1' in pose_postprocess.values(),
+                        source_refit='sensor-motion-refit-v1' in pose_postprocess.values())
                 startup_initialized = True
             if any_fresh and now >= next_display:
                 if viewer:
@@ -2561,6 +2615,7 @@ def _run_live_session(args) -> int | str:
                                 "latency": snap[side]["latency"],
                                 "link": snap[side]["link_kind"],
                                 "connected": True,
+                                "waiting_for_data": snap[side]["joints"] is None,
                                 # Abnormal, so the HUD shows it: this hand's
                                 # pose above is the last good one, not this
                                 # frame's.
@@ -2634,12 +2689,19 @@ def _run_live_session(args) -> int | str:
                 0.001, min(0.010, next_display - time.perf_counter())))
     finally:
         stop_event.set()
+        # Worker joins can take seconds while serial readers/queue feeders
+        # stop. Close the window first: leaving it visible without pumping Qt
+        # makes an orderly session exit look like a frozen live viewport.
+        if viewer:
+            viewer.close()
         for reader in readers.values():
             reader.join(timeout=5.0)
             if reader.is_alive():
                 reader.terminate()
-        if viewer:
-            viewer.close()
+                reader.join(timeout=1.0)
+        for session_queue in state_queues.values():
+            session_queue.cancel_join_thread()
+            session_queue.close()
     elapsed = time.perf_counter() - started
     print(
         f"Adaptive bimanual run finished: {processed_frame_index} preview "
@@ -2678,6 +2740,7 @@ def main(argv=None):
             return result
         if result == "selector":
             args.select_calibration = True
+            args.no_select_calibration = False
             continue
         return result
 

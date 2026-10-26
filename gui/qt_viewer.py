@@ -25,7 +25,7 @@ from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget)
+    QScrollArea, QSlider, QVBoxLayout, QWidget)
 
 from common.i18n import L  # noqa: E402
 
@@ -708,8 +708,7 @@ class QtCanvas(QWidget):
                  show_orientation_button: bool = False,
                  show_selector_button: bool = False,
                  show_dongle_reboot_button: bool = False,
-                 show_view_control_button: bool = True,
-                 show_pressure_fit_buttons: bool = False):
+                 show_view_control_button: bool = True):
         super().__init__()
         # Dark navy-blue chrome to match the in-canvas palette.
         self.setStyleSheet(
@@ -747,6 +746,12 @@ class QtCanvas(QWidget):
         self._display_combo: QComboBox | None = None
         self._display_label: QLabel | None = None
         self._lang_button: QPushButton | None = None
+        self._contact_toggle: QCheckBox | None = None
+        self._root_limits_toggle: QCheckBox | None = None
+        self._contact_blend: QSlider | None = None
+        self._contact_label: QLabel | None = None
+        self._contact_experimental = False
+        self._contact_source_refit = False
         self._tactile_toggle: QCheckBox | None = None
         self._tactile_panel_label: QLabel | None = None
         self._tactile_panel_combo: QComboBox | None = None
@@ -759,19 +764,13 @@ class QtCanvas(QWidget):
         self._selector_button: QPushButton | None = None
         self._dongle_reboot_button: QPushButton | None = None
         self._view_control_button: QPushButton | None = None
-        self._pressure_fit_send_button: QPushButton | None = None
-        self._pressure_fit_query_button: QPushButton | None = None
-        # Last busy flag seen; ``None`` until the first frame, so the first
-        # ``set_pressure_fit_busy`` always applies.
-        self._pressure_fit_busy: bool | None = None
 
         # Top bar: the optional tactile-panel selector stays at the left edge;
         # display, language and pressure controls remain right-aligned.
         if (self._display_modes or lang_button or show_baseline
                 or show_surface_color or self._tactile_panel_modes
                 or show_orientation_button or show_selector_button
-                or show_dongle_reboot_button or show_view_control_button
-                or show_pressure_fit_buttons):
+                or show_dongle_reboot_button or show_view_control_button):
             top = QWidget()
             top_layout = QHBoxLayout(top)
             top_layout.setContentsMargins(10, 6, 10, 6)
@@ -842,27 +841,6 @@ class QtCanvas(QWidget):
                 # Born hidden: the controller reveals it once a Bluetooth link
                 # is detected (see set_dongle_reboot_visible).
                 self._dongle_reboot_button.setVisible(False)
-            if show_pressure_fit_buttons:
-                # Two buttons: a read-only query and the query that carries the
-                # write-back.  Anything else about the
-                # parameter commands (set pickers, write toggles) was removed on
-                # purpose -- the firmware decides which set it sends, so there
-                # is nothing for this side to choose.
-                self._pressure_fit_send_button = QPushButton()
-                self._pressure_fit_query_button = QPushButton()
-                for fit_button, handler in (
-                        (self._pressure_fit_send_button,
-                         self._on_pressure_fit_send),
-                        (self._pressure_fit_query_button,
-                         self._on_pressure_fit_query)):
-                    fit_button.setFocusPolicy(Qt.NoFocus)
-                    btn_font = fit_button.font()
-                    btn_font.setBold(True)
-                    fit_button.setFont(btn_font)
-                    fit_button.setMinimumHeight(36)
-                    fit_button.clicked.connect(handler)
-                    top_layout.addWidget(fit_button)
-                self._retranslate_pressure_fit_buttons()
             if show_view_control_button:
                 self._view_control_button = QPushButton()
                 self._view_control_button.setFocusPolicy(Qt.NoFocus)
@@ -878,6 +856,30 @@ class QtCanvas(QWidget):
                 # label follows the canvas rather than only its own clicks.
                 self._area.view_control_visibility_changed.connect(
                     self._on_view_control_visibility_changed)
+            self._root_limits_toggle = QCheckBox()
+            self._root_limits_toggle.setChecked(True)
+            self._root_limits_toggle.setEnabled(False)
+            self._root_limits_toggle.setFocusPolicy(Qt.NoFocus)
+            self._root_limits_toggle.toggled.connect(
+                lambda enabled: getattr(controller, '_on_root_limits_changed', lambda _: None)(enabled))
+            top_layout.addWidget(self._root_limits_toggle)
+            if callable(getattr(controller, '_on_contact_controls_changed', None)):
+                self._contact_toggle = QCheckBox()
+                self._contact_toggle.setChecked(True)
+                self._contact_toggle.setEnabled(False)
+                self._contact_toggle.setFocusPolicy(Qt.NoFocus)
+                self._contact_label = QLabel('Blend 100%')
+                self._contact_blend = QSlider(Qt.Horizontal)
+                self._contact_blend.setRange(0, 100)
+                self._contact_blend.setValue(100)
+                self._contact_blend.setFixedWidth(100)
+                self._contact_blend.setEnabled(False)
+                self._contact_toggle.toggled.connect(self._on_contact_controls)
+                self._contact_blend.valueChanged.connect(self._on_contact_controls)
+                self._retranslate_contact_controls()
+                top_layout.addWidget(self._contact_toggle)
+                top_layout.addWidget(self._contact_label)
+                top_layout.addWidget(self._contact_blend)
             if show_baseline:
                 if show_tactile_toggle:
                     self._tactile_toggle = QCheckBox()
@@ -946,7 +948,7 @@ class QtCanvas(QWidget):
         if (self._display_modes or lang_button or show_baseline
                 or show_surface_color or self._tactile_panel_modes
                 or show_orientation_button or show_selector_button
-                or show_dongle_reboot_button or show_pressure_fit_buttons):
+                or show_dongle_reboot_button or show_view_control_button):
             extra += 48
         # A 1280x720 canvas plus chrome is taller than the usable height of
         # many 1366x768 laptops.  Start within the available work area instead
@@ -1026,7 +1028,49 @@ class QtCanvas(QWidget):
         # canvas so the two can never disagree.
         self._retranslate_view_control_button()
 
+    def set_contact_controls_available(self, available: bool) -> None:
+        if self._contact_toggle is not None:
+            self._contact_toggle.setEnabled(available)
+            self._contact_blend.setEnabled(available and self._contact_toggle.isChecked())
+
+    def set_contact_experimental(self, enabled: bool, *, source_refit: bool = False) -> None:
+        self._contact_experimental = bool(enabled)
+        self._contact_source_refit = bool(source_refit)
+        self._retranslate_contact_controls()
+
+    def _on_contact_controls(self, _value) -> None:
+        enabled = self._contact_toggle.isChecked()
+        value = self._contact_blend.value()
+        self._contact_blend.setEnabled(enabled and self._contact_toggle.isEnabled())
+        self._contact_label.setText(f'Blend {value}%')
+        self._controller._on_contact_controls_changed(enabled, value / 100.)
+
+    def _retranslate_contact_controls(self) -> None:
+        if self._root_limits_toggle is not None:
+            self._root_limits_toggle.setText(L('四指关节约束', 'Finger joint limits'))
+            self._root_limits_toggle.setToolTip(L(
+                '除拇指外，指根切线扭转和法线偏转乘 0.5，再限制为 ±5° / ±12°；out 弯曲依次限制在 -30~100°、-10~130°、-10~90°。关闭恢复原输出，下一帧生效。',
+                'Four MCP joints: twist/spread ×0.5 then clamp to ±5°/±12°. Flexion: MCP -30..100°, PIP -10..130°, DIP -10..90°. Thumb unchanged. Applies on the next frame.'))
+        if self._contact_toggle is not None:
+            if self._contact_source_refit:
+                label = L('对指兜底', 'Contact fallback')
+                tip = L('关闭或 0% 只关闭接触修正；佩戴补偿与末两节单轴约束仍启用。整体 Blend 从校正后的源姿态（0%）混合到完整接触兜底（100%）。其他模式的手保留各自的对指功能。对后续帧生效。',
+                        'Off or 0% disables only contact correction; wearing compensation and the two distal single-axis constraints remain enabled. Overall Blend mixes the corrected source pose (0%) toward full contact fallback (100%). Hands in other modes retain their own contact behavior. Applies to subsequent frames.')
+            elif self._contact_experimental:
+                label = L('手势重定向（实验）', 'Gesture retarget (experimental)')
+                tip = L('使用实验标定识别手势并驱动预制姿态；0% 保留输入姿态，100% 完整重定向。未使用实验标定的手保留原对指功能。对后续帧生效。',
+                        'Recognize calibrated gestures and drive preset poses: 0% input pose, 100% full retarget. Hands without an experimental profile retain their contact correction. Applies to subsequent frames.')
+            else:
+                label = L('对指吸附', 'Fingertip attraction')
+                tip = L('控制原始求解链的对指修正；0% 关闭修正，100% 完整修正。对后续帧生效。',
+                        'Original solver contact correction: 0% off, 100% full. Applies to subsequent frames.')
+            self._contact_toggle.setText(label)
+            self._contact_toggle.setToolTip(tip)
+            self._contact_blend.setToolTip(tip)
+            self._contact_blend.setAccessibleName(L('对指 Blend', 'Contact blend'))
+
     def retranslate(self) -> None:
+        self._retranslate_contact_controls()
         """Refresh combo items + language button text after a language change."""
         if self._display_combo is not None:
             current = self._display_combo.currentData()
@@ -1041,7 +1085,6 @@ class QtCanvas(QWidget):
         self._retranslate_selector_button()
         self._retranslate_dongle_reboot_button()
         self._retranslate_view_control_button()
-        self._retranslate_pressure_fit_buttons()
 
     def _on_lang_toggle(self) -> None:
         fn = getattr(self._controller, "_toggle_language", None)
@@ -1059,34 +1102,8 @@ class QtCanvas(QWidget):
         if callback is not None:
             callback()
 
-    def _on_pressure_fit_send(self) -> None:
-        callback = getattr(self._controller, "_on_pressure_fit_send", None)
-        if callback is not None:
-            callback()
 
-    def _on_pressure_fit_query(self) -> None:
-        callback = getattr(self._controller, "_on_pressure_fit_query", None)
-        if callback is not None:
-            callback()
 
-    def set_pressure_fit_busy(self, busy: bool) -> None:
-        """Grey out both fit buttons while a command is in flight.
-
-        Called from the viewer's per-frame refresh with the controller's flag,
-        because the run happens on a worker thread and this is the only place
-        that may touch a widget.  The last value is remembered so a frame that
-        changes nothing does not restyle a button every time.
-        """
-
-        buttons = (self._pressure_fit_send_button,
-                   self._pressure_fit_query_button)
-        if self._pressure_fit_busy == bool(busy) or all(
-                button is None for button in buttons):
-            return
-        self._pressure_fit_busy = bool(busy)
-        for button in buttons:
-            if button is not None:
-                button.setEnabled(not busy)
 
     def _on_baseline_toggled(self, checked: bool) -> None:
         callback = getattr(self._controller, "_on_use_baseline_toggled", None)
@@ -1205,16 +1222,6 @@ class QtCanvas(QWidget):
         self._orientation_button.setText(
             fn() if fn is not None else "Recapture orientation")
 
-    def _retranslate_pressure_fit_buttons(self) -> None:
-        for button, method, fallback in (
-                (self._pressure_fit_send_button, "_pressure_fit_send_label",
-                 "Query fit parameters"),
-                (self._pressure_fit_query_button, "_pressure_fit_query_label",
-                 "Query and store back")):
-            if button is None:
-                continue
-            fn = getattr(self._controller, method, None)
-            button.setText(fn() if fn is not None else fallback)
 
     def _refresh_baseline_status(self) -> None:
         if self._baseline_status is None:

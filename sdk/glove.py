@@ -1,6 +1,6 @@
 """Plaintext single-glove orchestration over public SDK interfaces.
 
-This module owns threading, synchronization, display smoothing, and recording.
+This module owns threading, synchronization, and display smoothing.
 The protected hand solver remains reachable only through ``HandSolver``.
 """
 
@@ -17,24 +17,17 @@ from typing import Iterator
 
 import numpy as np
 
-from sdk.io.single_recording import SingleRecordingSession
-from common.errors import RecordingError, StreamClosedError, StreamTimeoutError
+from common.errors import StreamClosedError, StreamTimeoutError
 from common.frame_pacing import BURST_SPAN_US, recent_batch
 from sdk import get_version as sdk_version
 from sdk.io.streams import RawImuStream, TactileStream
 from sdk.solver import HandSolver
-from sdk.mag import from_snapshot, mag_available
-from sdk.pressure_fit import (
-    PARAM_ACK_TIMEOUT_S, PARAM_COMMAND_ATTEMPTS, PARAM_SHARD_RETRIES,
-    PARAM_VERSION_WAIT_S,
-    PressureFitCommandOutcome, PressureFitReadOutcome, PressureFitSnapshot,
-    PressureFitWriteOutcome,
-    RawParamReadOutcome, RawParamWriteOutcome,
-)
+from sdk.mag import from_snapshot, mag_available, MagCalibrationDropMonitor
+from sdk.io.streams import PARAM_VERSION_WAIT_S
 from sdk.transport import LinkSpec, resolve_link
 from common.types import (
     LINK_AUTO, DeviceHealth, GloveConfig, GloveInfo, HandFrame, RawImuFrame,
-    RecordingResult, RecordingStatus, TactileFrame)
+    TactileFrame)
 
 
 def _sdk_root(start):
@@ -171,8 +164,6 @@ class GloveEngine:
         self._started = False
         self._last_error: str | None = None
         self._last_tactile_error: str | None = None
-        self._recording: SingleRecordingSession | None = None
-        self._recording_lock = threading.RLock()
 
     def start(self) -> "GloveEngine":
         if self._started:
@@ -192,6 +183,7 @@ class GloveEngine:
         self._started = True
         self._last_error = None
         self._last_tactile_error = None
+        self._mag_drop_monitor = MagCalibrationDropMonitor()
         self._stop.clear()
         self._stream.start()
         self._threads = [
@@ -347,13 +339,19 @@ class GloveEngine:
                     link_errors=dict(self._stream.link_errors),
                     latency_ms=self._latency_ms(),
                 )
+                dropped = self._mag_drop_monitor.update(frame.mag)
+                if dropped:
+                    channels = ', '.join(f'IMU-{channel}: 3->{level}' for channel, level in dropped)
+                    print(f'[WARNING][MAG] {self.config.side} {self.serial_number} '
+                          f'磁力计校准状态下降 / calibration lost '
+                          f'(physical channels, 0-based): {channels}. '
+                          '请检查磁环境并缓慢画圆重新校准。', flush=True)
                 with self._lock:
                     missing_mask = ~np.isfinite(keypoints.sensor_age_s)
                     self._missing = tuple(
                         f"IMU-{index}" for index in np.flatnonzero(missing_mask))
                     self._latest = frame
                     self._frame_times.append(now)
-                self._append_recording(frame)
                 self._put_latest(frame)
         except Exception as exc:
             with self._lock:
@@ -432,37 +430,9 @@ class GloveEngine:
         with self._lock:
             return self._latest
 
-    def _append_recording(self, frame: HandFrame) -> None:
-        with self._recording_lock:
-            if self._recording is not None:
-                self._recording.add(frame)
 
-    def start_recording(self, name: str | None = None) -> RecordingStatus:
-        if not self._started:
-            self.start()
-        with self._recording_lock:
-            if self._recording is None:
-                self._recording = SingleRecordingSession(
-                    self.config, self.serial_number)
-            try:
-                return self._recording.start(name)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise RecordingError(str(exc)) from exc
 
-    def stop_recording(self) -> RecordingResult:
-        with self._recording_lock:
-            if self._recording is None:
-                raise RecordingError("recording has not been started")
-            try:
-                return self._recording.stop()
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise RecordingError(str(exc)) from exc
 
-    def recording_status(self) -> RecordingStatus:
-        with self._recording_lock:
-            if self._recording is None:
-                return RecordingStatus("idle", 0, 0, None)
-            return self._recording.status()
 
     def _param_stream(self) -> RawImuStream:
         """The running stream, opening the glove first if it has not been."""
@@ -484,124 +454,15 @@ class GloveEngine:
 
         return self._param_stream().wait_for_version(timeout_s)
 
-    @property
-    def supports_pressure_fit(self) -> bool:
-        """Whether the attached firmware has the pressure-fit parameter channel.
 
-        False until the 0x01 status frame has landed, so a fresh port answers
-        False for a few hundred milliseconds whatever the firmware is.  Ask
-        :meth:`wait_for_firmware_version` first when the answer has to be right.
-        """
 
-        return self._param_stream().supports_pressure_fit
 
-    def pressure_fit_snapshots(self) -> dict[int, PressureFitSnapshot]:
-        """The stored sets seen so far, keyed by set index, newest scan each.
 
-        Free: these are the 0x06 broadcasts the reader has already parsed, so
-        this never touches the wire.  Which sets a *device* holds is the
-        device's answer to give, not the cache's -- use
-        :meth:`query_pressure_fit` for that.
-        """
 
-        return self._param_stream().pressure_fit_snapshots()
 
-    def pressure_fit_snapshot(self, set_index: int) -> PressureFitSnapshot | None:
-        """The newest stored-set broadcast for one set, or ``None`` if never seen."""
 
-        return self._param_stream().pressure_fit_snapshot(set_index)
 
-    def read_pressure_fit(
-            self, set_index: int, *,
-            timeout_s: float = 2.0) -> PressureFitReadOutcome:
-        """Read one stored set back off the device (0x02).
 
-        Blocks until the answer arrives.  The outcome carries both the decoded
-        coefficients and the device's own CRC-32 of the blob it returned, which
-        is the only independent witness that what came back is what is stored.
-        """
-
-        return self._param_stream().read_pressure_fit(
-            set_index, timeout_s=timeout_s)
-
-    def query_pressure_fit(
-            self, *, timeout_s: float = 5.0) -> PressureFitCommandOutcome:
-        """Ask the device to report every set it holds (0x04), then wait for them.
-
-        The device answers with an ack and then broadcasts one 0x06 per stored
-        set, so the wait is longer than a single command's.  ``outcome.params``
-        holds the sets it reported and ``outcome.missing`` the indices its own
-        ack claimed but that never turned up.
-        """
-
-        return self._param_stream().query_pressure_fit(timeout_s=timeout_s)
-
-    def write_pressure_fit(
-            self, set_index: int, blob: bytes, *,
-            timeout_s: float = PARAM_ACK_TIMEOUT_S,
-            retries: int = PARAM_SHARD_RETRIES,
-            progress=None) -> PressureFitWriteOutcome:
-        """Write one set as four 256-byte shards (0x01), retrying until it commits.
-
-        The blob is the full 1024 bytes; each shard carries the CRC-32 of the
-        whole thing.  Recovery differs by failure: an unanswered shard is
-        resent as-is, while a device rejection restarts the set from offset 0,
-        because offset 0 is what clears the staging buffer.  Blocks for as long
-        as that takes -- seconds on a slow link -- so keep it off any thread
-        that has to paint.  ``progress(shard, ok, attempt)`` is called per try.
-        """
-
-        return self._param_stream().write_pressure_fit(
-            set_index, blob, timeout_s=timeout_s, retries=retries,
-            progress=progress)
-
-    def clear_pressure_fit(
-            self, *, timeout_s: float = 2.0) -> PressureFitCommandOutcome:
-        """Erase every stored set on the device (0x03)."""
-
-        return self._param_stream().clear_pressure_fit(timeout_s=timeout_s)
-
-    def start_pressure_fit(
-            self, *, timeout_s: float = PARAM_ACK_TIMEOUT_S,
-            attempts: int = PARAM_COMMAND_ATTEMPTS,
-    ) -> PressureFitCommandOutcome:
-        """Ask the device to fit for itself (0x06), and read nothing back.
-
-        A *send*: one command and its ack.  Nothing arrives in ``params``, and
-        no stored set is touched -- this is not the read-back path, which is
-        :meth:`query_pressure_fit`.  A firmware that does not implement the
-        subcommand stays silent, so the failure names it rather than reporting
-        a bare timeout.
-        """
-
-        return self._param_stream().start_pressure_fit(
-            timeout_s=timeout_s, attempts=attempts)
-
-    def read_raw_param_block(
-            self, *, timeout_s: float = 5.0) -> RawParamReadOutcome:
-        """Read the whole parameter block in one command (0x51/0x02).
-
-        The compact firmware answers with a single opaque block whose length it
-        declares, rather than the legacy per-set 1024-byte payloads.  What the
-        bytes mean is the application's business -- the SDK moves them and
-        reports the device's own length and CRC-32, and stops there.
-        """
-
-        return self._param_stream().read_raw_param_block(timeout_s=timeout_s)
-
-    def write_raw_param_block(
-            self, data: bytes, *,
-            timeout_s: float = 2.0) -> RawParamWriteOutcome:
-        """Store a whole parameter block in one command (0x51/0x01).
-
-        The counterpart of :meth:`read_raw_param_block`, for a caller that
-        already holds a block in the firmware's own format.  Session commands
-        that write one set at a time still go through
-        :meth:`write_pressure_fit`.
-        """
-
-        return self._param_stream().write_raw_param_block(
-            data, timeout_s=timeout_s)
 
     def health(self) -> DeviceHealth:
         with self._lock:
@@ -667,10 +528,6 @@ class GloveEngine:
         for thread in self._threads:
             if thread.is_alive():
                 thread.join(timeout=2.0)
-        with self._recording_lock:
-            if (self._recording is not None
-                    and self._recording.state == "recording"):
-                self._recording.stop()
         self._started = False
 
     @property
@@ -749,15 +606,17 @@ class Glove:
     def neutral_joints(self):
         return self._impl.neutral_joints()
 
-    def start_recording(self, name: str | None = None) -> RecordingStatus:
-        return self._impl.start_recording(name)
+    def set_root_limits_enabled(self, enabled: bool) -> None:
+        """Enable four-finger twist/spread and flexion limits (default True)."""
+        self._impl.solver.set_root_limits_enabled(enabled)
 
-    def stop_recording(self) -> RecordingResult:
-        return self._impl.stop_recording()
+    def set_contact_controls(self, enabled: bool, blend: float = 1.0) -> None:
+        """Apply attraction controls to subsequent solved frames."""
+        self._impl.solver.set_contact_controls(enabled, blend)
 
-    @property
-    def recording_status(self) -> RecordingStatus:
-        return self._impl.recording_status()
+
+
+
 
     def wait_for_firmware_version(
             self, timeout_s: float = PARAM_VERSION_WAIT_S) -> str | None:
@@ -765,80 +624,15 @@ class Glove:
 
         return self._impl.wait_for_firmware_version(timeout_s)
 
-    @property
-    def supports_pressure_fit(self) -> bool:
-        """Whether this glove's firmware has the pressure-fit parameter channel.
 
-        False until the 0x01 status frame has landed; ask
-        :meth:`wait_for_firmware_version` first when the answer has to be right.
-        """
 
-        return self._impl.supports_pressure_fit
 
-    def pressure_fit_snapshots(self) -> dict[int, PressureFitSnapshot]:
-        """The stored parameter sets the reader has seen, keyed by set index."""
 
-        return self._impl.pressure_fit_snapshots()
 
-    def pressure_fit_snapshot(self, set_index: int) -> PressureFitSnapshot | None:
-        """The newest stored-set broadcast for one set, or ``None``."""
 
-        return self._impl.pressure_fit_snapshot(set_index)
 
-    def read_pressure_fit(
-            self, set_index: int, *,
-            timeout_s: float = 2.0) -> PressureFitReadOutcome:
-        """Read one stored set back off the device.  Blocks until it answers."""
 
-        return self._impl.read_pressure_fit(set_index, timeout_s=timeout_s)
 
-    def query_pressure_fit(
-            self, *, timeout_s: float = 5.0) -> PressureFitCommandOutcome:
-        """Ask the device to report every set it holds.  Blocks for the broadcast."""
-
-        return self._impl.query_pressure_fit(timeout_s=timeout_s)
-
-    def write_pressure_fit(
-            self, set_index: int, blob: bytes, *,
-            timeout_s: float = PARAM_ACK_TIMEOUT_S,
-            retries: int = PARAM_SHARD_RETRIES,
-            progress=None) -> PressureFitWriteOutcome:
-        """Write one 1024-byte set and retry until the device commits it.
-
-        Blocks for seconds at a time; do not call it from a render thread.
-        """
-
-        return self._impl.write_pressure_fit(
-            set_index, blob, timeout_s=timeout_s, retries=retries,
-            progress=progress)
-
-    def clear_pressure_fit(
-            self, *, timeout_s: float = 2.0) -> PressureFitCommandOutcome:
-        """Erase every stored set on the device."""
-
-        return self._impl.clear_pressure_fit(timeout_s=timeout_s)
-
-    def start_pressure_fit(
-            self, *, timeout_s: float = PARAM_ACK_TIMEOUT_S,
-            attempts: int = PARAM_COMMAND_ATTEMPTS,
-    ) -> PressureFitCommandOutcome:
-        """Tell the device to fit for itself; read nothing back."""
-
-        return self._impl.start_pressure_fit(
-            timeout_s=timeout_s, attempts=attempts)
-
-    def read_raw_param_block(
-            self, *, timeout_s: float = 5.0) -> RawParamReadOutcome:
-        """Read the whole parameter block in one command.  Blocks until it answers."""
-
-        return self._impl.read_raw_param_block(timeout_s=timeout_s)
-
-    def write_raw_param_block(
-            self, data: bytes, *,
-            timeout_s: float = 2.0) -> RawParamWriteOutcome:
-        """Store a whole parameter block in one command.  Blocks for seconds."""
-
-        return self._impl.write_raw_param_block(data, timeout_s=timeout_s)
 
     def close(self) -> None:
         self._impl.close()

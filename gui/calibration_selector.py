@@ -20,6 +20,7 @@ from pathlib import Path
 import sys
 
 from gui import APP_VERSION
+from common.i18n import L
 
 def _sdk_root(start):
     for parent in [start, *start.parents]:
@@ -35,12 +36,13 @@ DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
 
 
 def discover_calibration_files(directory: Path, side: str) -> list[Path]:
-    """Return newest-first HAND2mm calibration JSON files for one side."""
+    """List normal calibrations first, then explicitly selectable experiments."""
     folder = Path(directory).expanduser().resolve()
     if not folder.is_dir():
         raise RuntimeError(f"Calibration directory does not exist: {folder}")
     matches = []
-    for path in folder.glob("*.json"):
+    experiments = []
+    for path in [*folder.glob("*.json"), *(folder / "experiments").glob("*.json")]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -53,10 +55,16 @@ def discover_calibration_files(directory: Path, side: str) -> list[Path]:
         if str(payload.get("tool") or "") in {
                 "direct_fk_calibrate_cli", "hand_fk_fit_cli"}:
             continue
-        matches.append(path.resolve())
-    return sorted(
-        matches, key=lambda path: (path.stat().st_mtime_ns, path.name),
-        reverse=True)
+        target = experiments if path.parent == folder / "experiments" else matches
+        target.append(path.resolve())
+    if folder / f"imu_calibration_{side}.json" in matches:
+        legacy_names = {"imu_2d_calibration.json", "imu_calibration.json",
+                        "imu_default_left.json", "imu_default_right.json",
+                        "imu_calibration_left_default.json", "imu_calibration_right_default.json"}
+        matches = [path for path in matches if path.name not in legacy_names]
+    order = lambda path: (path.stat().st_mtime_ns, path.name)
+    return (sorted(matches, key=order, reverse=True)
+            + sorted(experiments, key=order, reverse=True))
 
 
 def _label(path: Path) -> str:
@@ -64,7 +72,37 @@ def _label(path: Path) -> str:
         modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, ValueError, OverflowError):
         modified = "?"
-    return f"{path.name}    [{modified}]"
+    try:
+        from sdk.calibration import resolve_calibration_profile
+        payload = json.loads(path.read_text(encoding='utf-8-sig'))
+        side = str(payload.get('side') or 'right').lower()
+        resolution = resolve_calibration_profile(path, side)
+        state = resolution.status
+        selected = json.loads(resolution.path.read_text(encoding='utf-8-sig'))
+        selected_shape = selected.get('param_shape_calib')
+        profile = (selected_shape.get('sensor_motion_refit') or {}) if isinstance(selected_shape, dict) else {}
+        if not isinstance(profile, dict):
+            raise ValueError('Invalid motion profile')
+    except (OSError, ValueError, TypeError):
+        state = 'invalid'
+    prefix = {
+        'embedded': L('[佩戴校正] ', '[Wearing corrected] '),
+        'matched': L('[已有配套校正] ', '[Matching correction] '),
+        'legacy': L('[旧标定兼容] ', '[Legacy compatible] '),
+        'ambiguous': L('[多个配套校正] ', '[Multiple matching profiles] '),
+        'gesture': '[EXPERIMENT] ',
+        'invalid': L('[文件无效] ', '[Invalid file] '),
+    }[state]
+    if state in ('embedded', 'matched'):
+        if profile.get('calibration_policy') == 'installation-neutral-verified-v1':
+            quality = profile.get('quality')
+            check = quality.get('return_open_validation') if isinstance(quality, dict) else None
+            passed = isinstance(check, dict) and check.get('passed') is True
+            prefix += (L('[平展已验收] ', '[Open pose verified] ') if passed else
+                       L('[平展未验收] ', '[Open pose unverified] '))
+        else:
+            prefix += L('[旧版未验收] ', '[Legacy unverified] ')
+    return f"{prefix}{path.name}    [{modified}]"
 
 
 def select_calibration_files(
@@ -135,7 +173,9 @@ def select_calibration_files(
     dialog.setMinimumWidth(520)
 
     root = QVBoxLayout(dialog)
-    intro = QLabel("Choose calibration JSON before opening the live viewer.")
+    intro = QLabel(L('新标定会自动保存佩戴与关节校正。旧文件仍可使用；未包含或未匹配校正的旧文件，需要在新版完成一次标定。',
+                    'New calibrations include wearing and joint correction. Older files remain compatible; calibrate once in this version if no matching correction is available.'))
+    intro.setWordWrap(True)
     root.addWidget(intro)
     folder_label = QLabel(f"Folder: {Path(directory).resolve()}")
     folder_label.setWordWrap(True)

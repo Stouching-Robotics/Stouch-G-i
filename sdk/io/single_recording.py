@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import copy
 import sys
 
 from sdk.io.recording import (
@@ -31,8 +32,10 @@ SDK_ROOT = (Path(sys.executable).resolve().parent
 
 
 class SingleRecordingSession:
-    def __init__(self, config: GloveConfig, serial_number: str = ""):
+    def __init__(self, config: GloveConfig, serial_number: str = "", *,
+                 pose_metadata: dict | None = None):
         self.config = config
+        self.pose_metadata = copy.deepcopy(pose_metadata or {})
         default_root = SDK_ROOT / (
             "data/keypoints_21_left"
             if config.side == "left" else "data/keypoints_21")
@@ -107,6 +110,12 @@ class SingleRecordingSession:
                     self.config.calibration).resolve()),
             },
             "recording": {"take_index": self.take_index},
+            "kinematics": {"pose_postprocess_by_side": {
+                self.config.side: self.pose_metadata.get('pose_postprocess', 'legacy-contact')}},
+            "gesture_profiles": ({self.config.side: copy.deepcopy(self.pose_metadata['gesture_profile'])}
+                                 if self.pose_metadata.get('gesture_profile') is not None else {}),
+            "motion_refit_profiles": ({self.config.side: copy.deepcopy(self.pose_metadata['motion_refit_profile'])}
+                                      if self.pose_metadata.get('motion_refit_profile') is not None else {}),
         }
 
     def add(self, frame: HandFrame) -> bool:

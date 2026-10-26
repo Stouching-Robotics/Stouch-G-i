@@ -11,3 +11,6 @@ def _sdk_root(start):
 
 SDK_ROOT = (Path(sys._MEIPASS) if getattr(sys, "frozen", False)
             else _sdk_root(Path(__file__).resolve().parent))
+
+DATA_ROOT = (Path(sys.executable).resolve().parent
+             if getattr(sys, "frozen", False) else SDK_ROOT)

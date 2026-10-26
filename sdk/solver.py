@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import copy
 
 import numpy as np
 
@@ -24,6 +25,24 @@ class HandSolver:
 
     def neutral_joints(self) -> np.ndarray:
         return self._impl.neutral_joints()
+
+    def set_root_limits_enabled(self, enabled: bool) -> None:
+        """Enable four-finger twist/spread and flexion limits (default True)."""
+        self._impl.set_root_limits_enabled(enabled)
+
+    def set_contact_controls(self, enabled: bool, blend: float = 1.0) -> None:
+        """Control original runtime attraction (including solved recordings)."""
+        self._impl.set_contact_controls(enabled, blend)
+
+    @property
+    def pose_recording_metadata(self) -> dict:
+        """Snapshot the selected solver mode/profile for replay provenance."""
+        shape = self._impl.hand_config.param_shape_calib or {}
+        return {
+            "pose_postprocess": self.backend.get('pose_postprocess', 'legacy-contact'),
+            "gesture_profile": copy.deepcopy(shape.get('gesture_retarget')),
+            "motion_refit_profile": copy.deepcopy(shape.get('sensor_motion_refit')),
+        }
 
     @property
     def neutral_imu_xyzw(self) -> np.ndarray:

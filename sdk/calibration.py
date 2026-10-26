@@ -22,6 +22,9 @@ import json
 from pathlib import Path
 
 from algorithm.calibration_session import ImuCalibratorEngine as _Engine
+from algorithm.calibration_profiles import (
+    CalibrationProfileResolution, prepare_viewer_calibration,
+    resolve_calibration_profile)
 from algorithm.imu_calibrate_cli import (
     ImuCalibrationCLI, compute_motion_rms, default_out_path)
 from algorithm.utils import get_average_rotation
@@ -33,6 +36,8 @@ __all__ = [
     "ImuCalibrator", "ImuCalibrationCLI", "compute_motion_rms",
     "default_out_path", "find_latest_hand2mm_calibration",
     "get_average_rotation",
+    "CalibrationProfileResolution", "resolve_calibration_profile",
+    "prepare_viewer_calibration",
 ]
 
 
@@ -69,6 +74,12 @@ def find_latest_hand2mm_calibration(directory: Path | str, side: str) -> Path:
     if not matches:
         raise CalibrationError(
             f"No usable HAND2mm {side} IMU calibration JSON in {folder}")
+    canonical = folder / f"imu_calibration_{side}.json"
+    if canonical in matches:
+        legacy_names = {"imu_2d_calibration.json", "imu_calibration.json",
+                        "imu_default_left.json", "imu_default_right.json",
+                        "imu_calibration_left_default.json", "imu_calibration_right_default.json"}
+        matches = [path for path in matches if path.name not in legacy_names]
     return max(matches, key=lambda path: (path.stat().st_mtime_ns, path.name))
 
 
