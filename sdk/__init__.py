@@ -71,15 +71,15 @@ from sdk.user_facade import (
     UserHandFrame as HandFrame,
 )
 
-__version__ = "2.3.2"
+__version__ = "2.3.3"
 
 
 def get_version() -> str:
-    """Return the SDK version string, currently ``"2.3.2"``.
+    """Return the SDK version string, currently ``"2.3.3"``.
 
     Not to be confused with the glove's own ``HandFrame.firmware_version``.
     The two are independent and may share a string by coincidence -- Bluetooth
-    firmware is at ``"2.0.7"`` while the SDK is at ``"2.3.2"``.
+    firmware is at ``"2.0.7"`` while the SDK is at ``"2.3.3"``.
 
     ``2.3.1`` is the release that added ``HandFrame.tactile_adc`` and the
     per-link frame dialects (Bluetooth compresses its pressure scans, wired

@@ -1722,7 +1722,8 @@ def _read_newest(glove, timeout):
 
 def hand_solver_process(side, calib_paths, links, serials, registry_path,
                         solve_rate, state_queue, stop_event,
-                        contact_control=None, root_limits_control=None):
+                        contact_control=None, root_limits_control=None,
+                        root_limits_blending_control=None, fist_correction_control=None):
     """One process for one hand's SDK pipeline, publishing to the parent.
 
     The parent is the consumer: it drains ``state_queue`` keep-newest and
@@ -1783,6 +1784,14 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
                 glove.set_contact_controls(strength >= 0.0, max(0.0, strength))
             if root_limits_control is not None:
                 glove.set_root_limits_enabled(bool(root_limits_control.value))
+            if root_limits_blending_control is not None:
+                setter = getattr(glove, 'set_root_limits_blending_enabled', None)
+                if setter is not None:
+                    setter(bool(root_limits_blending_control.value))
+            if fist_correction_control is not None:
+                setter = getattr(glove, 'set_fist_correction_enabled', None)
+                if setter is not None:
+                    setter(bool(fist_correction_control.value))
             frames, drained = _read_newest(glove, _READ_TIMEOUT_S)
             if not frames:
                 continue
@@ -2394,8 +2403,11 @@ def _run_live_session(args) -> int | str:
     processed_frame_index = 0
     state_lock = threading.Lock()
     stop_event = multiprocessing.Event()
-    contact_control = multiprocessing.Value("d", 1.0)
+    # Shared by both hands: negative contact strength means disabled.
+    contact_control = multiprocessing.Value("d", -1.0)
     root_limits_control = multiprocessing.Value("b", True)
+    root_limits_blending_control = multiprocessing.Value("b", True)
+    fist_correction_control = multiprocessing.Value("b", True)
     # One reader process per hand, and one queue back each.  A hand that is not
     # connected has no runtime to feed and is never opened.
     readers: dict[str, multiprocessing.Process] = {}
@@ -2435,7 +2447,8 @@ def _run_live_session(args) -> int | str:
                 target=hand_solver_process,
                 args=(side, calib_paths, links, serials,
                       args.registry, solve_rate, state_queue, stop_event,
-                      contact_control, root_limits_control),
+                      contact_control, root_limits_control,
+                      root_limits_blending_control, fist_correction_control),
                 name=f"sdk-{side}",
                 daemon=True,
             )
@@ -2593,7 +2606,13 @@ def _run_live_session(args) -> int | str:
                         contact_control.value = blend if enabled else -1.0
                     def set_root_limits(enabled):
                         root_limits_control.value = bool(enabled)
+                    def set_root_limits_blending(enabled):
+                        root_limits_blending_control.value = bool(enabled)
+                    def set_fist_correction(enabled):
+                        fist_correction_control.value = bool(enabled)
                     viewer.bind_root_limits(set_root_limits)
+                    viewer.bind_root_limits_blending(set_root_limits_blending)
+                    viewer.bind_fist_correction(set_fist_correction)
                     viewer.bind_contact_controls(
                         set_contacts,
                         experimental='gesture-retarget-v1' in pose_postprocess.values(),

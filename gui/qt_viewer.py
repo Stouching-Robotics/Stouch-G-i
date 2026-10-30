@@ -24,7 +24,7 @@ import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSlider, QVBoxLayout, QWidget)
 
 from common.i18n import L  # noqa: E402
@@ -748,6 +748,9 @@ class QtCanvas(QWidget):
         self._lang_button: QPushButton | None = None
         self._contact_toggle: QCheckBox | None = None
         self._root_limits_toggle: QCheckBox | None = None
+        self._root_limits_blending_toggle: QCheckBox | None = None
+        self._fist_correction_toggle: QCheckBox | None = None
+        self._root_limits_blending_available = False
         self._contact_blend: QSlider | None = None
         self._contact_label: QLabel | None = None
         self._contact_experimental = False
@@ -856,16 +859,36 @@ class QtCanvas(QWidget):
                 # label follows the canvas rather than only its own clicks.
                 self._area.view_control_visibility_changed.connect(
                     self._on_view_control_visibility_changed)
+            # Two compact rows keep the pose toggles together without extending
+            # the already scrollable toolbar by two more checkbox widths.
+            pose_controls = QWidget()
+            pose_layout = QGridLayout(pose_controls)
+            pose_layout.setContentsMargins(0, 0, 0, 0)
+            pose_layout.setVerticalSpacing(0)
             self._root_limits_toggle = QCheckBox()
             self._root_limits_toggle.setChecked(True)
             self._root_limits_toggle.setEnabled(False)
             self._root_limits_toggle.setFocusPolicy(Qt.NoFocus)
-            self._root_limits_toggle.toggled.connect(
-                lambda enabled: getattr(controller, '_on_root_limits_changed', lambda _: None)(enabled))
-            top_layout.addWidget(self._root_limits_toggle)
+            self._root_limits_toggle.toggled.connect(self._on_root_limits)
+            pose_layout.addWidget(self._root_limits_toggle, 0, 0)
+            self._root_limits_blending_toggle = QCheckBox()
+            self._root_limits_blending_toggle.setChecked(True)
+            self._root_limits_blending_toggle.setEnabled(False)
+            self._root_limits_blending_toggle.setFocusPolicy(Qt.NoFocus)
+            self._root_limits_blending_toggle.toggled.connect(
+                lambda enabled: getattr(controller, '_on_root_limits_blending_changed', lambda _: None)(enabled))
+            pose_layout.addWidget(self._root_limits_blending_toggle, 1, 0)
+            self._fist_correction_toggle = QCheckBox()
+            self._fist_correction_toggle.setChecked(True)
+            self._fist_correction_toggle.setEnabled(False)
+            self._fist_correction_toggle.setFocusPolicy(Qt.NoFocus)
+            self._fist_correction_toggle.toggled.connect(
+                lambda enabled: getattr(controller, '_on_fist_correction_changed', lambda _: None)(enabled))
+            pose_layout.addWidget(self._fist_correction_toggle, 1, 1)
+            top_layout.addWidget(pose_controls)
             if callable(getattr(controller, '_on_contact_controls_changed', None)):
                 self._contact_toggle = QCheckBox()
-                self._contact_toggle.setChecked(True)
+                self._contact_toggle.setChecked(False)
                 self._contact_toggle.setEnabled(False)
                 self._contact_toggle.setFocusPolicy(Qt.NoFocus)
                 self._contact_label = QLabel('Blend 100%')
@@ -877,9 +900,10 @@ class QtCanvas(QWidget):
                 self._contact_toggle.toggled.connect(self._on_contact_controls)
                 self._contact_blend.valueChanged.connect(self._on_contact_controls)
                 self._retranslate_contact_controls()
-                top_layout.addWidget(self._contact_toggle)
+                pose_layout.addWidget(self._contact_toggle, 0, 1)
                 top_layout.addWidget(self._contact_label)
                 top_layout.addWidget(self._contact_blend)
+            self._retranslate_contact_controls()
             if show_baseline:
                 if show_tactile_toggle:
                     self._tactile_toggle = QCheckBox()
@@ -938,8 +962,9 @@ class QtCanvas(QWidget):
             toolbar.setFrameShape(QFrame.NoFrame)
             toolbar.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             toolbar.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            toolbar.setMinimumHeight(48)
-            toolbar.setMaximumHeight(66)
+            # Leave room for both pose-control rows and the horizontal scrollbar.
+            toolbar.setMinimumHeight(56)
+            toolbar.setMaximumHeight(80)
             layout.addWidget(toolbar)
 
         layout.addWidget(self._area, 1)
@@ -1033,6 +1058,20 @@ class QtCanvas(QWidget):
             self._contact_toggle.setEnabled(available)
             self._contact_blend.setEnabled(available and self._contact_toggle.isChecked())
 
+    def set_root_limits_blending_available(self, available: bool) -> None:
+        self._root_limits_blending_available = bool(available)
+        if self._root_limits_blending_toggle is not None:
+            master = self._root_limits_toggle
+            self._root_limits_blending_toggle.setEnabled(
+                self._root_limits_blending_available
+                and master.isEnabled() and master.isChecked())
+
+    def _on_root_limits(self, enabled: bool) -> None:
+        self.set_root_limits_blending_available(self._root_limits_blending_available)
+        callback = getattr(self._controller, '_on_root_limits_changed', None)
+        if callback is not None:
+            callback(bool(enabled))
+
     def set_contact_experimental(self, enabled: bool, *, source_refit: bool = False) -> None:
         self._contact_experimental = bool(enabled)
         self._contact_source_refit = bool(source_refit)
@@ -1051,6 +1090,16 @@ class QtCanvas(QWidget):
             self._root_limits_toggle.setToolTip(L(
                 '除拇指外，指根切线扭转和法线偏转乘 0.5，再限制为 ±5° / ±12°；out 弯曲依次限制在 -30~100°、-10~130°、-10~90°。关闭恢复原输出，下一帧生效。',
                 'Four MCP joints: twist/spread ×0.5 then clamp to ±5°/±12°. Flexion: MCP -30..100°, PIP -10..130°, DIP -10..90°. Thumb unchanged. Applies on the next frame.'))
+        if self._root_limits_blending_toggle is not None:
+            self._root_limits_blending_toggle.setText(L('约束 Blending', 'Joint-limit blending'))
+            self._root_limits_blending_toggle.setToolTip(L(
+                '平展时保持完整四指约束，沿本次标定的对指动作线性减弱，到达对指时解除这层约束。关闭恢复固定约束。佩戴补偿与单轴约束不变；对后续解算生效。',
+                'Keep full finger limits when open; relax them linearly toward calibrated opposition, reaching zero at opposition. Off restores fixed limits. Wearing compensation and hinge constraints stay enabled. Applies to subsequent solved frames.'))
+        if self._fist_correction_toggle is not None:
+            self._fist_correction_toggle.setText(L('握拳预制修正', 'Fist preset correction'))
+            self._fist_correction_toggle.setToolTip(L(
+                '接近本次采集的握拳时，将四指混合到预制姿态。拇指继续跟随原解算，可独立张开、外展或收拢。缺少本次佩戴的有效握拳采样时不修正；对后续解算生效。',
+                'Near the sampled fist, blend only the four fingers toward the preset. The thumb keeps its source motion and can open, spread or fold independently. No correction without valid fist samples from this wearing. Applies to subsequent solved frames.'))
         if self._contact_toggle is not None:
             if self._contact_source_refit:
                 label = L('对指兜底', 'Contact fallback')

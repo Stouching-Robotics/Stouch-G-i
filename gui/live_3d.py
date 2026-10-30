@@ -657,6 +657,8 @@ class Live3DViewer:
         self.active_contact: str | None = None
         self._contact_controls_callback = None
         self._root_limits_callback = None
+        self._root_limits_blending_callback = None
+        self._fist_correction_callback = None
         self._kpts_slots = np.asarray(initial_slots, np.float32).reshape(2, 21, 3)
         self._mesh_slots: list[np.ndarray | None] = [None, None]
         if initial_mesh_vertices is not None:
@@ -1048,10 +1050,32 @@ class Live3DViewer:
     def bind_root_limits(self, callback):
         self._root_limits_callback = callback
         self._qcanvas._root_limits_toggle.setEnabled(True)
+        self._qcanvas.set_root_limits_blending_available(
+            getattr(self, '_root_limits_blending_callback', None) is not None)
         callback(self._qcanvas._root_limits_toggle.isChecked())
 
     def _on_root_limits_changed(self, enabled):
         callback = getattr(self, '_root_limits_callback', None)
+        if callback is not None:
+            callback(bool(enabled))
+
+    def bind_root_limits_blending(self, callback):
+        self._root_limits_blending_callback = callback
+        self._qcanvas.set_root_limits_blending_available(True)
+        callback(self._qcanvas._root_limits_blending_toggle.isChecked())
+
+    def _on_root_limits_blending_changed(self, enabled):
+        callback = getattr(self, '_root_limits_blending_callback', None)
+        if callback is not None:
+            callback(bool(enabled))
+
+    def bind_fist_correction(self, callback):
+        self._fist_correction_callback = callback
+        self._qcanvas._fist_correction_toggle.setEnabled(True)
+        callback(self._qcanvas._fist_correction_toggle.isChecked())
+
+    def _on_fist_correction_changed(self, enabled):
+        callback = getattr(self, '_fist_correction_callback', None)
         if callback is not None:
             callback(bool(enabled))
 
@@ -1061,7 +1085,9 @@ class Live3DViewer:
         self._contact_controls_callback = callback
         self._qcanvas.set_contact_experimental(experimental, source_refit=source_refit)
         self._qcanvas.set_contact_controls_available(True)
-        self._on_contact_controls_changed(True, 1.0)
+        self._on_contact_controls_changed(
+            self._qcanvas._contact_toggle.isChecked(),
+            self._qcanvas._contact_blend.value() / 100.0)
 
     def _on_contact_controls_changed(self, enabled: bool, blend: float) -> None:
         if self._contact_controls_callback is not None:
@@ -1332,6 +1358,8 @@ def main(argv=None) -> int:
             redraw_interval_s=1.0 / max(args.fps, 1.0),
         )
         viewer.bind_root_limits(source.set_root_limits_enabled)
+        viewer.bind_root_limits_blending(source.set_root_limits_blending_enabled)
+        viewer.bind_fist_correction(source.set_fist_correction_enabled)
         viewer.bind_contact_controls(
             source.set_contact_controls,
             experimental=backend.get('pose_postprocess') == 'gesture-retarget-v1',

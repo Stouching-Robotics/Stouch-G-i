@@ -851,7 +851,15 @@ def main(argv=None):
                     def set_root_limits(enabled):
                         for hand in hands.values():
                             hand.set_root_limits_enabled(enabled)
+                    def set_root_limits_blending(enabled):
+                        for hand in hands.values():
+                            hand.set_root_limits_blending_enabled(enabled)
+                    def set_fist_correction(enabled):
+                        for hand in hands.values():
+                            hand.set_fist_correction_enabled(enabled)
                     viewer.bind_root_limits(set_root_limits)
+                    viewer.bind_root_limits_blending(set_root_limits_blending)
+                    viewer.bind_fist_correction(set_fist_correction)
                     viewer.bind_contact_controls(
                         set_contacts,
                         experimental=any(hand.backend.get('pose_postprocess') == 'gesture-retarget-v1'

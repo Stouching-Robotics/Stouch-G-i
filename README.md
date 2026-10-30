@@ -2,11 +2,11 @@
 
 Stouch-G-i 是 GitHub 半开源用户发行仓库，提供 SDK／GUI 源码与受保护算法，用于设备识别、佩戴标定、21 关键点解算、压力／力值显示及已有数据回放。
 
-SDK：`2.3.2`；GUI：`2.0.12`；文档日期：`2026-10-26`。本版为 PyArmor 9.2.8 trial 试用／测试交付。
+SDK：`2.3.3`；GUI：`2.0.13`；文档日期：`2026-10-30`。本版为 PyArmor 9.2.8 trial 试用／测试交付。
 
 本仓库根目录直接对应 Python SDK 根目录。所有安装和运行命令均在 `Stouch-G-i/` 内执行；桌面 EXE 由独立发行包提供。
 
-**验证状态：**公开接口与示例已完成静态核对和模拟验证。Windows 明文及保护 SDK 的离线解算、GUI 控件和回放检查通过；配套桌面包的 EXE 启动与合成回放检查通过。Windows 双手 USB 实时 3D 窗口的启动、有限帧绘制与退出已完成离屏验证；动作精度与标定质量不在该验证范围内。Linux 尚未测试，SDK 示例尚未连接设备验证。
+**验证状态：**公开接口与示例已完成静态核对和模拟验证。Windows 离线解算、GUI 控件和回放检查通过；配套桌面包的 EXE 启动与合成回放检查通过。双手及左右单手实时启动已通过模拟链路检查；本版真机实时首帧尚未验收通过，动作精度与标定质量未验收。Linux 尚未测试，SDK 示例尚未连接设备验证。
 
 ## 主要功能
 
@@ -14,7 +14,7 @@ SDK：`2.3.2`；GUI：`2.0.12`；文档日期：`2026-10-26`。本版为 PyArmor
 - 单手／双手标定，单手、双手及自适应实时 3D 显示。
 - 输出 `(21, 3)` 关键点（米）、`(16, 16)` 压力 ADC（计数）与拟合力值（牛顿）。
 - 新佩戴标定保存补偿与对指兜底，计算后通过独立返回平展验证才可保存。
-- 四指关节约束默认开启；对指修正默认开启，Blend `1.0`，可通过 GUI 或 SDK 调节。
+- 四指关节约束、约束 Blending 和握拳预制修正默认开启；对指修正默认关闭，Blend 初始为 `1.0`，可通过 GUI 或 SDK 调节。
 - 回放已有 Parquet，渲染 MP4／PNG；通过 `sdk.open_glove()` / `sdk.open_bimanual()` 集成用户帧。
 
 ## 目录结构
@@ -51,7 +51,7 @@ python -m pip install -r requirements.txt
 python -c "import sdk, gui; print(sdk.get_version(), gui.APP_VERSION); print(sdk.__file__)"
 ```
 
-预期版本输出为 `2.3.2 2.0.12`，模块路径应位于本仓库。
+预期版本输出为 `2.3.3 2.0.13`，模块路径应位于本仓库。
 
 如 `chumpy==0.70` 构建失败，可在已激活环境中执行后重试：
 
@@ -163,6 +163,8 @@ with open_glove(
     "right", calibration="calibration/imu_calibration_right.json",
 ) as glove:
     glove.set_root_limits_enabled(True)
+    glove.set_root_limits_blending_enabled(True)
+    glove.set_fist_correction_enabled(True)
     glove.set_contact_controls(True, blend=0.5)
     for _ in range(100):
         try:
@@ -198,6 +200,8 @@ with open_bimanual(
     left_calibration="calibration/imu_calibration_left.json",
     right_calibration="calibration/imu_calibration_right.json",
 ) as gloves:
+    gloves.set_root_limits_blending_enabled(True)
+    gloves.set_fist_correction_enabled(True)
     gloves.left.set_contact_controls(False)
     gloves.right.set_contact_controls(True, blend=1.0)
     gloves.left.set_root_limits_enabled(True)
@@ -231,7 +235,9 @@ with open_bimanual(
 
 单手保留 `start()`、`read(timeout=None)`、`latest()`、`info()`、`health()`、`neutral_joints()`、`wait_for_firmware_version(timeout_s=5.0)`、`close()` 和上下文管理；还提供 `side`、`port`、`serial_number`、`mesh_vertices_m`、`backend` 属性。
 
-新增 `set_contact_controls(enabled: bool, blend: float = 1.0) -> None` 和 `set_root_limits_enabled(enabled: bool) -> None`。Blend 须为 `[0, 1]` 内有限数，否则抛出 `ValueError`；默认对指开启且 Blend 为 `1.0`，四指约束开启。设置作用于后续解算，已排队帧可能仍反映之前设置。
+姿态控制方法包括 `set_contact_controls(enabled: bool, blend: float = 1.0) -> None`、`set_root_limits_enabled(enabled: bool) -> None`、`set_root_limits_blending_enabled(enabled: bool) -> None` 和 `set_fist_correction_enabled(enabled: bool) -> None`。Blend 须为 `[0, 1]` 内有限数，否则抛出 `ValueError`。默认四指约束、约束 Blending 和握拳预制修正开启；对指关闭，Blend 初始为 `1.0`。
+
+约束 Blending 沿本次标定的对指动作线性减弱四指约束，关闭后恢复固定约束。握拳预制修正在有效的本次佩戴握拳采样附近修正四指，拇指保持原解算活动；缺少有效握拳采样的旧标定不启用该修正。设置作用于后续解算，已排队帧可能仍反映之前设置。
 
 双手保留 `start()`、`read(timeout=None)`、`health()`、`close()`、上下文管理及 `left` / `right` 单手对象；也可调用双手对象的同名设置方法统一设置两侧。SDK 版本查询为 `sdk.get_version()`，GUI 为 `gui.APP_VERSION`，固件用 `info().firmware_version` 读取并通过 `display_firmware_version()` 显示、`firmware_real_version()` 比较；未知固件为 `None`，不能用 SDK 版本代填。
 

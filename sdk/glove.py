@@ -610,6 +610,14 @@ class Glove:
         """Enable four-finger twist/spread and flexion limits (default True)."""
         self._impl.solver.set_root_limits_enabled(enabled)
 
+    def set_root_limits_blending_enabled(self, enabled: bool) -> None:
+        """Relax joint limits linearly toward opposition (default True)."""
+        self._impl.solver.set_root_limits_blending_enabled(enabled)
+
+    def set_fist_correction_enabled(self, enabled: bool) -> None:
+        """Enable four-finger fist correction; the thumb keeps its independent motion."""
+        self._impl.solver.set_fist_correction_enabled(enabled)
+
     def set_contact_controls(self, enabled: bool, blend: float = 1.0) -> None:
         """Apply attraction controls to subsequent solved frames."""
         self._impl.solver.set_contact_controls(enabled, blend)

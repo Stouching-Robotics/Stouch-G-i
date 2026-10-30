@@ -311,6 +311,14 @@ class UserGlove:
         """Enable or disable the default four-finger joint limits."""
         self._inner.set_root_limits_enabled(enabled)
 
+    def set_root_limits_blending_enabled(self, enabled: bool) -> None:
+        """Relax four-finger limits toward calibrated opposition (default True)."""
+        self._inner.set_root_limits_blending_enabled(enabled)
+
+    def set_fist_correction_enabled(self, enabled: bool) -> None:
+        """Blend the four fingers toward the fist preset; preserve thumb motion."""
+        self._inner.set_fist_correction_enabled(enabled)
+
     def close(self) -> None:
         self._inner.close()
 
@@ -365,6 +373,24 @@ class UserBimanualGlove:
         else:
             self.left.set_root_limits_enabled(enabled)
             self.right.set_root_limits_enabled(enabled)
+
+    def set_root_limits_blending_enabled(self, enabled: bool) -> None:
+        """Apply the joint-limit blending switch to both hands."""
+        forward = getattr(self._inner, "set_root_limits_blending_enabled", None)
+        if callable(forward):
+            forward(enabled)
+        else:
+            self.left.set_root_limits_blending_enabled(enabled)
+            self.right.set_root_limits_blending_enabled(enabled)
+
+    def set_fist_correction_enabled(self, enabled: bool) -> None:
+        """Apply the four-finger fist preset switch to both hands."""
+        forward = getattr(self._inner, "set_fist_correction_enabled", None)
+        if callable(forward):
+            forward(enabled)
+        else:
+            self.left.set_fist_correction_enabled(enabled)
+            self.right.set_fist_correction_enabled(enabled)
 
     def close(self) -> None:
         self._inner.close()
