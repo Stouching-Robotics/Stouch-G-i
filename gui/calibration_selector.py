@@ -35,7 +35,7 @@ else:
 DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
 
 
-def discover_calibration_files(directory: Path, side: str) -> list[Path]:
+def discover_calibration_files(directory: Path, side: str, *, catalog=None) -> list[Path]:
     """List normal calibrations first, then explicitly selectable experiments."""
     folder = Path(directory).expanduser().resolve()
     if not folder.is_dir():
@@ -44,8 +44,11 @@ def discover_calibration_files(directory: Path, side: str) -> list[Path]:
     experiments = []
     for path in [*folder.glob("*.json"), *(folder / "experiments").glob("*.json")]:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            payload = (catalog.read(path) if catalog is not None else
+                       json.loads(path.read_text(encoding="utf-8-sig")))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
             continue
         saved_side = str(payload.get("side") or "right").lower()
         if saved_side != side or not isinstance(payload.get("param_inst_calib"), dict):
@@ -67,18 +70,20 @@ def discover_calibration_files(directory: Path, side: str) -> list[Path]:
             + sorted(experiments, key=order, reverse=True))
 
 
-def _label(path: Path) -> str:
+def _label(path: Path, *, catalog=None) -> str:
     try:
         modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, ValueError, OverflowError):
         modified = "?"
     try:
         from sdk.calibration import resolve_calibration_profile
-        payload = json.loads(path.read_text(encoding='utf-8-sig'))
+        read = catalog.read if catalog is not None else lambda p: json.loads(p.read_text(encoding='utf-8-sig'))
+        payload = read(path)
         side = str(payload.get('side') or 'right').lower()
-        resolution = resolve_calibration_profile(path, side)
+        resolution = (resolve_calibration_profile(path, side, catalog=catalog)
+                      if catalog is not None else resolve_calibration_profile(path, side))
         state = resolution.status
-        selected = json.loads(resolution.path.read_text(encoding='utf-8-sig'))
+        selected = read(resolution.path)
         selected_shape = selected.get('param_shape_calib')
         profile = (selected_shape.get('sensor_motion_refit') or {}) if isinstance(selected_shape, dict) else {}
         if not isinstance(profile, dict):
@@ -94,11 +99,19 @@ def _label(path: Path) -> str:
         'invalid': L('[文件无效] ', '[Invalid file] '),
     }[state]
     if state in ('embedded', 'matched'):
+        installation = selected.get('param_inst_calib')
+        metadata = installation.get('metadata') if isinstance(installation, dict) else None
+        from common.calibration_root import ROOT_METHOD_SIMPLIFIED
+        if isinstance(metadata, dict) and metadata.get('root_method') == ROOT_METHOD_SIMPLIFIED:
+            prefix += L('[简化标定] ', '[Simplified] ')
         if profile.get('calibration_policy') == 'installation-neutral-verified-v1':
+            from common.calibration_validation import is_return_open_skipped
             quality = profile.get('quality')
             check = quality.get('return_open_validation') if isinstance(quality, dict) else None
             passed = isinstance(check, dict) and check.get('passed') is True
+            skipped = is_return_open_skipped(check)
             prefix += (L('[平展已验收] ', '[Open pose verified] ') if passed else
+                       L('[平展已跳过] ', '[Open verification skipped] ') if skipped else
                        L('[平展未验收] ', '[Open pose unverified] '))
         else:
             prefix += L('[旧版未验收] ', '[Legacy unverified] ')
@@ -138,9 +151,12 @@ def select_calibration_files(
         connection_status = {side: True for side in normalized}
         render_sides = normalized
 
+    from sdk.calibration import CalibrationProfileCatalog
+    catalog = CalibrationProfileCatalog()
+
     def discover(side: str) -> list[Path]:
         try:
-            return discover_calibration_files(directory, side)
+            return discover_calibration_files(directory, side, catalog=catalog)
         except (OSError, RuntimeError):
             return []
 
@@ -197,7 +213,7 @@ def select_calibration_files(
         name_label.setMinimumWidth(120)
         combo = QComboBox()
         for path in options[side]:
-            combo.addItem(_label(path), path)
+            combo.addItem(_label(path, catalog=catalog), path)
         if options[side]:
             combo.setCurrentIndex(0)
         combo.setEnabled(is_connected and bool(options[side]))
@@ -212,6 +228,8 @@ def select_calibration_files(
             row.addWidget(status)
         root.addLayout(row)
 
+    # Captures can be large; keep only labels/paths while the dialog is idle.
+    catalog = None
     root.addSpacing(12)
     buttons = QHBoxLayout()
     refresh_button: QPushButton | None = None
@@ -236,10 +254,12 @@ def select_calibration_files(
     collect_sides: list[str] = list(normalized)
 
     def do_refresh() -> None:
-        nonlocal connection_status, collect_sides
+        nonlocal connection_status, collect_sides, catalog
         if not callable(refresh_status):
             return
         fresh = refresh_status()
+        # A scan owns its cache; Refresh must observe changed/new/deleted files.
+        catalog = CalibrationProfileCatalog()
         connection_status = {
             str(side).lower(): bool(status) for side, status in fresh.items()
         }
@@ -251,7 +271,7 @@ def select_calibration_files(
             combo.blockSignals(True)
             combo.clear()
             for path in paths:
-                combo.addItem(_label(path), path)
+                combo.addItem(_label(path, catalog=catalog), path)
             if paths:
                 combo.setCurrentIndex(0)
             combo.setEnabled(is_connected and bool(paths))
@@ -275,6 +295,7 @@ def select_calibration_files(
         else:
             open_button.setText("No glove connected")
             open_button.setEnabled(False)
+        catalog = None
 
     def do_confirm() -> None:
         nonlocal result

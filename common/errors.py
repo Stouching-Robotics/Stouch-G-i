@@ -34,7 +34,9 @@ class CalibrationError(GloveSdkError):
 
 
 class CalibrationQualityError(CalibrationError):
-    pass
+    def __init__(self, message, *, retry_steps=()):
+        super().__init__(message)
+        self.retry_steps = tuple(retry_steps)
 
 
 class CalibrationCompatibilityError(CalibrationError):

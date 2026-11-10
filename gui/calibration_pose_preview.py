@@ -36,9 +36,11 @@ PREVIEW_WIDTH = 660
 PREVIEW_HEIGHT = 300
 # Approved static demo images for the fist calibration steps (rendered with
 # the axis-layer fist pose: four fingers curled, thumb fully extended).
-# The fist steps display these instead of the runtime render so the demo is
-# pixel-identical everywhere; the dynamic renderer stays as fallback.
+# These originals remain the source for the frozen fist images. Guided image
+# loading uses the versioned references below without a dynamic fallback.
 _FIST_STATIC_DIR = BUNDLE_ROOT / "assets" / "calibration_previews"
+_REFERENCE_VERSION = "v2_0_8"
+_REFERENCE_DIR = _FIST_STATIC_DIR / _REFERENCE_VERSION
 _CONTACT_NAMES = ("index", "middle", "ring", "little")
 # Fist preview: four-finger flexion expressed as anatomy-aligned Euler angles
 # (twist X, spread Y, bend Z in degrees, MANO pose order 0..12; thumb 13..15
@@ -106,9 +108,35 @@ def _default_calibration_path(side: str) -> Path:
 
 
 class CalibrationPosePreview:
-    """Generate cached BGR full-hand previews using the current lite renderer."""
+    """Load frozen guidance images and lazily expose legacy hand geometry."""
 
     def __init__(self):
+        self._reference_dir = _REFERENCE_DIR
+        self._image_cache: dict[tuple[str, int], np.ndarray] = {}
+        self._bimanual_image_cache: dict[int, np.ndarray] = {}
+        self._dynamic_initialized = False
+
+    def __getattr__(self, name: str):
+        """Keep legacy direct attributes such as ``_neutral`` lazy-compatible."""
+        if name == "_dynamic_initialized" or not name.startswith("_"):
+            raise AttributeError(name)
+        self._ensure_dynamic()
+        return object.__getattribute__(self, name)
+
+    def _ensure_dynamic(self) -> None:
+        if getattr(self, "_dynamic_initialized", False):
+            return
+        # Initialization calls joints_for_step()/mesh_for_step() while fitting
+        # the camera.  Marking first prevents those compatibility entry points
+        # from recursively entering this same initialization.
+        self._dynamic_initialized = True
+        try:
+            self._initialize_dynamic()
+        except Exception:
+            self._dynamic_initialized = False
+            raise
+
+    def _initialize_dynamic(self) -> None:
         self._models = {
             side: HandNumpy(side, BUNDLE_ROOT / "assets/hand")
             for side in ("left", "right")
@@ -291,8 +319,37 @@ class CalibrationPosePreview:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             self._live_enabled = False
             pass
-        self._image_cache: dict[tuple[str, int], np.ndarray] = {}
-        self._bimanual_image_cache: dict[int, np.ndarray] = {}
+
+    def _reference_path(
+            self, kind: str, step_index: int, side: str | None = None) -> Path:
+        if kind == "single":
+            if side not in ("left", "right"):
+                raise ValueError(f"side must be left or right, got {side!r}")
+            name = f"single_{side}_step_{step_index:02d}.png"
+        elif kind == "dual":
+            name = f"dual_step_{step_index:02d}.png"
+        else:
+            raise ValueError(f"unknown reference kind: {kind!r}")
+        return self._reference_dir / name
+
+    def _load_reference_image(
+            self, kind: str, step_index: int, side: str | None = None
+    ) -> np.ndarray:
+        path = self._reference_path(kind, step_index, side)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"missing frozen calibration reference: {path}. "
+                "Regenerate it with: python tools/freeze_calibration_references.py")
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(
+                f"cannot decode frozen calibration reference: {path}")
+        expected = (PREVIEW_HEIGHT, PREVIEW_WIDTH, 3)
+        if image.shape != expected or image.dtype != np.uint8:
+            raise ValueError(
+                f"invalid frozen calibration reference {path}: "
+                f"expected uint8 {expected}, got {image.dtype} {image.shape}")
+        return np.ascontiguousarray(image)
 
     def _align(self, side: str, joints: np.ndarray) -> np.ndarray:
         aligned = apply_hand_display_rotation(
@@ -536,6 +593,7 @@ class CalibrationPosePreview:
         )
 
     def joints_for_step(self, side: str, step_index: int) -> np.ndarray:
+        self._ensure_dynamic()
         side = str(side).lower()
         if side not in ("left", "right"):
             raise ValueError(f"side must be left or right, got {side!r}")
@@ -563,6 +621,7 @@ class CalibrationPosePreview:
 
     def mesh_for_step(self, side: str, step_index: int) -> np.ndarray:
         """Return the complete 778-vertex hand surface for a preview step."""
+        self._ensure_dynamic()
         side = str(side).lower()
         if side not in ("left", "right"):
             raise ValueError(f"side must be left or right, got {side!r}")
@@ -606,121 +665,24 @@ class CalibrationPosePreview:
         return np.ascontiguousarray(image)
 
     def render_bgr(self, side: str, step_index: int) -> np.ndarray:
-        key = (str(side).lower(), int(step_index))
+        side = str(side).lower()
+        if side not in ("left", "right"):
+            raise ValueError(f"side must be left or right, got {side!r}")
+        index = max(0, min(int(step_index), 14))
+        key = (side, index)
         cached = self._image_cache.get(key)
         if cached is not None:
-            return cached
-        if key[1] in (13, 14):
-            static = self._static_fist_image(key[0])
-            if static is not None:
-                self._image_cache[key] = static
-                return static
-        joints = self.joints_for_step(*key)
-        mesh = self.mesh_for_step(*key)
-        displayed = joints
-        slots = np.full((2, 21, 3), np.nan, np.float32)
-        slot = 0 if key[0] == "left" else 1
-        slots[slot] = displayed
-        mesh_slots: list[np.ndarray | None] = [None, None]
-        mesh_slots[slot] = mesh
-        if self._live_enabled:
-            is_contact = 8 <= key[1] <= 12
-            view = (self._contact_view[key[0]]
-                    if is_contact else self._live_view)
-            dist = (self._contact_dist[key[0]]
-                    if is_contact else self._live_dist[key[0]])
-            pan = (self._contact_pan[key[0]]
-                   if is_contact else self._live_pan[key[0]])
-            camera = Camera(
-                view["yaw"], view["elev"], dist,
-                roll_deg=view["roll"], pan_px=pan)
-            grid_r = max(0.1, dist * 0.5)
-            grid_basis = self._live_grid_basis
-        else:
-            camera_probe = Camera(
-                _PREVIEW_YAW, _PREVIEW_ELEV, _PREVIEW_DIST,
-                roll_deg=_PREVIEW_ROLL, pan_px=(0.0, 0.0))
-            hand_center = 0.5 * (mesh.min(axis=0) + mesh.max(axis=0))
-            projected_center, _ = camera_probe.project(hand_center[None])
-            pan_px = (
-                640.0 - float(projected_center[0, 0]),
-                360.0 - float(projected_center[0, 1]),
-            )
-            camera = Camera(
-                _PREVIEW_YAW, _PREVIEW_ELEV, _PREVIEW_DIST,
-                roll_deg=_PREVIEW_ROLL, pan_px=pan_px)
-            grid_r = 0.12
-            grid_basis = None
-        # No in-image title / "no pose required" text here: those overlays are
-        # drawn by the Qt layer as localized labels, and cv2's Hershey fonts
-        # cannot render CJK.  Only the hand, grid and contact markers are drawn.
-        # Contact previews intentionally reuse the left calibration pose for
-        # both sides, so they also use the matching left-hand face topology.
-        face_side = "left" if self._live_enabled and 8 <= key[1] <= 12 \
-            else key[0]
-        faces = self._mesh_faces[face_side]
-        image = render_frame_live(
-            camera, slots, [], None, grid_r=grid_r, grid_basis=grid_basis,
-            mesh_slots=mesh_slots, mesh_faces=faces, display_mode="hand")
-        if 8 <= key[1] <= 11:
-            target_tip = (8, 12, 16, 20)[key[1] - 8]
-            points, _ = camera.project(displayed[[4, target_tip]])
-            for point in points:
-                cv2.circle(
-                    image, tuple(np.rint(point).astype(int)), 15,
-                    (40, 210, 255), 3, cv2.LINE_AA)
-        # Remove unused widescreen margins so the hand stays legible inside
-        # the GUI panel, then return the BGR uint8 frame for a QImage display.
-        image = image[55:685, 190:1090]
-        image = cv2.resize(
-            image, (PREVIEW_WIDTH, PREVIEW_HEIGHT), interpolation=cv2.INTER_AREA)
-        image = np.ascontiguousarray(image)
+            return cached.copy()
+        image = self._load_reference_image("single", index, side)
         self._image_cache[key] = image
-        return image
+        return image.copy()
 
     def render_bimanual_bgr(self, step_index: int) -> np.ndarray:
-        """Return left/right full-hand references together in one panel.
-
-        Each side is rendered independently before composition.  This is
-        important for the mirrored root yaw and roll poses: duplicating one
-        side's image would teach exactly the wrong motion to the other hand.
-        """
+        """Return a frozen left/right full-hand reference panel."""
         index = max(0, min(int(step_index), 14))
         cached = self._bimanual_image_cache.get(index)
         if cached is not None:
-            return cached
-
-        source = {
-            side: self.render_bgr(side, index)
-            for side in ("left", "right")
-        }
-        gap = 10
-        panel_w = (PREVIEW_WIDTH - gap) // 2
-        panel_h = 260
-        panel_y = (PREVIEW_HEIGHT - panel_h) // 2
-        canvas = np.empty((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), np.uint8)
-        canvas[:] = (24, 31, 45)
-        for side, x0, accent in (
-                ("left", 0, (255, 180, 80)),
-                ("right", panel_w + gap, (80, 180, 255))):
-            image = source[side]
-            # The single-hand renderer deliberately includes generous side
-            # margins.  Remove them before scaling so both complete hands stay
-            # large and legible in the shared preview area.
-            crop_margin = max(0, (image.shape[1] - 500) // 2)
-            cropped = image[:, crop_margin:image.shape[1] - crop_margin]
-            panel = cv2.resize(
-                cropped, (panel_w, panel_h), interpolation=cv2.INTER_AREA)
-            canvas[panel_y:panel_y + panel_h, x0:x0 + panel_w] = panel
-            cv2.rectangle(
-                canvas, (x0, panel_y),
-                (x0 + panel_w - 1, panel_y + panel_h - 1),
-                accent, 2, cv2.LINE_AA)
-            cv2.putText(
-                canvas, "L" if side == "left" else "R",
-                (x0 + 12, panel_y + 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.8, accent, 2, cv2.LINE_AA)
-
-        canvas = np.ascontiguousarray(canvas)
+            return cached.copy()
+        canvas = self._load_reference_image("dual", index)
         self._bimanual_image_cache[index] = canvas
-        return canvas
+        return canvas.copy()

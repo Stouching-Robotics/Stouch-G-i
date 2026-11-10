@@ -531,7 +531,7 @@ class CalibrationStep:
     id: str
     title: str
     action: Literal["capture", "compute"]
-    stage: Literal["root", "installation", "contact"]
+    stage: Literal["root", "installation", "contact", "fist"]
 
 
 @dataclass(frozen=True)
@@ -547,6 +547,7 @@ class CalibrationProgress:
     total_steps: int
     completed_step_ids: tuple[str, ...]
     complete: bool
+    skipped_step_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

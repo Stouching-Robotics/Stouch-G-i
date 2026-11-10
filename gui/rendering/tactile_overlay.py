@@ -86,7 +86,8 @@ _PRESSURE_BANDS_FORCE_N = (
 
 def _band_colors(values: np.ndarray, bands: tuple) -> np.ndarray:
     """Map a pressure array to fixed discrete colour bands (one per cell)."""
-    values = np.maximum(0.0, np.asarray(values, np.float32))
+    values = np.maximum(0.0, np.nan_to_num(
+        np.asarray(values, np.float32), nan=0.0, posinf=0.0, neginf=0.0))
     upper = np.asarray([band[0] for band in bands], np.float32)
     palette = np.asarray([band[1] for band in bands], np.uint8)
     indices = np.searchsorted(upper, values, side="left")
@@ -564,7 +565,7 @@ def _draw_cell_values(
         for col in range(_GRID_COLS):
             if linear_fitted:
                 label = (f"{float(displayed[row, col]):.2f}"
-                         if row < 4 else "--")
+                         if np.isfinite(displayed[row, col]) else "--")
             else:
                 label = str(int(round(float(displayed[row, col]))))
             scale, width, height = _text_metrics(label, cell, base_scale)
@@ -745,7 +746,8 @@ def _render_card(
 
     values = np.maximum(0.0, np.asarray(frame, np.float32))
     displayed = _display_matrix(values, side)
-    peak = max(0.0, float(values.max()))
+    finite = values[np.isfinite(values)]
+    peak = max(0.0, float(finite.max())) if finite.size else None
     cell_colors = _band_colors(displayed, bands)
     grid_h = _GRID_ROWS * cell
     grid_w = _GRID_COLS * cell
@@ -759,8 +761,8 @@ def _render_card(
         linear_fitted=linear_fitted)
     if card.shape[1] >= 260:
         ui = _ui_factor(cell)
-        peak_text = (f"MAX {peak:.2f} N" if linear_fitted
-                     else f"MAX {peak:.0f}")
+        peak_text = ((f"MAX {peak:.2f} N" if peak is not None else "N unavailable")
+                     if linear_fitted else f"MAX {peak or 0:.0f}")
         peak_scale = 0.36 * ui
         (peak_w, _), _ = cv2.getTextSize(
             peak_text, cv2.FONT_HERSHEY_SIMPLEX, peak_scale, 1)
@@ -779,15 +781,17 @@ def draw_bimanual_tactile_overlay(
         threshold: float = 0.0,
         scale: float = 0.6,
         baseline_corrected: bool | dict[str, bool] = True,
-        linear_fitted: bool = False) -> np.ndarray:
+        linear_fitted: bool = False,
+        linear_fit_params: dict[str, dict] | None = None,
+        force_frames: dict[str, np.ndarray | None] | None = None,
+        threshold_baselines: dict[str, np.ndarray | None] | None = None) -> np.ndarray:
     """Draw compact active-region pressure cards on a 1280x720 BGR frame.
 
-    ``linear_fitted`` says the frame already carries force in newtons -- which
-    is what the public SDK hands over -- so there is nothing left to fit and
-    the newton bands are used.  NaN cells (positions no fitted region covers)
-    read as zero force.  Otherwise ``baseline_corrected`` selects the fixed
-    colour scale for legacy ADC recordings: the corrected (baseline-subtracted)
-    bands when True, else the full raw-ADC bands.
+    ``baseline_corrected`` selects the fixed colour scale: the corrected
+    (baseline-subtracted) bands when True, else the full raw-ADC bands.  It
+    also takes a per-side mapping, because one hand can be calibrated while
+    the other is still uncalibrated and showing raw numbers -- the two need
+    different bands to match the numbers they are drawn from.
     """
 
     def bands_for(side: str) -> list:
@@ -807,18 +811,43 @@ def draw_bimanual_tactile_overlay(
             if isinstance(baseline_corrected, dict)
             else bool(baseline_corrected)
         )
-        frame = np.asarray(
+        raw = np.asarray(
             tactile_frames[side], dtype=np.float32).reshape(16, 16)
-        frame = np.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
-        if threshold > 0:
-            frame = np.where(frame < float(threshold), 0.0, frame)
+        if linear_fitted:
+            if force_frames is not None:
+                supplied = force_frames.get(side)
+                frame = (np.full((16, 16), np.nan, np.float32)
+                         if supplied is None else
+                         np.asarray(supplied, np.float32).reshape(16, 16).copy())
+            elif linear_fit_params is not None and linear_fit_params.get(side) is not None:
+                # Compatibility for callers with an explicitly verified profile.
+                from algorithm.force_fit import fit_finger_force_matrix
+                frame = fit_finger_force_matrix(raw, side, linear_fit_params[side])
+            else:
+                frame = np.full((16, 16), np.nan, np.float32)
+            if threshold > 0:
+                response = raw
+                if threshold_baselines is not None:
+                    baseline = threshold_baselines.get(side)
+                    response = (np.full((16, 16), np.nan, np.float32)
+                                if baseline is None else
+                                raw - np.asarray(baseline, np.float32).reshape(16, 16))
+                # Threshold stays in ADC units; the SDK N matrix is already fitted.
+                frame = np.where(np.isfinite(frame) & np.isfinite(response),
+                                 np.where(response < float(threshold), 0.0, frame), np.nan)
+        else:
+            frame = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+            if threshold > 0:
+                frame = np.where(frame < float(threshold), 0.0, frame)
 
         # The cell size depends on the frame as well as on the scale, so the
         # frame shape joins the cache key: the same scale on a smaller canvas
         # would otherwise reuse a card too wide for it.
         cell = _card_cell(scale, img.shape)
+        calibration = (None if linear_fit_params is None
+                       else linear_fit_params.get(side))
         cache_key = (side, frame.tobytes(), float(threshold), cell,
-                     corrected, linear_fitted)
+                     corrected, linear_fitted, id(calibration))
         cached = _CARD_CACHE.get(cache_key)
         if cached is None:
             cached = _render_card(

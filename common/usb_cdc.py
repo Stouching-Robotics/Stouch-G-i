@@ -1181,7 +1181,7 @@ class UsbCdcFrameParser:
                         # frame header, not by the legacy 1032-byte per-set
                         # layout.  Keep accepting the legacy size too (it is
                         # included by this range).
-                        fit_length_ok = 0 < payload_length <= 0xFFFF
+                        fit_length_ok = 0 <= payload_length <= 0xFFFF
                     else:
                         fit_length_ok = payload_length in PARAM_ACK_PAYLOAD_SIZES
                     if (header_size != USB_SLIM_HEADER_SIZE

@@ -380,6 +380,12 @@ class HandRuntime:
     latest_uv: np.ndarray | None = None
     latest_force: np.ndarray | None = None
     latest_adc: np.ndarray | None = None
+    force_source: str = "unavailable"
+    force_status: str = "unread"
+    force_error: str = ""
+    force_connection_id: str | None = None
+    force_baseline_id: str | None = None
+    force_fresh: bool = False
     latest_host_s: float = 0.0
     last_seq: int = -1
     safety: bool = False
@@ -411,6 +417,12 @@ class _AbsentHandRuntime:
     latest_smoothed = None
     latest_force = None
     latest_adc = None
+    force_source = "unavailable"
+    force_status = "unread"
+    force_error = ""
+    force_connection_id = None
+    force_baseline_id = None
+    force_fresh = False
     last_seq = -1
     safety = False
     contact = None
@@ -447,6 +459,12 @@ class PublishedHandState:
         self.latest_smoothed = None
         self.latest_force = None
         self.latest_adc = None
+        self.force_source = "unavailable"
+        self.force_status = "unread"
+        self.force_error = ""
+        self.force_connection_id = None
+        self.force_baseline_id = None
+        self.force_fresh = False
         self.safety = False
         self.contact = None
         self.warming_up = False
@@ -470,12 +488,105 @@ def draw_bimanual_tactile_overlay(
         threshold: float = 0.0,
         scale: float = 0.6,
         baseline_corrected: bool = True,
-        linear_fitted: bool = False) -> np.ndarray:
+        linear_fitted: bool = False,
+        linear_fit_params: dict[str, dict] | None = None,
+        force_frames: dict[str, np.ndarray | None] | None = None,
+        threshold_baselines: dict[str, np.ndarray | None] | None = None) -> np.ndarray:
     """Compatibility wrapper for the full-matrix tactile UI."""
     return draw_full_matrix_tactile_overlay(
         img, tactile_frames, threshold=threshold, scale=scale,
         baseline_corrected=baseline_corrected,
-        linear_fitted=linear_fitted)
+        linear_fitted=linear_fitted,
+        linear_fit_params=linear_fit_params,
+        force_frames=force_frames,
+        threshold_baselines=threshold_baselines)
+
+
+def _sdk_force_payload(frame):
+    """Only a verified current SDK force snapshot may reach an N card."""
+    status = str(getattr(frame, "force_status", "unread"))
+    source = str(getattr(frame, "force_source", "unavailable"))
+    values = getattr(frame, "force_n", None)
+    force = (np.asarray(values, np.float32).reshape(16, 16).copy()
+             if values is not None and status == "ready" and source == "device"
+             else None)
+    return {"force_n": force, "force_source": source,
+            "force_status": status,
+            "force_connection_id": getattr(frame, "_force_connection_id", None),
+            "force_baseline_id": getattr(frame, "_force_baseline_id", None),
+            "force_error": str(getattr(frame, "force_error", "") or "")}
+
+
+def _force_payload_signature(payload):
+    force = payload["force_n"]
+    return (payload["force_source"], payload["force_status"],
+            payload["force_error"], payload["force_connection_id"],
+            payload["force_baseline_id"], None if force is None else force.tobytes())
+
+
+def _param_command_worker(stream, side, command_queue, result_queue,
+                          stop_event) -> None:
+    """Serve the GUI's parameter-command requests on the stream this process owns.
+
+    The solver process holds the glove's serial port for its whole life, so the
+    GUI cannot open it to send a command of its own; requests arrive here and
+    are sent over the link that is already open.
+
+    A thread of its own rather than a branch of the solve loop: a fit command
+    can spend seconds waiting on the device, and poses have to keep flowing
+    meanwhile.  Nothing needs to be synchronised with the solve loop for that
+    to be safe -- the transport serialises whole command sessions internally,
+    and its reader thread owns the wire.
+
+    Nothing in here may raise.  A fault is a result the user can read, never a
+    silently dead thread.
+    """
+
+    while not stop_event.is_set():
+        try:
+            request = command_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        except (OSError, EOFError, ValueError):
+            return  # the parent closed the queue out from under us
+        try:
+            payload = _run_pressure_fit_request(stream, request)
+        except BaseException as exc:  # noqa: BLE001 - reported, not raised
+            payload = {
+                "type": "pressure_fit_test",
+                "side": side,
+                "op": str(request.get("op") or ""),
+                "ok": False,
+                "message": f"{type(exc).__name__}: {exc}",
+                "connection_id": request.get("connection_id"),
+                "baseline_id": request.get("baseline_id"),
+            }
+        try:
+            result_queue.put(payload, timeout=1.0)
+        except queue.Full:
+            pass
+        except (OSError, EOFError, ValueError):
+            return
+
+
+def _run_pressure_fit_request(stream, request):
+    """Execute only a verified read or a host-memory baseline update."""
+    op=str(request.get("op") or "")
+    payload={"type":"pressure_fit_test", "op":op, "side":request.get("side"),
+             "connection_id":request.get("connection_id"),
+             "baseline_id":request.get("baseline_id")}
+    if op == "set_force_baseline":
+        stream.set_force_baseline(request.get("baseline"),
+            connection_id=request.get("connection_id"), baseline_id=request.get("baseline_id"))
+        payload.update(ok=True, message="")
+    elif op == "read_raw":
+        result=stream.read_force_calibration(timeout_s=5.0)
+        payload.update(ok=bool(result.ok), message=result.error,
+                       force_status=result.status, profile=result.calibration,
+                       raw_length=None if result.data is None else len(result.data))
+    else:
+        payload.update(ok=False, message="operation is unavailable in the user edition")
+    return payload
 
 
 class BimanualViewer(Live3DViewer):
@@ -526,17 +637,31 @@ class BimanualViewer(Live3DViewer):
                       "connected": "right" in self.present_sides, "stale": False},
         }
         self.tactile_frames = {"left": None, "right": None}
+        self.force_statuses = {side: "unread" for side in ("left", "right")}
+        self.force_sources = {side: "unavailable" for side in ("left", "right")}
+        self.force_errors = {side: "" for side in ("left", "right")}
+        self._force_connections = {side: None for side in ("left", "right")}
+        self._force_baseline_ids = {side: None for side in ("left", "right")}
+        self._force_baseline_queues = {}
+        self._param_command_queues = {}
+        self._param_result_queues = {}
+        self.tactile_threshold = 30
+        self._pressure_fit_busy = False
+        self._pressure_fit_status = ""
+        self._pending_force_baselines = {}
+        self._force_refresh_needed = set()
+        self.tactile_force_frames = {side:None for side in ("left","right")}
+        self.tactile_calibrating_sides = {side:True for side in ("left","right")}
+        self.tactile_stamps = {side:None for side in ("left","right")}
+        self._tactile_stamps_pending = {side:False for side in ("left","right")}
+        self._tactile_scans_consumed = {side:None for side in ("left","right")}
         # The raw ADC the forces above were fitted from, for the panel's ADC
         # view.  Kept apart from ``tactile_frames`` because those newtons also
         # drive the on-mesh tiles and points, which have no ADC scale.
         self.tactile_adc_frames = {"left": None, "right": None}
-        # Pressure-matrix baseline (the admin edition's convention, shared with
-        # the standalone pressure tools).  ``use_baseline`` is the ADC card's
-        # view switch -- corrected or raw -- and it only picks what is drawn:
-        # the baseline itself is collected when the user presses 重新采集基线
-        # with the glove unloaded, and nothing is collected automatically.  It
-        # starts off, so a fresh start shows the raw map; until a baseline
-        # exists the corrected view falls back to that same raw map.
+        # The ADC display baseline also calibrates the SDK force matrix. The
+        # corrected/raw switch only selects the ADC view; the N card uses SDK
+        # force calculated against this measured baseline.
         self.tactile_raw_frames = {"left": None, "right": None}
         self.tactile_baseline = {"left": None, "right": None}
         self.use_baseline = False
@@ -637,6 +762,22 @@ class BimanualViewer(Live3DViewer):
                     print(
                         f"[Pressure view warning] Cannot prepare {side} hand map: {exc}",
                         file=sys.stderr)
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QSlider
+        self._tactile_threshold_row=QWidget(self._qcanvas)
+        threshold_layout=QHBoxLayout(self._tactile_threshold_row)
+        threshold_layout.setContentsMargins(10,2,10,2)
+        threshold_layout.addWidget(QLabel(L("阈值 (ADC)","Threshold (ADC)")))
+        threshold_slider=QSlider(Qt.Horizontal)
+        threshold_slider.setRange(0,2047)
+        threshold_slider.setValue(self.tactile_threshold)
+        threshold_value=QLabel(str(self.tactile_threshold))
+        threshold_slider.valueChanged.connect(self._on_tactile_thr)
+        threshold_slider.valueChanged.connect(lambda value:threshold_value.setText(str(value)))
+        threshold_layout.addWidget(threshold_slider,1)
+        threshold_layout.addWidget(threshold_value)
+        self._qcanvas.layout().addWidget(self._tactile_threshold_row)
+        self._tactile_threshold_row.setVisible(self.tactile_panel_mode != "off")
         self._relative_reference_slots = self._display_slots().copy()
         # Window title bar is updated once the firmware version is known.
         self._window_title_shown = self._qcanvas.windowTitle()
@@ -1086,14 +1227,13 @@ class BimanualViewer(Live3DViewer):
     def _resizable_tactile_frames(self):
         """The frames whose card is on screen with a resize handle.
 
-        Only the matrix panels draw a resizable card, and only while one of
-        them is the selected view.  Both views share the card's geometry, so the
-        handles follow whichever matrix that view is showing.
+        The two matrix panels are the resizable ones and each is drawn from a
+        different source, so the answer depends on the selected view.
         """
         if self.tactile_panel_mode == "matrix":
             return self.tactile_frames
-        if self.tactile_panel_mode == "adc":
-            return self.tactile_adc_frames
+        if self.tactile_panel_mode == "linear_matrix":
+            return self.tactile_raw_frames
         return {}
 
     def _tactile_grip_at(self, x, y):
@@ -1181,37 +1321,89 @@ class BimanualViewer(Live3DViewer):
         self.request_selector = False
         return requested
 
-    def set_tactile_side(self, side, force_n, adc=None):
-        """Store one hand's force matrix, and the ADC it was fitted from.
-
-        ``force_n`` is the frame's ``force_n`` field: a (16, 16) float32 array
-        of newtons straight out of the client-edition SDK, with NaN in the cells
-        no fitted region covers and ``None`` when the frame carried no pressure
-        scan at all.  Nothing is converted or baseline-corrected here -- the
-        ADC-to-newton step already happened on the SDK side.
-
-        ``adc`` is that same frame's ``tactile_adc``: the raw 12-bit counts for
-        the panel's ADC view.  The raw scan is kept here -- it is what a running
-        baseline run averages -- and the ADC card draws
-        :meth:`_adc_display_value` of it: floor-clamped raw, or
-        ``max(0, adc - baseline)`` when 使用基线 is on.  See
-        ``_DISPLAY_ADC_FLOOR`` for why the floor belongs to the display and not
-        to the reading.  The newton matrix is deliberately not clamped: it has
-        a real zero, and a floor there would be a lie.
-        """
-        matrix = (None if force_n is None else
-                  np.asarray(force_n, np.float32).reshape(16, 16))
-        raw16 = (None if adc is None else
-                 np.asarray(adc, np.float32).reshape(16, 16))
-        self.tactile_frames[side] = matrix
+    def set_tactile_side(self, side, processed, raw=None, stamps=None,
+                         force_n=None, force_status="unread", force_error="",
+                         tactile_fresh=True, tactile_scan=None,
+                         force_connection_id=None, force_baseline_id=None):
+        # The overlay is driven by the raw ADC map so the baseline toggle can
+        # switch between raw and baseline-corrected display (glove-test style);
+        # the force curves use ``processed`` so their zero level and denoising
+        # remain stable regardless of the pressure-map display mode.
+        raw16 = (None if raw is None else
+                 np.asarray(raw, np.float32).reshape(16, 16))
+        self._set_force_connection(side, force_connection_id)
+        if (self._force_output_requested() and not self._baseline_collecting
+                and self._force_baseline_missing(side)
+                and raw16 is not None and force_connection_id is not None):
+            self._start_baseline_collection(sides=(side,))
+        if tactile_scan is not None:
+            tactile_fresh = (raw16 is not None and
+                             self._tactile_scans_consumed.get(side) != tactile_scan)
+            if raw16 is not None:
+                self._tactile_scans_consumed[side] = tactile_scan
         self.tactile_raw_frames[side] = raw16
-        if self._baseline_collecting and raw16 is not None:
+        self.tactile_calibrating_sides[side] = raw16 is None
+        if (tactile_fresh and self._baseline_collecting and raw16 is not None
+                and force_connection_id is not None):
             self._baseline_sample(side, raw16)
-        self.tactile_adc_frames[side] = self._adc_display_value(side)
+        baseline_matches = (force_baseline_id is not None
+                            and force_baseline_id == self._force_baseline_ids[side])
+        self.tactile_force_frames[side] = (
+            np.asarray(force_n, np.float32).reshape(16, 16).copy()
+            if force_n is not None and force_status == "ready" and baseline_matches
+            else None)
+        self.force_statuses[side] = (
+            "no_baseline" if force_status == "ready" and not baseline_matches
+            else str(force_status))
+        self.force_errors[side] = str(force_error or "")
+        self.tactile_frames[side] = self._tactile_display_value(side)
+        # ``stamps`` arrives with the same frame as the picture above, so it is
+        # replaced here rather than merged: a stale tuple left in place would be
+        # closed by the *next* frame's paint time and report a hop that never
+        # happened.  Only ``--link-diag`` sends it at all.
+        self.tactile_stamps[side] = stamps
+        self._tactile_stamps_pending[side] = bool(stamps)
+        if tactile_fresh:
+            pass  # User edition has no force-history recorder.
         # No _redraw_requested here: the pressure stream bumps faster than the
         # display gate and forcing a redraw per bump made the draw rate track
         # the sensor rate instead of the gate (visible as jitter while moving).
         # The panel is picked up by the next scheduled gate frame instead.
+
+    def _set_force_connection(self, side, connection_id):
+        if self._force_connections[side] == connection_id:
+            return
+        self._force_connections[side] = connection_id
+        if connection_id is not None:
+            self._force_refresh_needed.add(side)
+        self._force_baseline_ids[side] = None
+        self._pending_force_baselines.pop(side, None)
+        self.tactile_baseline[side] = None
+        self.tactile_force_frames[side] = None
+        self._baseline_buffer[side] = []
+        self._baseline_done[side] = False
+        self._tactile_scans_consumed[side] = None
+        if connection_id is not None and self._force_output_requested():
+            if not self._baseline_collecting:
+                self._start_baseline_collection(sides=(side,))
+            elif side not in self._baseline_sides:
+                self._baseline_sides += (side,)
+
+    def _queue_force_baseline(self, side, baseline):
+        """Schedule a host-only update on the existing serialised worker."""
+        baseline_id = None if baseline is None else f"{side}-{time.monotonic_ns()}"
+        self._force_baseline_ids[side] = baseline_id
+        self.tactile_force_frames[side] = None
+        if self.force_statuses.get(side) == "ready":
+            self.force_statuses[side] = "no_baseline"
+        connection_id = self._force_connections[side]
+        if connection_id is not None:
+            self._pending_force_baselines[side] = {
+                "op": "set_force_baseline", "side": side,
+                "connection_id": connection_id, "baseline_id": baseline_id,
+                "baseline": (None if baseline is None else
+                             np.asarray(baseline, np.float32).copy()),
+            }
 
     def _adc_display_value(self, side):
         """The ADC card's picture for one hand: corrected or floor-clamped raw."""
@@ -1228,31 +1420,37 @@ class BimanualViewer(Live3DViewer):
     def _tactile_panel_label(self) -> str:
         return L("触觉面板", "Tactile panel")
 
-    def _tactile_panel_mode_options(self) -> list[tuple[str, str]]:
-        # Every mode the panel answers to is offered here, and this list is the
-        # only thing that decides which ones a user can reach: the guards
-        # (``_on_tactile_panel_mode``), the resize handle
-        # (``_resizable_tactile_frames``) and the draw branch in
-        # ``_draw_tactile`` are keyed by mode name alone.  Leaving an entry out
-        # hides a finished feature rather than disabling it.
-        return [
-            ("off", L("关闭", "Off")),
-            ("matrix", L("压力矩阵 (N)", "Pressure matrix (N)")),
-            ("adc", L("压力矩阵 (ADC)", "Pressure matrix (ADC)")),
-        ]
+    def _tactile_panel_mode_options(self):
+        return [("off", L("关闭", "Off")),
+                ("linear_matrix", L("力矩阵 (N)", "Force matrix (N)")),
+                ("matrix", L("压力矩阵 (ADC)", "Pressure matrix (ADC)"))]
 
     def _on_tactile_panel_mode(self, mode: str) -> None:
         mode = str(mode)
         self.tactile_panel_mode = (
             mode
-            if mode in {"off", "matrix", "adc"}
+            if mode in {"off", "matrix", "linear_matrix"}
             else "off"
         )
-        # The pressure-baseline toggle acts on the ADC card's own map, so it
-        # rides with the panel: with the panel off there is nothing on screen
+        # The pressure-baseline toggle acts on the tactile panel's own maps, so
+        # it rides with the panel: with the panel off there is nothing on screen
         # to correct.  Only visibility changes; ``use_baseline`` is left alone.
         self._qcanvas.set_baseline_controls_visible(
             self.tactile_panel_mode != "off")
+        if self._force_output_requested():
+            missing = tuple(side for side in self.present_sides
+                            if self._force_baseline_missing(side))
+            if missing and not self._baseline_collecting:
+                self._start_baseline_collection(sides=missing)
+            elif missing:
+                for side in missing:
+                    if side not in self._baseline_sides:
+                        self._baseline_sides += (side,)
+                        self._baseline_buffer[side] = []
+                        self._baseline_done[side] = False
+                        self._queue_force_baseline(side, None)
+        if hasattr(self,"_tactile_threshold_row"):
+            self._tactile_threshold_row.setVisible(self.tactile_panel_mode != "off")
         # Any resize in flight was aimed at a card that is no longer there.
         self._tactile_resize = None
         self._redraw_requested = True
@@ -1281,7 +1479,7 @@ class BimanualViewer(Live3DViewer):
         if self.use_baseline:
             self._start_baseline_collection()
         for side in ("left", "right"):
-            self.tactile_adc_frames[side] = self._adc_display_value(side)
+            self.tactile_frames[side] = self._tactile_display_value(side)
         self._update_baseline_status()
         self._redraw_requested = True
 
@@ -1294,51 +1492,58 @@ class BimanualViewer(Live3DViewer):
         self._start_baseline_collection()
         self._redraw_requested = True
 
-    def _start_baseline_collection(self) -> None:
+    def _start_baseline_collection(self, *, sides=None):
         self._baseline_collecting = True
         # One press covers both hands when both are connected, and just the one
         # hand when only one is.  The fallback keeps the run open when it was
         # started before any hand is known: the contributing-frames rule in
         # ``_finish_baseline_if_complete`` then decides who counts.
-        targets = tuple(side for side in ("left", "right")
-                        if side in self.present_sides)
+        targets = (tuple(sides) if sides is not None else
+                   tuple(side for side in ("left", "right")
+                         if side in self.present_sides))
         self._baseline_sides = targets or ("left", "right")
         self._baseline_buffer = {"left": [], "right": []}
-        self._baseline_done = {"left": False, "right": False}
+        self._baseline_done = {side: side not in self._baseline_sides
+                               for side in ("left", "right")}
+        for side in self._baseline_sides:
+            self._queue_force_baseline(side, None)
         self._update_baseline_status()
 
-    def _baseline_sample(self, side, raw16) -> None:
+    def _baseline_sample(self, side, raw16):
         """Advance the baseline calibration by one raw frame.
 
         The first frame after the button press already counts -- there is no
-        settle delay, matching the standalone pressure tools, where the user is
-        told to press the button while the glove is unloaded and the next
-        ``_BASELINE_FRAMES`` frames are averaged.  Sides are independent: each
-        keeps sampling until it has its own ``_baseline_target`` frames, so a
-        two-hand run calibrates both hands from one press.
+        settle delay, matching ``hands_ma.py``/``matrix_gui.py``, where the
+        user is told to press the button while the glove is unloaded and the
+        next ``_BASELINE_FRAMES`` frames are averaged.  Sides are independent:
+        each keeps sampling until it has its own ``_baseline_target`` frames,
+        so a two-hand run calibrates both hands from one press.
         """
-        if self._baseline_done.get(side, False):
+        if side not in self._baseline_sides or self._baseline_done.get(side, False):
             return
-        self._baseline_buffer[side].append(raw16)
+        if not np.isfinite(raw16).all() or np.any((raw16 < 0) | (raw16 > 4095)):
+            return
+        self._baseline_buffer[side].append(raw16.copy())
         if len(self._baseline_buffer[side]) >= self._baseline_target:
             stack = np.stack(
                 self._baseline_buffer[side][-self._baseline_target:], axis=0)
-            # Mean, not median: the same per-cell average the admin edition
-            # computes, so a value read here matches one read there.
+            # Mean, not median: the same per-cell average the two reference
+            # tools compute, so a value read here matches one read there.
             self.tactile_baseline[side] = np.mean(
                 stack, axis=0).astype(np.float32)
+            self._queue_force_baseline(side, self.tactile_baseline[side])
             self._baseline_done[side] = True
         self._finish_baseline_if_complete()
 
-    def _finish_baseline_if_complete(self) -> None:
+    def _finish_baseline_if_complete(self):
         if not self._baseline_collecting:
             return
         # "Every side that contributed frames", not "every side the runtimes
         # announced".  Two failures hide behind the wrong test: with an empty
         # ``present_sides`` the condition is vacuously true, so the collection
         # retires and the status claims a baseline that was never collected
-        # (the corrected view would then silently keep showing raw numbers),
-        # while an announced side that stops delivering frames before its last
+        # (the calibrated view would then silently keep showing raw numbers),
+        # while an announced side that stops delivering frames before its tenth
         # sample would hold the collection open forever.
         contributed = [side for side in ("left", "right")
                        if self._baseline_buffer[side]]
@@ -1349,7 +1554,7 @@ class BimanualViewer(Live3DViewer):
             # already available, without waiting for their next tactile frame.
             for side in ("left", "right"):
                 if self.tactile_raw_frames.get(side) is not None:
-                    self.tactile_adc_frames[side] = self._adc_display_value(side)
+                    self.tactile_frames[side] = self._tactile_display_value(side)
         self._update_baseline_status()
 
     def _update_baseline_status(self) -> None:
@@ -1412,62 +1617,140 @@ class BimanualViewer(Live3DViewer):
         self.pressure_display_mode = (
             mode if mode in {"none", "points", "tiles"} else "none")
         self._redraw_requested = True
+        self._ensure_force_baselines()
 
     def _draw_tactile(self, img):
-        # The on-mesh overlays paint ``force_n`` -- newtons already fitted by
-        # the SDK -- because the mesh has no ADC scale to colour against, and
-        # the newton panel does the same.  The ADC panel paints the other
-        # matrix: the raw scan those newtons were fitted from, in sensor counts.
-        # ``_adc_display_value`` already subtracted the baseline when 使用基线
-        # is on, so the colour bands have to follow the same per-hand answer --
-        # a corrected frame is 0..~500 and would all but vanish on the raw
-        # scale, while an uncalibrated ~2000 would go solid red on the
-        # corrected one.
-        #
-        # No threshold is forwarded to either card: the client edition has no
-        # ADC-count gate (the old tactile_thr slider is gone), and every force
-        # value here is 0..5 N, so the ADC scale it counted in has nothing to
-        # say.  The floor that separates contact from an idle sensor is
-        # ``_NEWTON_CONTACT_FLOOR_N`` inside ``gui.rendering.tactile_pressure_hand``.
-        newton_ready = {"left": False, "right": False}
-        # Per hand, because one glove can be calibrated while the other is not.
-        baseline_ready = {
-            side: bool(self.use_baseline
-                       and self.tactile_baseline.get(side) is not None)
-            for side in ("left", "right")
-        }
+        ready={side:self.tactile_force_frames.get(side) is not None for side in ("left","right")}
         if self.display_mode == "hand" and self._pressure_mappers:
-            camera = self._camera()
-            mesh_slots = self._controlled_display_mesh_slots()
+            camera=self._camera();mesh_slots=self._controlled_display_mesh_slots()
             if self.pressure_display_mode == "tiles":
-                draw_pressure_tiles(
-                    img, camera, mesh_slots, self.tactile_frames,
-                    self._pressure_mappers, newton_ready, newtons=True)
+                draw_pressure_tiles(img,camera,mesh_slots,self.tactile_force_frames,self._pressure_mappers,ready,newtons=True)
             elif self.pressure_display_mode == "points":
-                draw_pressure_color_points(
-                    img, camera, mesh_slots, self.tactile_frames,
-                    self._pressure_mappers, newton_ready, newtons=True)
-            # "none" -> draw nothing on the mesh surface
-        if self.tactile_panel_mode == "matrix":
-            draw_bimanual_tactile_overlay(
-                img,
-                self.tactile_frames,
-                scale=self.tactile_scale,
-                baseline_corrected=False,
-                linear_fitted=True,
-            )
-        elif self.tactile_panel_mode == "adc":
-            # The same card fed the scan the newtons were fitted from, so the
-            # per-cell numbers are what the sensor reported instead of what the
-            # fit made of it -- on the raw band scale, or the corrected one once
-            # a baseline exists and 使用基线 is on.
-            draw_bimanual_tactile_overlay(
-                img,
-                self.tactile_adc_frames,
-                scale=self.tactile_scale,
-                baseline_corrected=baseline_ready,
-                linear_fitted=False,
-            )
+                draw_pressure_color_points(img,camera,mesh_slots,self.tactile_force_frames,self._pressure_mappers,ready,newtons=True)
+        self._draw_wrist_labels(img)
+        if self.tactile_panel_mode == "linear_matrix":
+            draw_bimanual_tactile_overlay(img,self.tactile_raw_frames,
+                threshold=self.tactile_threshold,scale=self.tactile_scale,
+                baseline_corrected=False,linear_fitted=True,
+                force_frames=self.tactile_force_frames,threshold_baselines=self.tactile_baseline)
+        elif self.tactile_panel_mode == "matrix":
+            corrected={side:bool(self.use_baseline and self.tactile_baseline.get(side) is not None) for side in ("left","right")}
+            draw_bimanual_tactile_overlay(img,self.tactile_frames,
+                threshold=self.tactile_threshold,scale=self.tactile_scale,baseline_corrected=corrected)
+
+    def _draw_wrist_labels(self, img):
+        camera = self._camera()
+        wrists = self._controlled_display_slots()[:, 0, :]
+        points, depth = camera.project(wrists)
+        for index, label, color in ((0, "L", (255, 180, 80)),
+                                    (1, "R", (80, 180, 255))):
+            if np.isfinite(points[index]).all() and depth[index] > 0:
+                position = tuple(points[index].astype(int) + np.array([8, -8]))
+                cv2.putText(img, label, position, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9, color, 2, cv2.LINE_AA)
+
+    def _force_baseline_missing(self, side):
+        return (self.tactile_baseline.get(side) is None
+                or self._force_baseline_ids.get(side) is None)
+
+    def _flush_force_baselines(self):
+        if self._pressure_fit_busy or not self._pending_force_baselines:
+            return
+        plan = list(self._pending_force_baselines.values())
+        self._pending_force_baselines.clear()
+        self._run_pressure_fit("set_force_baseline", background=True, requests=plan)
+
+    def _update_force_connection_state(self, statuses):
+        for side, status in statuses.items():
+            if not status.get("connected") or status.get("stale"):
+                if (self.tactile_force_frames.get(side) is not None
+                        or self.force_statuses.get(side) != "disconnected"):
+                    self._redraw_requested = True
+                self.tactile_force_frames[side] = None
+                self.force_statuses[side] = "disconnected"
+                self._force_refresh_needed.add(side)
+        recovered = {side for side in self._force_refresh_needed
+                     if statuses.get(side, {}).get("connected")
+                     and not statuses.get(side, {}).get("stale")}
+        if recovered and not self._pressure_fit_busy:
+            self._force_refresh_needed.difference_update(recovered)
+            self._run_pressure_fit("read_raw", background=True)
+        self._flush_force_baselines()
+
+    def _tactile_display_value(self, side):
+        raw = self.tactile_raw_frames.get(side)
+        if raw is None:
+            return None
+        if self.use_baseline and self.tactile_baseline.get(side) is not None:
+            return np.maximum(0.0, raw - self.tactile_baseline[side])
+        # Uncalibrated: the floor keeps the dip around a contact from turning
+        # into a dark patch of its own.  See ``_DISPLAY_ADC_FLOOR``.
+        return np.maximum(_DISPLAY_ADC_FLOOR, raw)
+
+    def _on_pressure_fit_send(self) -> None:
+        """Read verified force parameters without writing anything back."""
+
+        self._run_pressure_fit("read_raw")
+
+    def _on_tactile_thr(self, value):
+        self.tactile_threshold = int(value)
+        self._redraw_requested = True
+
+    def _run_pressure_fit(self, op, *, background=False, requests=None):
+        """Serialise readonly parameter and host-only baseline requests."""
+        if op not in {"read_raw", "set_force_baseline"} or self._pressure_fit_busy:
+            return
+        queues={side:q for side,q in self._param_command_queues.items() if side in self.present_sides}
+        if not queues:
+            return
+        plan=([{"op":op,"side":side} for side in queues] if requests is None else list(requests))
+        self._pressure_fit_busy=True
+        def worker():
+            try:
+                if background and op == "read_raw":
+                    if self._session_stop_event is not None:
+                        if self._session_stop_event.wait(1.5): return
+                    else:
+                        time.sleep(1.5)
+                for request in plan:
+                    side=request.get("side")
+                    if side not in queues: continue
+                    from gui.force_parameters import request_once
+                    payload=request_once(queues[side],self._param_result_queues[side],request,
+                                         self._session_stop_event)
+                    if op == "read_raw":
+                        self.force_statuses[side]=str(payload.get("force_status","invalid"))
+                        self.force_errors[side]=str(payload.get("message", ""))
+                        if not payload.get("ok"): self.tactile_force_frames[side]=None
+                    elif (request.get("connection_id")==self._force_connections[side]
+                          and request.get("baseline_id")==self._force_baseline_ids[side]
+                          and not payload.get("ok")):
+                        self.force_errors[side]=str(payload.get("message", ""))
+            except Exception as exc:
+                self._pressure_fit_status=f"{type(exc).__name__}: {exc}"
+            finally:
+                self._pressure_fit_busy=False
+                self._redraw_requested=True
+        threading.Thread(target=worker,daemon=True,name="user-force-parameters").start()
+
+    def _force_output_requested(self):
+        return (self.tactile_panel_mode == "linear_matrix"
+                or (getattr(self,"display_mode","bones") == "hand"
+                    and getattr(self,"pressure_display_mode","none") in {"points","tiles"}))
+
+    def _ensure_force_baselines(self):
+        if not self._force_output_requested():
+            return
+        missing=tuple(side for side in self.present_sides if self._force_baseline_missing(side))
+        if missing and not self._baseline_collecting:
+            self._start_baseline_collection(sides=missing)
+        elif missing:
+            for side in missing:
+                if side not in self._baseline_sides:
+                    self._baseline_sides += (side,)
+                    self._baseline_buffer[side]=[]
+                    self._baseline_done[side]=False
+                    self._queue_force_baseline(side,None)
 
 
 def _synthesize_single_hand_bases(initial: np.ndarray) -> np.ndarray:
@@ -1550,6 +1833,13 @@ def _snapshot(runtimes, present_sides, state_lock):
                 "smoothed": runtime.latest_smoothed,
                 "force": getattr(runtime, "latest_force", None),
                 "adc": getattr(runtime, "latest_adc", None),
+                "force_source": getattr(runtime, "force_source", "unavailable"),
+                "force_status": getattr(runtime, "force_status", "unread"),
+                "force_error": getattr(runtime, "force_error", ""),
+                "force_connection_id": getattr(runtime, "force_connection_id", None),
+                "force_baseline_id": getattr(runtime, "force_baseline_id", None),
+                "force_fresh": bool(getattr(runtime, "force_fresh", False)),
+                "tactile_scan": getattr(runtime,"tactile_scan",None),
                 "safety": bool(runtime.safety),
                 "contact": runtime.contact,
                 "warming_up": bool(getattr(runtime, "warming_up", False)),
@@ -1710,7 +2000,15 @@ def _read_newest(glove, timeout):
             frame = glove.read(wait)
         except StreamTimeoutError:
             break
-        newest[str(frame.side)] = frame
+        side = str(frame.side)
+        previous = newest.get(side)
+        if (previous is not None and getattr(previous,"force_fresh",False)
+                and getattr(previous,"_force_connection_id",None)
+                    == getattr(frame,"_force_connection_id",None)
+                and not getattr(frame,"force_fresh",False)):
+            frame=copy.copy(frame)
+            object.__setattr__(frame,"force_fresh",True)
+        newest[side] = frame
         drained += 1
         # Bounded like the parent's own drain: a producer that keeps handing
         # frames over must not keep this loop from ever publishing.
@@ -1723,7 +2021,8 @@ def _read_newest(glove, timeout):
 def hand_solver_process(side, calib_paths, links, serials, registry_path,
                         solve_rate, state_queue, stop_event,
                         contact_control=None, root_limits_control=None,
-                        root_limits_blending_control=None, fist_correction_control=None):
+                        root_limits_blending_control=None, fist_correction_control=None,
+                        force_command_queue=None, force_result_queue=None):
     """One process for one hand's SDK pipeline, publishing to the parent.
 
     The parent is the consumer: it drains ``state_queue`` keep-newest and
@@ -1747,6 +2046,11 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
         })
         return
     print(f"[SDK] {side} pipeline started (pid {os.getpid()})")
+    command_thread=None
+    if force_command_queue is not None and force_result_queue is not None:
+        command_thread=threading.Thread(target=_param_command_worker,
+            args=(glove,side,force_command_queue,force_result_queue,stop_event),daemon=True)
+        command_thread.start()
     # The mesh is read through ``Glove.mesh_vertices_m``, the hand's own public
     # facade: a frame carries the pose and not the mesh, which is the state that
     # lives on the engine.  That property is the newest solved mesh rather than
@@ -1772,6 +2076,8 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
     # force matrix and very much changed on the ADC panel.
     last_force: np.ndarray | None = None
     last_adc: np.ndarray | None = None
+    last_force_metadata = None
+    tactile_scan = 0
     publish_times: list[float] = []
     # Delivery shape (frames per read, arrival gaps) and the transport's own
     # parser error counters, which travel on the frame.  Together they decide
@@ -1800,39 +2106,64 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
             # boundary in the parent.
             now = time.perf_counter()
             for hand_side, frame in frames.items():
-                # The frame's own force in newtons: the finger regions are
-                # already fitted, and the cells no fitted region covers arrive
-                # as NaN.  ``None`` means this frame carries no pressure scan.
-                force = frame.force_n
-                if force is not None:
-                    force = np.asarray(force, np.float32).reshape(16, 16).copy()
-                    # The raw ADC the newtons were fitted from rides the same
-                    # message: one scan, one version.  Both matrices are compared
-                    # before publishing, because in the ADC view a cell no fitted
-                    # region covers is a reading too -- it is NaN in the newton
-                    # matrix, so a scan that moved only there would otherwise be
-                    # dropped as unchanged.
-                    adc = frame.tactile_adc
-                    adc = (None if adc is None else
-                           np.asarray(adc, np.float32).reshape(16, 16).copy())
-                    if (last_force is None
-                            or not np.array_equal(
-                                force, last_force, equal_nan=True)
-                            or (adc is not None
-                                and (last_adc is None
-                                     or not np.array_equal(adc, last_adc)))):
-                        last_force = force
-                        last_adc = adc
-                        runtime.latest_force = force
-                        runtime.latest_adc = adc
-                        runtime.force_version += 1
-                        _publish_latest(state_queue, {
-                            "type": "force",
-                            "side": hand_side,
-                            "force": force,
-                            "adc": adc,
-                            "force_version": runtime.force_version,
-                        })
+                # The SDK exposes fitted force and its status on the restricted
+                # frame. force_fresh follows ADC scan freshness, even when a
+                # missing parameter/baseline leaves force_n unavailable.
+                source = str(getattr(frame, "force_source", "unavailable"))
+                force_status = str(getattr(frame, "force_status", "unread"))
+                force_error = str(getattr(frame, "force_error", "") or "")
+                connection_id = getattr(frame, "_force_connection_id", None)
+                baseline_id = getattr(frame, "_force_baseline_id", None)
+                force = getattr(frame, "force_n", None)
+                force = (np.asarray(force, np.float32).reshape(16, 16).copy()
+                         if force is not None and source == "device"
+                         and force_status == "ready" else None)
+                adc = getattr(frame, "tactile_adc", None)
+                adc = (None if adc is None else
+                       np.asarray(adc, np.float32).reshape(16, 16).copy())
+                force_fresh = bool(getattr(frame, "force_fresh", False))
+                # _read_newest can coalesce away the one attitude frame marked
+                # fresh. A changed ADC snapshot is the same scan boundary and
+                # lets the 40-scan collector observe it without counting repeats.
+                if adc is not None and last_adc is not None:
+                    force_fresh = force_fresh or not np.array_equal(
+                        adc, last_adc, equal_nan=True)
+                elif adc is not None:
+                    force_fresh = True
+                metadata = (source, force_status, force_error,
+                            connection_id, baseline_id)
+                changed = (
+                    metadata != last_force_metadata
+                    or (force is None) != (last_force is None)
+                    or (force is not None and last_force is not None
+                        and not np.array_equal(force, last_force, equal_nan=True))
+                    or (adc is None) != (last_adc is None)
+                    or (adc is not None and last_adc is not None
+                        and not np.array_equal(adc, last_adc, equal_nan=True)))
+                if force_fresh:
+                    tactile_scan += 1
+                if changed or force_fresh:
+                    last_force, last_adc = force, adc
+                    last_force_metadata = metadata
+                    runtime.latest_force = force
+                    runtime.latest_adc = adc
+                    runtime.force_source = source
+                    runtime.force_status = force_status
+                    runtime.force_error = force_error
+                    runtime.force_connection_id = connection_id
+                    runtime.force_baseline_id = baseline_id
+                    runtime.force_fresh = force_fresh
+                    runtime.force_version += 1
+                    _publish_latest(state_queue, {
+                        "type": "force", "side": hand_side,
+                        "force": force, "adc": adc,
+                        "force_source": source, "force_status": force_status,
+                        "force_error": force_error,
+                        "force_connection_id": connection_id,
+                        "force_baseline_id": baseline_id,
+                        "force_fresh": force_fresh, "tactile_scan": tactile_scan,
+                        "force_version": runtime.force_version,
+                    })
                 timestamp_us = int(frame.timestamp_us)
                 previous_us = last_timestamp_us
                 last_timestamp_us = timestamp_us
@@ -1930,6 +2261,8 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
     finally:
         try:
             glove.close()
+            if command_thread is not None:
+                command_thread.join(timeout=1.0)
         finally:
             _cancel_stopped_worker_queue_joins(
                 stop_event, state_queue)
@@ -1958,13 +2291,32 @@ def _drain_hand_queue(state_queue, runtimes) -> dict | None:
         kind = message.get("type")
         if kind == "fatal":
             fatal = message
-        elif kind in ("force", "solve"):
+        elif kind in ("force", "tactile", "solve"):
             latest_by_kind[(message.get("side"), kind)] = message
     for (side, kind), message in latest_by_kind.items():
         state = runtimes[side]
+        if kind == "tactile":
+            message = dict(message, type="force", force=message.get("force_n"),
+                           adc=message.get("tactile_raw"),
+                           force_version=message.get("tactile_version",0),
+                           force_fresh=message.get("tactile_fresh",False))
+            kind = "force"
         if kind == "force":
             state.latest_force = message["force"]
             state.latest_adc = message.get("adc")
+            state.force_source = message.get("force_source", "unavailable")
+            state.force_status = message.get("force_status", "unread")
+            state.force_error = message.get("force_error", "")
+            state.force_connection_id = message.get("force_connection_id")
+            state.force_baseline_id = message.get("force_baseline_id")
+            scan=message.get("tactile_scan")
+            state.force_fresh = (scan != getattr(state,"tactile_scan",0) if scan is not None
+                                 else bool(message.get("force_fresh",False)))
+            if scan is not None:
+                state.tactile_scan=scan
+            state.latest_force_n=state.latest_force
+            state.latest_tactile_raw=state.latest_adc
+            state.latest_tactile_fresh=state.force_fresh
             state.force_version = message["force_version"]
             continue
         state.latest_joints = message["joints"]
@@ -1984,6 +2336,7 @@ def _drain_hand_queue(state_queue, runtimes) -> dict | None:
         state.latency = message.get("latency")
         state.link_kind = message.get("link_kind") or "usb"
     return fatal
+
 
 
 def _parse_args(argv=None):
@@ -2412,6 +2765,8 @@ def _run_live_session(args) -> int | str:
     # connected has no runtime to feed and is never opened.
     readers: dict[str, multiprocessing.Process] = {}
     state_queues: dict[str, multiprocessing.Queue] = {}
+    force_command_queues: dict[str, multiprocessing.Queue] = {}
+    force_result_queues: dict[str, multiprocessing.Queue] = {}
     # The force matrix the panel is currently showing, per hand, so a repeat of
     # the same scan is not pushed again: the SDK re-attaches the newest scan to
     # every attitude frame, and the panel would otherwise be redrawn at the
@@ -2443,16 +2798,21 @@ def _run_live_session(args) -> int | str:
             # Live state is replaceable: cap IPC backlog so a slow GUI frame
             # cannot turn into visible pose latency on the following frames.
             state_queue = multiprocessing.Queue(maxsize=8)
+            force_command_queue = multiprocessing.Queue(maxsize=4)
+            force_result_queue = multiprocessing.Queue(maxsize=4)
             reader = multiprocessing.Process(
                 target=hand_solver_process,
                 args=(side, calib_paths, links, serials,
                       args.registry, solve_rate, state_queue, stop_event,
                       contact_control, root_limits_control,
-                      root_limits_blending_control, fist_correction_control),
+                      root_limits_blending_control, fist_correction_control,
+                      force_command_queue, force_result_queue),
                 name=f"sdk-{side}",
                 daemon=True,
             )
             state_queues[side] = state_queue
+            force_command_queues[side] = force_command_queue
+            force_result_queues[side] = force_result_queue
             readers[side] = reader
             reader.start()
         next_display = started
@@ -2519,14 +2879,20 @@ def _run_live_session(args) -> int | str:
                         f"lat {latency_text}",
                         flush=True)
             if viewer:
-                # The force panel follows the SDK's own scan counter, not the
-                # attitude frames the scan rides on.
+                # Each force publication includes ADC scan freshness and the
+                # connection/baseline generations from that exact SDK frame.
                 for side in present_sides:
                     if snap[side]["force_version"] != last_force_versions[side]:
                         last_force_versions[side] = snap[side]["force_version"]
                         viewer.set_tactile_side(
-                            side, _snap_force_or_none(snap, side),
-                            _snap_adc_or_none(snap, side))
+                            side, None, raw=_snap_adc_or_none(snap, side),
+                            force_n=_snap_force_or_none(snap, side),
+                            force_status=snap[side]["force_status"],
+                            force_error=snap[side]["force_error"],
+                            tactile_fresh=snap[side]["force_fresh"],
+                            tactile_scan=snap[side]["tactile_scan"],
+                            force_connection_id=snap[side]["force_connection_id"],
+                            force_baseline_id=snap[side]["force_baseline_id"])
             ready = not present_sides or any(
                 snap[side]["joints"] is not None
                 for side in present_sides)
@@ -2602,6 +2968,9 @@ def _run_live_session(args) -> int | str:
                         display_mode=args.display_mode,
                         stop_event=stop_event,
                         redraw_interval_s=1.0 / max(float(args.fps), 1.0))
+                    viewer._param_command_queues = force_command_queues
+                    viewer._param_result_queues = force_result_queues
+                    viewer._run_pressure_fit("read_raw", background=True)
                     def set_contacts(enabled, blend):
                         contact_control.value = blend if enabled else -1.0
                     def set_root_limits(enabled):
@@ -2618,6 +2987,11 @@ def _run_live_session(args) -> int | str:
                         experimental='gesture-retarget-v1' in pose_postprocess.values(),
                         source_refit='sensor-motion-refit-v1' in pose_postprocess.values())
                 startup_initialized = True
+            if viewer:
+                viewer._update_force_connection_state({
+                    side: {"connected": side in present_sides,
+                           "stale": side not in fresh_sides}
+                    for side in ("left", "right")})
             if any_fresh and now >= next_display:
                 if viewer:
                     statuses = {}
@@ -2721,7 +3095,8 @@ def _run_live_session(args) -> int | str:
             if reader.is_alive():
                 reader.terminate()
                 reader.join(timeout=1.0)
-        for session_queue in state_queues.values():
+        for session_queue in (*state_queues.values(),
+                              *force_command_queues.values(), *force_result_queues.values()):
             session_queue.cancel_join_thread()
             session_queue.close()
     elapsed = time.perf_counter() - started

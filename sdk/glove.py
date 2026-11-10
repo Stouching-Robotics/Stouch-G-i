@@ -8,12 +8,15 @@ from __future__ import annotations
 
 from collections import deque
 import math
+import sys
+import copy
+from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
-import sys
 import threading
 import time
 from typing import Iterator
+from uuid import uuid4
 
 import numpy as np
 
@@ -25,8 +28,11 @@ from sdk.solver import HandSolver
 from sdk.mag import from_snapshot, mag_available, MagCalibrationDropMonitor
 from sdk.io.streams import PARAM_VERSION_WAIT_S
 from sdk.transport import LinkSpec, resolve_link
+from sdk.types import HandFrame
+from algorithm.force_fit import fit_finger_force_matrix
+from sdk.force_codec import decode_force_parameters
 from common.types import (
-    LINK_AUTO, DeviceHealth, GloveConfig, GloveInfo, HandFrame, RawImuFrame,
+    LINK_AUTO, DeviceHealth, GloveConfig, GloveInfo, RawImuFrame,
     TactileFrame)
 
 
@@ -36,12 +42,6 @@ def _sdk_root(start):
             return parent
     raise RuntimeError("cannot locate SDK root")
 
-# Frozen, the tree is not there to be walked: the modules live inside the
-# bundle's archive, so ``__file__`` points at a path that does not exist and
-# every parent of it is a fiction.  What *is* real is the exe: the release
-# ships config/, calibration/ and data/ beside it, which is where the app
-# already looks for them (see ``PyInstaller`` builds in tmp/_gui210).  This is
-# the same rule ``sdk/io/device_registry.py`` applies to the registry path.
 SDK_ROOT = (Path(sys.executable).resolve().parent
             if getattr(sys, "frozen", False)
             else _sdk_root(Path(__file__).resolve().parent))
@@ -119,6 +119,15 @@ def _windowed_fps(entries: deque[tuple[float, int]],
     return (entries[-1][1] - entries[0][1]) / span
 
 
+@dataclass(frozen=True)
+class ForceCalibrationResult:
+    ok: bool
+    calibration: dict | None = None
+    data: bytes | None = None
+    error: str = ""
+    status: str = "unread"
+
+
 class GloveEngine:
     def __init__(self, config: GloveConfig,
                  queue_size: int = DEFAULT_QUEUE_FRAMES):
@@ -133,6 +142,8 @@ class GloveEngine:
         self._threads: list[threading.Thread] = []
         self._latest: HandFrame | None = None
         self._latest_tactile_raw: np.ndarray | None = None
+        self._tactile_connection_generation = None
+        self._tactile_connection_id = None
         # Bumped once per cached pressure scan -- one per poll, the newest the
         # transport had queued (see :meth:`_tactile_scan_frames`) -- and copied
         # onto each assembled HandFrame as ``tactile_fresh``.  Attitude and
@@ -164,10 +175,34 @@ class GloveEngine:
         self._started = False
         self._last_error: str | None = None
         self._last_tactile_error: str | None = None
+        self._force_revision = 0
+        self._force_session_id = uuid4().hex
+        self._force_connection_key = None
+        self._force_connection_id = None
+        self._force_baseline = None
+        self._force_baseline_id = None
+        self._force_baseline_revision = 0
+        self._force_generation = None
+        self._force_state = {"source": "unavailable", "status": "unread", "error": "", "calibration": None}
 
     def start(self) -> "GloveEngine":
         if self._started:
             return self
+        with self._lock:
+            self._force_session_id = uuid4().hex
+            self._force_connection_key = None
+            self._force_connection_id = None
+            self._clear_force_baseline()
+            self._invalidate_force("unread")
+            # A new transport can reuse generation 1; no old scan belongs to it.
+            self._latest_tactile_raw = None
+            self._tactile_connection_generation = None
+            self._tactile_connection_id = None
+            self._tactile_generation = 0
+            self._tactile_emitted = 0
+            self._tactile_arrivals.clear()
+            self._tactile_arrival_count = 0
+            self._tactile_fps = 0.0
         self._link = resolve_link(self.config)
         self.port = self._link.port
         self.serial_number = self._link.serial_number
@@ -197,6 +232,117 @@ class GloveEngine:
         for thread in self._threads:
             thread.start()
         return self
+
+    def _invalidate_force(self, status="unread", error=""):
+        with self._lock:
+            self._force_revision += 1
+            self._force_generation = None
+            self._force_state = {"source": "unavailable", "status": status, "error": error, "calibration": None}
+
+    def _clear_force_baseline(self):
+        """Clear local baseline output state; caller holds _lock."""
+        self._force_baseline = None
+        self._force_baseline_id = None
+        self._force_baseline_revision += 1
+
+    def _sync_force_connection(self):
+        """Track live identity even while coefficients are absent or reading."""
+        stream = self._stream
+        transport = None if stream is None else stream._transport
+        key = ((transport, transport.connection_generation)
+               if self._started and not self._stop.is_set()
+               and transport is not None and transport.connected else None)
+        previous = self._force_connection_key
+        if (key is None and previous is None) or (
+                key is not None and previous is not None
+                and key[0] is previous[0] and key[1] == previous[1]):
+            return
+        self._force_connection_key = key
+        self._force_connection_id = (None if key is None else
+                                     f"{self._force_session_id}:{uuid4().hex}:{key[1]}")
+        self._clear_force_baseline()
+        if previous is not None:
+            self._invalidate_force("disconnected", "connection or parameters changed during read")
+
+    def _force_snapshot(self):
+        with self._lock:
+            self._sync_force_connection()
+            state = copy.deepcopy(self._force_state)
+            state.update(connection_id=self._force_connection_id,
+                         baseline_id=self._force_baseline_id,
+                         baseline_ready=self._force_baseline is not None)
+            return state
+
+    @property
+    def force_calibration_status(self):
+        return self._force_snapshot()
+
+    def set_force_baseline(self, baseline, *, connection_id=None, baseline_id=None) -> str | None:
+        """Apply a measured local baseline to this live connection, without I/O."""
+        with self._lock:
+            self._sync_force_connection()
+            if self._force_connection_id is None:
+                raise StreamClosedError("force baseline requires a started connected engine")
+            if not self.config.include_tactile:
+                raise ValueError("force baseline requires tactile input")
+            if connection_id is not None and connection_id != self._force_connection_id:
+                raise ValueError("force baseline connection_id is stale")
+            if baseline is None:
+                self._clear_force_baseline()
+                return None
+            measured = np.asarray(baseline, dtype=np.float64)
+            if (measured.shape != (16, 16) or not np.all(np.isfinite(measured))
+                    or np.any(measured < 0) or np.any(measured > 4095)):
+                raise ValueError("baseline must be a finite 16x16 ADC matrix in 0..4095")
+            if baseline_id is not None and not isinstance(baseline_id, str):
+                raise ValueError("baseline_id must be a string")
+            self._force_baseline = measured.astype(np.float32, copy=True)
+            self._force_baseline_id = uuid4().hex if baseline_id is None else baseline_id
+            self._force_baseline_revision += 1
+            return self._force_baseline_id
+
+    def read_force_calibration(self, *, timeout_s=5.0):
+        with self._lock:
+            self._sync_force_connection()
+            stream = self._stream
+            if not self._started or stream is None or self._stop.is_set():
+                return ForceCalibrationResult(False, error="engine is not started", status="disconnected")
+            if not self.config.include_tactile:
+                self._invalidate_force("no_tactile", "tactile is disabled")
+                return ForceCalibrationResult(False, error="tactile is disabled", status="no_tactile")
+            transport = stream._transport
+            if not transport.connected:
+                self._invalidate_force("disconnected", "transport is disconnected")
+                return ForceCalibrationResult(False, error="transport is disconnected", status="disconnected")
+            generation = transport.connection_generation
+            connection_id = self._force_connection_id
+            self._invalidate_force("reading")
+            revision = self._force_revision
+        try:
+            raw = transport.read_force_raw(timeout_s=max(0.0, float(timeout_s)), generation=generation)
+            data = raw.data
+            if not raw.ok:
+                result = ForceCalibrationResult(False, data=data, error=raw.message, status="timeout" if "answer" in raw.message or "sent no" in raw.message else "invalid")
+            elif not data or all(b == 0xff for b in data):
+                result = ForceCalibrationResult(False, data=data, error="parameter block is empty", status="empty")
+            else:
+                calibration = decode_force_parameters(data, expected_side=self.config.side)
+                result = ForceCalibrationResult(True, calibration=calibration, data=data, status="ready")
+        except Exception as exc:
+            result = ForceCalibrationResult(False, data=locals().get("data"), error=str(exc), status="invalid")
+        with self._lock:
+            self._sync_force_connection()
+            if (revision != self._force_revision or not self._started or self._stream is not stream
+                    or connection_id != self._force_connection_id or not transport.connected
+                    or transport.connection_generation != generation):
+                error = "connection or parameters changed during read"
+                # A completed old request must not overwrite a newer read or close.
+                if revision == self._force_revision:
+                    self._invalidate_force("disconnected", error)
+                return ForceCalibrationResult(False, data=result.data, error=error, status="disconnected")
+            self._force_generation = generation
+            self._force_state = {"source": "device" if result.ok else "unavailable", "status": result.status, "error": result.error, "calibration": copy.deepcopy(result.calibration)}
+        return result
 
     def _put_latest(self, frame: HandFrame) -> None:
         while True:
@@ -310,11 +456,37 @@ class GloveEngine:
                 now = time.monotonic()
                 device_fps = self._note_arrival(now)
                 with self._lock:
+                    force_state = self._force_snapshot()
+                    current_generation = self._stream._transport.connection_generation
                     tactile_raw = (None if self._latest_tactile_raw is None
+                                   or not self._stream.connected
+                                   or self._tactile_connection_generation != current_generation
+                                   or self._tactile_connection_id != force_state["connection_id"]
                                    else self._latest_tactile_raw.copy())
                     tactile_fresh = self._take_tactile_freshness()
                     tactile_fps = self._tactile_fps
+                    force_revision = self._force_revision
+                    baseline_revision = self._force_baseline_revision
+                    baseline = (None if self._force_baseline is None
+                                else self._force_baseline.copy())
+                force = None
+                force_status = force_state["status"]
+                force_error = force_state["error"]
+                if force_state["calibration"] is not None:
+                    if force_state["calibration"]["model"] == "delta_adc" and baseline is None:
+                        force_status = "no_baseline"
+                        force_error = "measured force baseline is unavailable"
+                    elif tactile_raw is None:
+                        force_status = "no_tactile"
+                    else:
+                        force = fit_finger_force_matrix(
+                            tactile_raw, self.config.side, force_state["calibration"], baseline=baseline)
                 frame = HandFrame(
+                    force_n=force,
+                    force_source=force_state["source"],
+                    force_status=force_status,
+                    force_error=force_error,
+                    force_fresh=bool(force is not None and tactile_fresh),
                     side=self.config.side,
                     sequence=keypoints.sequence,
                     timestamp_us=keypoints.timestamp_us,
@@ -339,6 +511,10 @@ class GloveEngine:
                     link_errors=dict(self._stream.link_errors),
                     latency_ms=self._latency_ms(),
                 )
+                object.__setattr__(frame, "_force_revision", force_revision)
+                object.__setattr__(frame, "_force_connection_id", force_state["connection_id"])
+                object.__setattr__(frame, "_force_baseline_id", force_state["baseline_id"])
+                object.__setattr__(frame, "_force_baseline_revision", baseline_revision)
                 dropped = self._mag_drop_monitor.update(frame.mag)
                 if dropped:
                     channels = ', '.join(f'IMU-{channel}: 3->{level}' for channel, level in dropped)
@@ -398,13 +574,22 @@ class GloveEngine:
 
         try:
             assert self._stream is not None
-            stream = self._stream.tactile_stream()
+            owner = self._stream
+            stream = owner.tactile_stream()
             for tactile_frame in self._tactile_scan_frames(
                     stream, _FRAME_WAIT_S):
                 if self._stop.is_set():
                     break
                 with self._lock:
+                    state = self._force_snapshot()
+                    if self._stream is not owner:
+                        break
+                    generation = getattr(tactile_frame, "_connection_generation", None)
+                    if state["connection_id"] is None or generation != owner._transport.connection_generation:
+                        continue
                     self._latest_tactile_raw = tactile_frame.samples.copy()
+                    self._tactile_connection_generation = generation
+                    self._tactile_connection_id = state["connection_id"]
                     self._tactile_generation += 1
                     self._tactile_fps = self._note_tactile_scan(
                         time.monotonic())
@@ -416,7 +601,7 @@ class GloveEngine:
         if not self._started:
             self.start()
         try:
-            return self._queue.get(timeout=timeout)
+            return self._current_force_frame(self._queue.get(timeout=timeout))
         except Empty as exc:
             with self._lock:
                 last_error = self._last_error
@@ -426,9 +611,34 @@ class GloveEngine:
             raise StreamTimeoutError(
                 f"Timed out waiting for {self.config.side} glove frame") from exc
 
+    def _current_force_frame(self, frame):
+        if frame is None:
+            return None
+        with self._lock:
+            state = self._force_snapshot()
+            connection_id = getattr(frame, "_force_connection_id", None)
+            if (getattr(frame, "_force_revision", None) != self._force_revision
+                    or connection_id != state["connection_id"]
+                    or getattr(frame, "_force_baseline_revision", None) != self._force_baseline_revision):
+                source, status, error = state["source"], state["status"], state["error"]
+                if connection_id is None or connection_id != state["connection_id"]:
+                    source, status, error = "unavailable", "disconnected", "frame belongs to a previous connection"
+                elif (state["calibration"] is not None
+                      and state["calibration"]["model"] == "delta_adc"
+                      and not state["baseline_ready"]):
+                    status, error = "no_baseline", "measured force baseline is unavailable"
+                filtered = replace(frame, force_n=None, force_source=source,
+                                   force_status=status, force_error=error, force_fresh=False)
+                # Preserve origin: replacing dataclass fields drops internal metadata.
+                for name in ("_force_revision", "_force_connection_id", "_force_baseline_id",
+                             "_force_baseline_revision"):
+                    object.__setattr__(filtered, name, getattr(frame, name, None))
+                return filtered
+            return frame
+
     def latest(self) -> HandFrame | None:
         with self._lock:
-            return self._latest
+            return self._current_force_frame(self._latest)
 
 
 
@@ -522,7 +732,13 @@ class GloveEngine:
         return base
 
     def close(self) -> None:
-        self._stop.set()
+        with self._lock:
+            self._started = False
+            self._stop.set()
+            self._force_connection_key = None
+            self._force_connection_id = None
+            self._clear_force_baseline()
+            self._invalidate_force("disconnected", "engine closed")
         if self._stream is not None:
             self._stream.stop()
         for thread in self._threads:
@@ -639,6 +855,17 @@ class Glove:
 
 
 
+
+    @property
+    def force_calibration_status(self):
+        return self._impl.force_calibration_status
+
+    def read_force_calibration(self, *, timeout_s=5.0):
+        return self._impl.read_force_calibration(timeout_s=timeout_s)
+
+    def set_force_baseline(self, baseline, *, connection_id=None, baseline_id=None) -> str | None:
+        return self._impl.set_force_baseline(
+            baseline, connection_id=connection_id, baseline_id=baseline_id)
 
 
 

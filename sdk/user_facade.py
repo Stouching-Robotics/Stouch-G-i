@@ -161,6 +161,19 @@ class UserHandFrame:
                 self.tactile_adc, (16, 16), np.float32, "tactile_adc"))
 
 
+    @property
+    def force_source(self) -> str:
+        return getattr(self, "_force_source", "unavailable")
+
+    @property
+    def force_status(self) -> str:
+        return getattr(self, "_force_status", "unread")
+
+    @property
+    def force_error(self) -> str:
+        return getattr(self, "_force_error", "")
+
+
 @dataclass(frozen=True)
 class UserBimanualFrame:
     """Both hands, each already narrowed to :class:`UserHandFrame`."""
@@ -173,36 +186,25 @@ class UserBimanualFrame:
 
 
 def restrict(frame: HandFrame) -> UserHandFrame:
-    """Narrow one full internal frame to the user edition's public contract.
-
-    Every field not named here is dropped on the floor: the IMU quaternions and
-    their per-channel masks and ages, the magnetometer registers, the raw device
-    clock.  The pressure scan is named twice on purpose -- once as the ADC the
-    device sent, once as the newtons it fits to -- because they are one scan:
-    the ADC is copied out through :class:`UserHandFrame`'s own validation, and
-    the fit runs on the original.  ``link_drops``/``link_errors`` are copied
-    rather than shared so a caller mutating its dict cannot reach back into the
-    internal frame.
-    """
-
-    return UserHandFrame(
-        side=frame.side,
-        sequence=frame.sequence,
-        timestamp_us=frame.timestamp_us,
-        joints_raw_m=frame.joints_raw_m,
-        joints_smoothed_m=frame.joints_smoothed_m,
-        force_n=force_newtons(frame.tactile_raw, frame.side),
-        tactile_adc=frame.tactile_raw,
-        status=frame.status,
+    """Copy the public data and this scan's device-force availability metadata."""
+    force = (getattr(frame, "force_n", None)
+             if getattr(frame, "force_source", "unavailable") == "device"
+             and getattr(frame, "force_status", "unread") == "ready" else None)
+    result = UserHandFrame(
+        side=frame.side, sequence=frame.sequence, timestamp_us=frame.timestamp_us,
+        joints_raw_m=frame.joints_raw_m, joints_smoothed_m=frame.joints_smoothed_m,
+        force_n=force, tactile_adc=frame.tactile_raw, status=frame.status,
         force_fresh=bool(frame.tactile_fresh),
-        firmware_version=frame.firmware_version,
-        link_kind=frame.link_kind,
-        device_fps=float(frame.device_fps),
-        tactile_fps=float(frame.tactile_fps),
-        link_drops=dict(frame.link_drops or {}),
-        link_errors=dict(frame.link_errors or {}),
-        latency_ms=frame.latency_ms,
-    )
+        firmware_version=frame.firmware_version, link_kind=frame.link_kind,
+        device_fps=float(frame.device_fps), tactile_fps=float(frame.tactile_fps),
+        link_drops=dict(frame.link_drops or {}), link_errors=dict(frame.link_errors or {}),
+        latency_ms=frame.latency_ms)
+    for name in ("force_source", "force_status", "force_error"):
+        default = {"force_source": "unavailable", "force_status": "unread", "force_error": ""}[name]
+        object.__setattr__(result, "_" + name, getattr(frame, name, default))
+    for name in ("_force_connection_id", "_force_baseline_id"):
+        object.__setattr__(result, name, getattr(frame, name, None))
+    return result
 
 
 def restrict_bimanual(frame: BimanualFrame) -> UserBimanualFrame:
@@ -269,6 +271,20 @@ class UserGlove:
         """The resting pose, for a viewer that has nothing to display yet."""
 
         return self._inner.neutral_joints()
+
+    @property
+    def force_calibration_status(self):
+        """Return this connection's device parameters and baseline availability."""
+        return self._inner.force_calibration_status
+
+    def read_force_calibration(self, *, timeout_s=5.0):
+        """Read device force coefficients; unavailable firmware remains usable."""
+        return self._inner.read_force_calibration(timeout_s=timeout_s)
+
+    def set_force_baseline(self, baseline, *, connection_id=None, baseline_id=None):
+        """Set an unloaded 16x16 ADC baseline locally for this live connection."""
+        return self._inner.set_force_baseline(
+            baseline, connection_id=connection_id, baseline_id=baseline_id)
 
     def wait_for_firmware_version(self, timeout_s: float = 5.0) -> str | None:
         """Block until the device names its firmware, or give up (``None``)."""

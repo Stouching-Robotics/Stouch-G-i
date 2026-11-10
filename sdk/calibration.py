@@ -23,8 +23,8 @@ from pathlib import Path
 
 from algorithm.calibration_session import ImuCalibratorEngine as _Engine
 from algorithm.calibration_profiles import (
-    CalibrationProfileResolution, prepare_viewer_calibration,
-    resolve_calibration_profile)
+    CalibrationProfileCatalog, CalibrationProfileResolution,
+    prepare_viewer_calibration, resolve_calibration_profile)
 from algorithm.imu_calibrate_cli import (
     ImuCalibrationCLI, compute_motion_rms, default_out_path)
 from algorithm.utils import get_average_rotation
@@ -36,8 +36,8 @@ __all__ = [
     "ImuCalibrator", "ImuCalibrationCLI", "compute_motion_rms",
     "default_out_path", "find_latest_hand2mm_calibration",
     "get_average_rotation",
-    "CalibrationProfileResolution", "resolve_calibration_profile",
-    "prepare_viewer_calibration",
+    "CalibrationProfileCatalog", "CalibrationProfileResolution",
+    "resolve_calibration_profile", "prepare_viewer_calibration",
 ]
 
 
@@ -89,12 +89,14 @@ class ImuCalibrator:
     def __init__(self, side: str, serial_port: str | None = None,
                  registry: Path | str | None = None,
                  config: Path | str | None = None,
-                 startup_timeout: float = 30.0):
+                 startup_timeout: float = 30.0, *,
+                 workflow: str = "simplified", include_return_open: bool = False):
         # Calibration reads IMU, tactile and status frames only; the type-0x05
         # magnetometer telemetry is not consumed here and :meth:`connect` never
         # waits for it.  The live viewer's own receiver is what caches 0x05.
         self._impl = _Engine(
-            side, serial_port, registry, config, startup_timeout)
+            side, serial_port, registry, config, startup_timeout,
+            workflow=workflow, include_return_open=include_return_open)
 
     @property
     def steps(self) -> tuple[CalibrationStep, ...]:
@@ -111,6 +113,17 @@ class ImuCalibrator:
 
     def retry_step(self, step_id: str) -> CalibrationStepResult:
         return self._impl.retry_step(step_id)
+
+    def set_workflow(self, workflow: str, *, include_return_open: bool = False) -> CalibrationProgress:
+        return self._impl.set_workflow(workflow, include_return_open=include_return_open)
+
+    def recompute(self) -> CalibrationStepResult:
+        """Rebuild derived results from retained captures without acquiring data."""
+        return self._impl.recompute()
+
+    def skip_return_open(self) -> CalibrationStepResult:
+        """Skip the optional final check; saved quality remains unverified."""
+        return self._impl.skip_return_open()
 
     def progress(self) -> CalibrationProgress:
         return self._impl.progress()

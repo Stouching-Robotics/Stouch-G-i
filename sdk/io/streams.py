@@ -461,6 +461,7 @@ class _UsbSensorTransport:
         self.thread: threading.Thread | None = None
         self.active_port: str | None = None
         self.connected = False
+        self.connection_generation = 0
         self.last_error: str | None = None
         self.last_status: str = "idle"
         self.firmware_version: str | None = None
@@ -501,7 +502,7 @@ class _UsbSensorTransport:
         # and set number, so the channel is serialised and holds at most one
         # waiter -- see _PendingParamAck.
         self._param_lock = threading.Lock()
-        self._param_command_lock = threading.Lock()
+        self._param_command_lock = threading.RLock()
         self._pending_param: _PendingParamAck | None = None
         self._raw_param_lock = threading.Lock()
         self._pending_raw_param: _PendingRawParamAck | None = None
@@ -836,7 +837,7 @@ class _UsbSensorTransport:
                     self._pending_param = None
 
     def _send_raw_param_command(
-            self, command: bytes, timeout_s: float = PARAM_ACK_TIMEOUT_S,
+            self, command: bytes, timeout_s: float = PARAM_ACK_TIMEOUT_S, *, allow_unknown: bool = False,
     ) -> UsbRawParamAck | None:
         """Send one compact whole-block command and await its 8-byte ack."""
 
@@ -845,7 +846,9 @@ class _UsbSensorTransport:
             version = self.firmware_version
         if handle is None:
             return None
-        if version is None or not supports_pressure_fit_params(version):
+        if not allow_unknown and (version is None or not supports_pressure_fit_params(version)):
+            return None
+        if self.stop_event.is_set():
             return None
         pending = _PendingRawParamAck(
             subcommand=command[3], event=threading.Event())
@@ -972,7 +975,7 @@ class _UsbSensorTransport:
                 current = self._raw_param_frame
             if current is not None and current[0] is not baseline:
                 return current[1]
-            if time.monotonic() >= deadline:
+            if self.stop_event.is_set() or time.monotonic() >= deadline:
                 return None
             self.stop_event.wait(0.005)
 
@@ -999,12 +1002,12 @@ class _UsbSensorTransport:
 
     def _run_raw_param_command(
             self, command: bytes, *, timeout_s: float,
-            attempts: int = PARAM_COMMAND_ATTEMPTS,
+            attempts: int = PARAM_COMMAND_ATTEMPTS, allow_unknown: bool = False,
     ) -> tuple[UsbRawParamAck | None, str]:
         """Send one compact command until its 8-byte ack arrives."""
 
         for _ in range(max(1, int(attempts))):
-            ack = self._send_raw_param_command(command, timeout_s=timeout_s)
+            ack = self._send_raw_param_command(command, timeout_s=timeout_s, allow_unknown=allow_unknown)
             if ack is None:
                 continue
             if ack.ok:
@@ -1117,9 +1120,21 @@ class _UsbSensorTransport:
             return PressureFitCommandOutcome(
                 ok=True, ack=ack, params=params, missing=missing)
 
+    def read_force_raw(self, *, timeout_s, generation):
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        if not self._param_command_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            return RawParamReadOutcome(ok=False, message="no answer: parameter channel busy")
+        try:
+            if self.stop_event.is_set() or not self.connected or self.connection_generation != generation:
+                return RawParamReadOutcome(ok=False, message="connection changed")
+            remaining = max(0.0, deadline - time.monotonic())
+            return self.read_raw_param_block(timeout_s=remaining / 2, attempts=1, allow_unknown=True)
+        finally:
+            self._param_command_lock.release()
+
     def read_raw_param_block(
             self, *, timeout_s: float = 5.0,
-            attempts: int = PARAM_COMMAND_ATTEMPTS,
+            attempts: int = PARAM_COMMAND_ATTEMPTS, allow_unknown: bool = False,
     ) -> RawParamReadOutcome:
         """Read the current firmware's opaque parameter block.
 
@@ -1129,7 +1144,7 @@ class _UsbSensorTransport:
         """
 
         with self._param_command_lock:
-            problem = self._param_version_problem()
+            problem = None if allow_unknown else self._param_version_problem()
             if problem is not None:
                 return RawParamReadOutcome(ok=False, message=problem)
             with self._raw_param_lock:
@@ -1137,7 +1152,7 @@ class _UsbSensorTransport:
                             if self._raw_param_frame is not None else object())
             command = encode_raw_param_command(PARAM_SUBCMD_READ_SET)
             ack, problem = self._run_raw_param_command(
-                command, timeout_s=timeout_s, attempts=attempts)
+                command, timeout_s=timeout_s, attempts=attempts, allow_unknown=allow_unknown)
             if ack is None:
                 return RawParamReadOutcome(ok=False, message=problem)
             data = self._wait_raw_param_frame(
@@ -1321,6 +1336,7 @@ class _UsbSensorTransport:
                     last_valid_frame_s = opened_s
                     with self._state_lock:
                         self.active_port = str(port)
+                        self.connection_generation += 1
                         self.connected = True
                         self._serial_handle = serial_handle
                         self._mag_cache.reset()
@@ -1442,7 +1458,7 @@ class _UsbSensorTransport:
                             scan_time_us=wire_frame.timestamp_us,
                         )
                         if matrix is not None:
-                            _put_latest(self.tactile_queue, TactileFrame(
+                            tactile_frame = TactileFrame(
                                 sequence=int(matrix.sequence),
                                 timestamp_us=int(matrix.scan_time_us),
                                 samples=matrix.samples,
@@ -1453,7 +1469,9 @@ class _UsbSensorTransport:
                                 # frame is in it, not after.  ``0.0`` when the
                                 # probe is off, which ``record`` skips.
                                 host_enqueue_us=_latency_stamp(),
-                            ))
+                            )
+                            object.__setattr__(tactile_frame, "_connection_generation", self.connection_generation)
+                            _put_latest(self.tactile_queue, tactile_frame)
                     elif wire_frame.message_type == USB_TYPE_DELAY_RESPONSE:
                         self._resolve_ping(wire_frame.payload)
                     elif wire_frame.message_type == USB_TYPE_MAG_TELEMETRY:
