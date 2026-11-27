@@ -1,16 +1,4 @@
-"""Qt (PySide6) startup selector: pick the left/right HAND2mm calibration JSON files.
-
-The function signature and return semantics match the original DearPyGui
-version exactly (the three live callers need no changes), but the GUI is now a
-Qt QDialog and **keeps the glove-detection/refresh capability**: ``refresh_status``
-is the caller-supplied USB re-scan callback (plain device_manager.resolve_port
-logic, independent of the GUI framework); the Qt dialog's Refresh button calls
-it directly, with the same effect as the original.
-
-PySide6 is imported lazily inside this function; no QApplication is created at
-module import time, so headless scenarios such as replay/calibration previews
-remain safe.
-"""
+"""Qt startup selector for left and right Friston wearing calibration files."""
 
 from __future__ import annotations
 
@@ -20,6 +8,8 @@ from pathlib import Path
 import sys
 
 from gui import APP_VERSION
+from common.calibration_root import ROOT_METHOD_SIMPLIFIED
+from common.calibration_validation import is_return_open_skipped
 from common.i18n import L
 
 def _sdk_root(start):
@@ -35,87 +25,55 @@ else:
 DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
 
 
-def discover_calibration_files(directory: Path, side: str, *, catalog=None) -> list[Path]:
-    """List normal calibrations first, then explicitly selectable experiments."""
+def discover_calibration_files(directory: Path, side: str) -> list[Path]:
+    """List solver-compatible Friston calibrations, newest first."""
+    from common.errors import CalibrationError
+    from sdk import open_pose_processor
+
     folder = Path(directory).expanduser().resolve()
-    if not folder.is_dir():
-        raise RuntimeError(f"Calibration directory does not exist: {folder}")
     matches = []
-    experiments = []
     for path in [*folder.glob("*.json"), *(folder / "experiments").glob("*.json")]:
         try:
-            payload = (catalog.read(path) if catalog is not None else
-                       json.loads(path.read_text(encoding="utf-8-sig")))
-        except (OSError, ValueError):
+            payload = _read_profile(path)
+            if payload.get("side") != side or not isinstance(payload.get("friston"), dict):
+                continue
+            open_pose_processor(side, path)
+            matches.append((path.parent != folder, -path.stat().st_mtime_ns, path.name, path))
+        except (OSError, ValueError, CalibrationError):
             continue
-        if not isinstance(payload, dict):
-            continue
-        saved_side = str(payload.get("side") or "right").lower()
-        if saved_side != side or not isinstance(payload.get("param_inst_calib"), dict):
-            continue
-        if payload.get("kinematics") in {"direct_fk", "fitted_direct_fk"}:
-            continue
-        if str(payload.get("tool") or "") in {
-                "direct_fk_calibrate_cli", "hand_fk_fit_cli"}:
-            continue
-        target = experiments if path.parent == folder / "experiments" else matches
-        target.append(path.resolve())
-    if folder / f"imu_calibration_{side}.json" in matches:
-        legacy_names = {"imu_2d_calibration.json", "imu_calibration.json",
-                        "imu_default_left.json", "imu_default_right.json",
-                        "imu_calibration_left_default.json", "imu_calibration_right_default.json"}
-        matches = [path for path in matches if path.name not in legacy_names]
-    order = lambda path: (path.stat().st_mtime_ns, path.name)
-    return (sorted(matches, key=order, reverse=True)
-            + sorted(experiments, key=order, reverse=True))
+    return [path for _, _, _, path in sorted(matches)]
 
 
-def _label(path: Path, *, catalog=None) -> str:
+def _read_profile(path: Path) -> dict:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a calibration object in {path}")
+    return payload
+
+
+def _label(path: Path) -> str:
     try:
         modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        payload = _read_profile(path)
     except (OSError, ValueError, OverflowError):
-        modified = "?"
-    try:
-        from sdk.calibration import resolve_calibration_profile
-        read = catalog.read if catalog is not None else lambda p: json.loads(p.read_text(encoding='utf-8-sig'))
-        payload = read(path)
-        side = str(payload.get('side') or 'right').lower()
-        resolution = (resolve_calibration_profile(path, side, catalog=catalog)
-                      if catalog is not None else resolve_calibration_profile(path, side))
-        state = resolution.status
-        selected = read(resolution.path)
-        selected_shape = selected.get('param_shape_calib')
-        profile = (selected_shape.get('sensor_motion_refit') or {}) if isinstance(selected_shape, dict) else {}
-        if not isinstance(profile, dict):
-            raise ValueError('Invalid motion profile')
-    except (OSError, ValueError, TypeError):
-        state = 'invalid'
-    prefix = {
-        'embedded': L('[佩戴校正] ', '[Wearing corrected] '),
-        'matched': L('[已有配套校正] ', '[Matching correction] '),
-        'legacy': L('[旧标定兼容] ', '[Legacy compatible] '),
-        'ambiguous': L('[多个配套校正] ', '[Multiple matching profiles] '),
-        'gesture': '[EXPERIMENT] ',
-        'invalid': L('[文件无效] ', '[Invalid file] '),
-    }[state]
-    if state in ('embedded', 'matched'):
-        installation = selected.get('param_inst_calib')
-        metadata = installation.get('metadata') if isinstance(installation, dict) else None
-        from common.calibration_root import ROOT_METHOD_SIMPLIFIED
-        if isinstance(metadata, dict) and metadata.get('root_method') == ROOT_METHOD_SIMPLIFIED:
-            prefix += L('[简化标定] ', '[Simplified] ')
-        if profile.get('calibration_policy') == 'installation-neutral-verified-v1':
-            from common.calibration_validation import is_return_open_skipped
-            quality = profile.get('quality')
-            check = quality.get('return_open_validation') if isinstance(quality, dict) else None
-            passed = isinstance(check, dict) and check.get('passed') is True
-            skipped = is_return_open_skipped(check)
-            prefix += (L('[平展已验收] ', '[Open pose verified] ') if passed else
-                       L('[平展已跳过] ', '[Open verification skipped] ') if skipped else
-                       L('[平展未验收] ', '[Open pose unverified] '))
-        else:
-            prefix += L('[旧版未验收] ', '[Legacy unverified] ')
-    return f"{prefix}{path.name}    [{modified}]"
+        return f"{L('[文件无效]', '[Invalid file]')} {path.name}"
+
+    tags = ["Friston"]
+    installation = payload.get("param_inst_calib") or {}
+    metadata = installation.get("metadata") or {}
+    if metadata.get("root_method") == ROOT_METHOD_SIMPLIFIED:
+        tags.append(L("简化标定", "Simplified"))
+    shape = payload.get("param_shape_calib") or {}
+    profile = shape.get("sensor_motion_refit") or {}
+    quality = profile.get("quality") or {}
+    check = quality.get("return_open_validation")
+    if isinstance(check, dict) and check.get("passed") is True:
+        tags.append(L("平展已验收", "Open pose verified"))
+    elif is_return_open_skipped(check):
+        tags.append(L("平展已跳过", "Open verification skipped"))
+    elif profile:
+        tags.append(L("平展未验收", "Open pose unverified"))
+    return f"[{' / '.join(tags)}] {path.name}    [{modified}]"
 
 
 def select_calibration_files(
@@ -124,7 +82,8 @@ def select_calibration_files(
         title: str = "Select IMU Calibration",
         connected: dict[str, bool] | None = None,
         refresh_status=None,
-        calibrate_button: bool = False) -> dict[str, Path] | str | None:
+        calibrate_button: bool = False,
+        connection_notice: str | None = None) -> dict[str, Path] | str | None:
     """Open a blocking startup selector; return None when the user cancels.
 
     ``sides`` lists the hands whose calibration JSON must be picked (the
@@ -151,16 +110,11 @@ def select_calibration_files(
         connection_status = {side: True for side in normalized}
         render_sides = normalized
 
-    from sdk.calibration import CalibrationProfileCatalog
-    catalog = CalibrationProfileCatalog()
-
-    def discover(side: str) -> list[Path]:
-        try:
-            return discover_calibration_files(directory, side, catalog=catalog)
-        except (OSError, RuntimeError):
-            return []
-
-    options = {side: discover(side) for side in render_sides}
+    options = {
+        side: discover_calibration_files(directory, side)
+        if connection_status.get(side) else []
+        for side in render_sides
+    }
     missing = [
         side for side in normalized
         if side in options and not options[side]
@@ -171,7 +125,7 @@ def select_calibration_files(
     # "no JSON found" error for the plain file-picker callers.
     if missing and not calibrate_button:
         raise RuntimeError(
-            f"No HAND2mm calibration JSON found for: {', '.join(missing)} "
+            f"No Friston calibration JSON found for: {', '.join(missing)} "
             f"{Path(directory).resolve()}")
 
     # Lazy PySide6 import keeps module import time headless-safe.
@@ -189,10 +143,19 @@ def select_calibration_files(
     dialog.setMinimumWidth(520)
 
     root = QVBoxLayout(dialog)
-    intro = QLabel(L('新标定会自动保存佩戴与关节校正。旧文件仍可使用；未包含或未匹配校正的旧文件，需要在新版完成一次标定。',
-                    'New calibrations include wearing and joint correction. Older files remain compatible; calibrate once in this version if no matching correction is available.'))
+    hint = L("请选择当前手套的 Friston 佩戴标定。",
+             "Select the Friston calibration for the connected glove.")
+    if calibrate_button:
+        hint += L(" 若没有可选文件，请点击“标定 Calibrate”完成标定并保存。",
+                  " If no file is listed, choose Calibrate, complete the calibration and save it.")
+    intro = QLabel(hint)
     intro.setWordWrap(True)
     root.addWidget(intro)
+    if connection_notice:
+        warning = QLabel(connection_notice)
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: rgb(235,165,75)")
+        root.addWidget(warning)
     folder_label = QLabel(f"Folder: {Path(directory).resolve()}")
     folder_label.setWordWrap(True)
     folder_label.setStyleSheet("color: rgb(120,120,120)")
@@ -212,8 +175,10 @@ def select_calibration_files(
         name_label = QLabel(f"{side_name} JSON")
         name_label.setMinimumWidth(120)
         combo = QComboBox()
+        if is_connected and not options[side]:
+            combo.setPlaceholderText(L("缺少标定文件", "No calibration file"))
         for path in options[side]:
-            combo.addItem(_label(path, catalog=catalog), path)
+            combo.addItem(_label(path), path)
         if options[side]:
             combo.setCurrentIndex(0)
         combo.setEnabled(is_connected and bool(options[side]))
@@ -228,8 +193,6 @@ def select_calibration_files(
             row.addWidget(status)
         root.addLayout(row)
 
-    # Captures can be large; keep only labels/paths while the dialog is idle.
-    catalog = None
     root.addSpacing(12)
     buttons = QHBoxLayout()
     refresh_button: QPushButton | None = None
@@ -237,14 +200,13 @@ def select_calibration_files(
         refresh_button = QPushButton("↻ Refresh")
         buttons.addWidget(refresh_button)
     buttons.addStretch(1)
-    has_files = any(bool(options.get(side)) for side in render_sides)
     calibrate_btn: QPushButton | None = None
     if calibrate_button:
         calibrate_btn = QPushButton("标定 Calibrate")
         buttons.addWidget(calibrate_btn)
     open_button = QPushButton("Open Live Viewer")
     open_button.setDefault(True)
-    open_button.setEnabled(has_files)
+    open_button.setEnabled(bool(normalized) and all(options[side] for side in normalized))
     cancel_button = QPushButton("Cancel")
     buttons.addWidget(open_button)
     buttons.addWidget(cancel_button)
@@ -254,24 +216,23 @@ def select_calibration_files(
     collect_sides: list[str] = list(normalized)
 
     def do_refresh() -> None:
-        nonlocal connection_status, collect_sides, catalog
+        nonlocal connection_status, collect_sides
         if not callable(refresh_status):
             return
         fresh = refresh_status()
-        # A scan owns its cache; Refresh must observe changed/new/deleted files.
-        catalog = CalibrationProfileCatalog()
         connection_status = {
             str(side).lower(): bool(status) for side, status in fresh.items()
         }
-        enabled_sides: list[str] = []
         for side in render_sides:
             is_connected = bool(connection_status.get(side, False))
-            paths = discover(side) if is_connected else []
+            paths = discover_calibration_files(directory, side) if is_connected else []
             combo = combos[side]
             combo.blockSignals(True)
             combo.clear()
+            combo.setPlaceholderText(
+                L("缺少标定文件", "No calibration file") if is_connected and not paths else "")
             for path in paths:
-                combo.addItem(_label(path, catalog=catalog), path)
+                combo.addItem(_label(path), path)
             if paths:
                 combo.setCurrentIndex(0)
             combo.setEnabled(is_connected and bool(paths))
@@ -281,21 +242,15 @@ def select_calibration_files(
                 if is_connected and paths:
                     status.setText("✓ connected")
                     status.setStyleSheet("color: rgb(40,210,80);")
-                    enabled_sides.append(side)
                 elif is_connected:
                     status.setText("✓ no JSON")
                     status.setStyleSheet("color: rgb(240,150,40);")
                 else:
                     status.setText("✗ NOT CONNECTED")
                     status.setStyleSheet("color: rgb(235,70,70);")
-        collect_sides = enabled_sides
-        if enabled_sides:
-            open_button.setText("Open Live Viewer")
-            open_button.setEnabled(True)
-        else:
-            open_button.setText("No glove connected")
-            open_button.setEnabled(False)
-        catalog = None
+        collect_sides = [side for side in render_sides if connection_status.get(side)]
+        open_button.setEnabled(bool(collect_sides) and all(
+            combos[side].count() for side in collect_sides))
 
     def do_confirm() -> None:
         nonlocal result
@@ -304,7 +259,7 @@ def select_calibration_files(
             pick = combos[side].currentData()
             if pick is not None:
                 collected[side] = Path(pick)
-        if collected:
+        if collected and len(collected) == len(collect_sides):
             result = collected
             dialog.accept()
 

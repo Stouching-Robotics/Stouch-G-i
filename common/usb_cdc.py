@@ -16,7 +16,7 @@ import zlib
 import numpy as np
 
 
-# Explicit export list: ``sdk.io.usb_protocol`` is a thin re-export shim over
+# Explicit export list: ``glove_io.usb_protocol`` is a thin re-export shim over
 # this module, so this is the whole protocol surface both layers see.  Keeping
 # it explicit keeps ``from ... import *`` from leaking ``np``/``struct`` into
 # callers and makes an accidental rename a loud failure instead of a silent one.

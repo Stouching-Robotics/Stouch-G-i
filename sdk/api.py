@@ -1,39 +1,11 @@
-"""The one entry point: open a glove and read everything from one frame.
-
-Call :func:`open_glove` and nothing else in this package.  What arrives on
-:class:`~sdk.HandFrame`:
-
-======================  ==========================================
-21-keypoint position    ``joints_raw_m`` / ``joints_smoothed_m``
-finger force (newtons)  ``force_n`` (16x16, like the pressure matrix)
-pressure matrix ADC    ``tactile_adc`` (16x16, sensor counts)
-fitness of that force   ``force_fresh``
-solver state            ``status`` -- read this before trusting a frame
-firmware version        ``firmware_version`` (raw) / ``display_firmware_version``
-SDK version             ``GloveInfo.sdk_version`` from :meth:`Glove.info`
-link diagnostics        ``device_fps``, ``tactile_fps``, ``link_drops``, ``latency_ms``
-======================  ==========================================
-
-Neither link needs naming: ``link="auto"`` finds whichever of the wired USB
-cable or the Bluetooth dongle is carrying this hand.  See :mod:`sdk.transport`.
-
-``force_n`` is in newtons and laid out like the pressure matrix; the cells no
-fitted region covers are NaN, and it is ``None`` on a frame that carries no
-pressure scan at all.  ``force_fresh`` says whether that scan is new or one
-standing over from an earlier frame -- a temporal filter that ignores it will
-integrate the same reading twice.
-
-Check ``status.details["warming_up"]`` before using a frame: while the IMUs are
-still settling the joints are a neutral resting pose, not a solve of the
-wearer's hand.
-"""
+"""Open a single hand or a bimanual pair to read Friston poses and tactile scans."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sdk.calibration import find_latest_hand2mm_calibration
+from sdk.calibration import find_latest_friston_calibration
 from sdk.facade import make_bimanual, make_glove
 from sdk.glove import SDK_ROOT
 from common.types import BimanualConfig, GloveConfig, LINK_AUTO
@@ -60,14 +32,14 @@ def _resolve_calibration(side: str, calibration, calibration_dir) -> Path:
 
     Falling back to "newest" rather than a fixed filename matters because the
     calibration folder accumulates files from several tools -- see
-    :func:`sdk.calibration.find_latest_hand2mm_calibration`.
+    :func:`sdk.calibration.find_latest_friston_calibration`.
     """
 
     if calibration is not None:
         return Path(calibration).expanduser()
     folder = (Path(calibration_dir).expanduser() if calibration_dir is not None
               else default_calibration_dir())
-    return find_latest_hand2mm_calibration(folder, side).expanduser()
+    return find_latest_friston_calibration(folder, side).expanduser()
 
 
 def open_glove(

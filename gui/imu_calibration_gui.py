@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qt (PySide6) GUI for HAND2mm left/right 16-IMU calibration, zh/en switchable.
+"""Qt (PySide6) GUI for Friston left/right 16-IMU calibration, zh/en switchable.
 
 Replaces the former Dear PyGui window.  PySide6 classes are imported at module
 level (they are inert until a QApplication exists), but no QApplication is
@@ -17,14 +17,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing
 from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 import sys
+from tempfile import NamedTemporaryFile
 import threading
 import time
 
@@ -67,7 +66,7 @@ from common.calibration_limits import (  # noqa: E402
     ROOT_AXIS_RESIDUAL_LIMIT_DEG, ROOT_POSE_ANGLE_TOLERANCE_DEG,
     ROOT_LEVEL_ANGLE_TOLERANCE_DEG, ROOT_POSE_ANGLE_WARN_OFF_DEG,
 )
-from sdk.io.device_registry import (  # noqa: E402
+from sdk.device import (  # noqa: E402
     GloveDeviceError,
     clear_glove_bindings as _clear_registry_bindings,
     link_kind_of,
@@ -81,21 +80,15 @@ from common.usb_cdc import (  # noqa: E402
 from common.i18n import (  # noqa: E402
     L, get_lang, is_en, set_lang,
 )
-from algorithm.imu_calibrate_cli import (  # noqa: E402
+from sdk.calibration import (  # noqa: E402
     ImuCalibrationCLI,
     compute_motion_rms,
     default_out_path,
+    get_average_rotation,
 )
-from algorithm.utils import get_average_rotation  # noqa: E402
 from gui import APP_VERSION  # noqa: E402
-from gui.calibration_pose_preview import (  # noqa: E402
-    CalibrationPosePreview,
-    PREVIEW_HEIGHT,
-    PREVIEW_WIDTH,
-)
-from gui.calibration_orientation_guide import (  # noqa: E402
-    CalibrationOrientationGuide, build_orientation_state,
-)
+from gui.calibration_pose_preview import CalibrationPosePreview  # noqa: E402
+from gui.calibration_orientation_guide import build_orientation_state  # noqa: E402
 from sdk import get_version  # noqa: E402
 
 
@@ -279,7 +272,7 @@ _ROOT_POSE_READOUT = (
     (MoCapCalibrateRootType.YAW, "yaw", "Yaw"),
 )
 
-# Solver bands, mirrored in the readout colors.  Raw2MANOCalibrator skips a
+# Root-solver bands mirrored in the readout colors. The solver skips a
 # root pose rotated less than 20 deg or more than 160 deg from the Level
 # capture, warns beyond the shared limit from the 90 deg target, and requires at least
 # three valid poses at CALC time.
@@ -296,7 +289,7 @@ _ROOT_ANGLE_GOOD_BAND_DEG = ROOT_POSE_ANGLE_TOLERANCE_DEG
 _LIVE_ROOT_ANGLE_WINDOW_FRAMES = 30
 
 # These are deliberately the same labelled axes used by
-# Raw2MANOCalibrator.  A 90-degree magnitude alone is insufficient: the
+# the wrist solver. A 90-degree magnitude alone is insufficient: the
 # rotation must also be about the axis required by this step.
 _ROOT_AXIS_TARGETS = {
     "z_rot_pose_1": (np.array([0.0, 0.0, 1.0]), -np.pi / 2),
@@ -589,8 +582,8 @@ def format_root_angle(snapshot: dict) -> tuple[str, tuple[int, int, int], str]:
             verdict = direction["message"]
         elif np.linalg.norm(correction) > _ROOT_ANGLE_GOOD_BAND_DEG + 1e-9:
             color = _ANGLE_COLORS["off"]
-            verdict = L("三维朝向仍偏差 {value:.1f}°；请按 XYZ 箭头调整",
-                        "3D orientation is still {value:.1f} deg off; follow the XYZ arrows").format(
+            verdict = L("三维朝向仍偏差 {value:.1f}°；请对照预览图调整手腕朝向",
+                        "3D orientation is still {value:.1f} deg off; check your wrist orientation against the preview").format(
                             value=float(np.linalg.norm(correction)))
     if restart_note:
         color = _ANGLE_COLORS["skip"]
@@ -605,16 +598,11 @@ def format_root_angle(snapshot: dict) -> tuple[str, tuple[int, int, int], str]:
         color, history)
 
 
-def validate_hand2mm_runtime(path: Path | None = None) -> dict:
-    # The HAND2mm local runtime is hardcoded to hand_pinky_plus_2mm
-    # (see algorithm/protected/pc/runtime_backend.py); external JSON is no longer read.
-    return {
-        "schema": "stm32-imu-usb-local-runtime-override",
-        "schema_version": 1,
-        "local_only": True,
-        "backend": "hand_pinky_plus_2mm",
-        "pinky_extra_length_mm": 2.0,
-    }
+def validate_friston_runtime() -> None:
+    from gui.friston_display import skeleton_for_side
+
+    for side in ("left", "right"):
+        skeleton_for_side(side)
 
 
 def glove_link_label(port) -> str:
@@ -759,27 +747,84 @@ def format_glove_bindings(bindings: dict[str, list[str]]) -> str:
         for side, serials in bindings.items())
 
 
-def write_calibration_output(path: Path, payload: dict, force: bool = False) -> Path:
-    output = Path(path).resolve()
-    if output.exists() and not force:
-        raise FileExistsError(
-            "The selected output file already exists. Choose another path or enable replacement.")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
+def write_calibration_outputs(paths: dict[str, Path], payloads: dict[str, dict],
+                              force: bool = False) -> dict[str, Path]:
+    """Stage every payload and restore the prior files if publication fails."""
+    outputs = {side: Path(path).resolve() for side, path in paths.items()}
+    if len(set(outputs.values())) != len(outputs):
+        raise ValueError("Calibration outputs must use distinct paths")
+    for output in outputs.values():
+        if output.exists():
+            if not output.is_file():
+                raise IsADirectoryError(f"Calibration output is not a file: {output}")
+            if not force:
+                raise FileExistsError(
+                    f"Calibration file already exists: {output}. "
+                    "Choose another path or enable replacement.")
+
+    temporaries: set[Path] = set()
+    staged: dict[Path, Path] = {}
+    backups: dict[Path, Path] = {}
+    published: set[Path] = set()
     try:
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, ensure_ascii=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, output)
-    except Exception:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        for side, output in outputs.items():
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=output.parent,
+                                    prefix=f".{output.name}.", suffix=".tmp",
+                                    delete=False) as stream:
+                temporary = Path(stream.name)
+                temporaries.add(temporary)
+                staged[output] = temporary
+                json.dump(payloads[side], stream, indent=2, ensure_ascii=False)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        for output, temporary in staged.items():
+            if output.exists():
+                if not force:
+                    raise FileExistsError(f"Calibration file already exists: {output}")
+                if not output.is_file():
+                    raise IsADirectoryError(f"Calibration output is not a file: {output}")
+                with NamedTemporaryFile(dir=output.parent, prefix=f".{output.name}.",
+                                        suffix=".bak", delete=False) as stream:
+                    backup = Path(stream.name)
+                    temporaries.add(backup)
+                os.replace(output, backup)
+                backups[output] = backup
+            os.replace(temporary, output)
+            published.add(output)
+    except Exception as exc:
+        rollback_errors = []
+        for output in reversed(tuple(outputs.values())):
+            backup = backups.get(output)
+            try:
+                if backup is not None:
+                    os.replace(backup, output)
+                elif output in published:
+                    output.unlink()
+            except OSError as rollback_error:
+                if backup is not None:
+                    temporaries.discard(backup)
+                location = f" (original kept at {backup})" if backup is not None else ""
+                rollback_errors.append(f"{output}{location}: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(
+                f"Calibration save failed: {exc}. Rollback failed for "
+                + "\n".join(rollback_errors)) from exc
         raise
-    return output
+    finally:
+        for temporary in temporaries:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                print(f"Could not remove temporary calibration file {temporary}: {cleanup_error}",
+                      file=sys.stderr)
+    return outputs
+
+
+def write_calibration_output(path: Path, payload: dict, force: bool = False) -> Path:
+    return write_calibration_outputs({"hand": path}, {"hand": payload}, force)["hand"]
 
 
 def calibration_output_with_name(current_output: Path, filename: str) -> Path:
@@ -797,7 +842,7 @@ def calibration_output_with_name(current_output: Path, filename: str) -> Path:
 
 
 class CalibrationController:
-    """Own the existing HAND calibration engine while the Qt window stays responsive.
+    """Own the Friston wearing calibration engine while the Qt window stays responsive.
 
     User-facing strings are stored as ``(zh, en)`` pairs and resolved via
     ``L(*pair)`` in ``snapshot()`` so an in-flight status follows a language
@@ -1196,7 +1241,7 @@ class CalibrationController:
                     "All 16 IMUs are ready. Start a new calibration session.")
                 self._health_time = time.monotonic()
                 self._health_count = backend.hand.buffer.get_counter()
-        return self._start_worker(work, "hand2mm-calibration-connect")
+        return self._start_worker(work, "friston-calibration-connect")
 
     def start_new_session(self, *, enable_auto: bool = True) -> bool:
         def work():
@@ -1227,14 +1272,13 @@ class CalibrationController:
                 self._status = (
                     "新标定会话已开始。请采集水平姿势。",
                     "New calibration session started. Capture the level pose.")
-        return self._start_worker(work, "hand2mm-calibration-reset")
+        return self._start_worker(work, "friston-calibration-reset")
 
     def _execute_step(self, step_index: int, *, capture_only: bool = False, solve_only: bool = False) -> None:
         """Execute one step synchronously.
 
-        Single-hand mode wraps this method in its normal worker.  The dual
-        coordinator keeps per-hand state in this process while contact fitting
-        can run in dedicated processes from detached capture snapshots.
+        The dual coordinator runs the two independent Friston fits on workers
+        while keeping capture ownership with each hand.
         """
         step_index = int(step_index)
         step = self._steps[step_index]
@@ -1265,7 +1309,7 @@ class CalibrationController:
         with self._lock:
             self._activity = "compute" if computing else "capture"
             self._status = _operation_status(self._activity)
-        before_revision = backend.hand.mano_state.calibration_result_revision
+        before_revision = backend.hand.calibration_result_revision
         callback = getattr(backend.hand, {"root": "update_root_calibrator",
                     "installation": "update_installation_calibrator",
                     "fist": "update_fist_calibrator"}.get(step.flow, "update_shape_calibrator"))
@@ -1273,7 +1317,7 @@ class CalibrationController:
         with self._compute_lock if computing else nullcontext():
             with _CALIBRATION_COMPUTE_LOCK if serial_compute else nullcontext():
                 callback(trigger)
-        state = backend.hand.mano_state
+        state = backend.hand
         if state.calibration_result_revision <= before_revision:
             raise RuntimeError(L("标定命令未完成。",
                                  "The calibration command did not complete."))
@@ -1354,7 +1398,7 @@ class CalibrationController:
             return False
         return self._start_worker(
             lambda: self._execute_step(step_index),
-            f"hand2mm-calibration-step-{step_index}",
+            f"friston-calibration-step-{step_index}",
             pause_auto_on_error=self._is_compute_step(self._steps[step_index]),
             activity="compute" if self._is_compute_step(self._steps[step_index]) else "capture")
 
@@ -1370,7 +1414,7 @@ class CalibrationController:
         if not self._can_skip_current_step(allow_busy=allow_busy):
             raise RuntimeError("Return-open verification cannot be skipped at this step")
         index = self.current_step
-        state = self.backend.hand.mano_state
+        state = self.backend.hand
         before = state.calibration_result_revision
         self.backend.hand.skip_return_open_validation()
         if state.calibration_result_revision <= before or not state.last_calibration_ok:
@@ -1389,7 +1433,7 @@ class CalibrationController:
             return False
         return self._start_worker(
             lambda: self._skip_current_step(allow_busy=True),
-            "hand2mm-calibration-skip")
+            "friston-calibration-skip")
 
     def go_to_step(self, index: int) -> None:
         with self._lock:
@@ -1421,7 +1465,7 @@ class CalibrationController:
         if self.backend is None:
             return ()
         from common.calibration_workflow import step_id
-        reported = list(getattr(self.backend.hand.mano_state, 'last_calibration_retry_steps', ()) or ())
+        reported = list(getattr(self.backend.hand, 'last_calibration_retry_steps', ()) or ())
         active = {step_id(step.flow, step.trigger) for step in self._steps}
         if (getattr(self.args, 'calibration_workflow', 'simplified') == 'simplified'
                 and any(value in reported for value in ('installation_open', 'installation_compute'))):
@@ -1435,7 +1479,7 @@ class CalibrationController:
         reported = self._reported_repair_ids()
         if not reported:
             return
-        state = self.backend.hand.mano_state
+        state = self.backend.hand
         revision = getattr(state, 'calibration_result_revision', None)
         if revision == getattr(self, '_failure_revision', None) and self._failure_tracking:
             return
@@ -1461,7 +1505,7 @@ class CalibrationController:
             self._activity = "compute"
             self._status = _operation_status("compute")
         hand = self.backend.hand
-        state = hand.mano_state
+        state = hand
         before = state.calibration_result_revision
         for value in ("contact_compute", "verify_open"):
             try:
@@ -1498,7 +1542,7 @@ class CalibrationController:
     def repair_failed_steps(self) -> bool:
         if self.busy or not self.connected or not self.session_started:
             return False
-        state = self.backend.hand.mano_state
+        state = self.backend.hand
         self._refresh_reported_failures()
         reported = list(self._reported_repair_ids())
         ids = [step_id for step_id in reported if step_id in self._failed_steps]
@@ -1535,7 +1579,7 @@ class CalibrationController:
                 self.saved_path = path
                 self._status = (
                     f"标定保存成功：{path}", f"Calibration saved successfully: {path}")
-        return self._start_worker(work, "hand2mm-calibration-save")
+        return self._start_worker(work, "friston-calibration-save")
 
     def refresh_health(self) -> None:
         if getattr(self, '_activity', None) == 'compute' or self._is_compute_step(self.step):
@@ -1752,12 +1796,12 @@ class CalibrationController:
                     f"{self.rms_threshold:.1f} deg)...")
             else:
                 self._auto_status = (
-                    "自动采集：请按虚实模型和 XYZ 箭头调整朝向…",
-                    "Auto-capture: match the ghost hand using the XYZ arrows...")
+                    "自动采集：请对照预览图调整手腕朝向…",
+                    "Auto-capture: match the wrist orientation in the preview...")
 
     def _guidance_generation(self):
         with self._lock:
-            state = getattr(getattr(self.backend, "hand", None), "mano_state", None)
+            state = getattr(self.backend, "hand", None)
             return (id(self.backend), self.side, self.current_step,
                     self.session_started, frozenset(self.completed_steps),
                     getattr(state, "calibration_result_revision", 0))
@@ -1811,7 +1855,7 @@ class CalibrationController:
         step = self.step
         if step.flow != "root" or self._is_compute_step(step):
             return None
-        state = backend.hand.mano_state
+        state = backend.hand
         base_ready = bool(state.calib_root_pose_ready.get("horizontal"))
         base = state.calib_root_horizontal_pose if base_ready else None
 
@@ -2282,7 +2326,7 @@ class BimanualCalibrationController:
                 if self._single_step:
                     self._single_step = False
                     self.auto_capture = False
-            return self._start_worker(capture_and_solve, f"hand2mm-bimanual-fist-{step_index}",
+            return self._start_worker(capture_and_solve, f"friston-bimanual-fist-{step_index}",
                                       activity="capture")
 
         if left._is_compute_step(step):
@@ -2290,22 +2334,18 @@ class BimanualCalibrationController:
             compute_identifier = step_id(step.flow, step.trigger)
             if compute_identifier == "contact_compute":
                 def compute_in_parallel():
-                    from algorithm.contact_compute import init_contact_worker
                     errors = {}
                     error_lock = threading.Lock()
                     self._contact_pending_sides = set(pending)
                     for hand in pending.values():
                         hand.completed_steps.discard(step_index)
 
-                    def compute(side, hand, pool):
+                    def compute(side, hand):
                         side_zh = "左手" if side == "left" else "右手"
                         side_en = "left hand" if side == "left" else "right hand"
                         with hand._lock:
                             hand._error = ("", "")
-                        backend_hand = hand.backend.hand
-                        previous_executor = getattr(backend_hand, "_contact_compute_executor", None)
                         try:
-                            backend_hand._contact_compute_executor = pool
                             hand._execute_step(step_index)
                             with self._lock:
                                 self._contact_pending_sides.discard(side)
@@ -2319,8 +2359,6 @@ class BimanualCalibrationController:
                                     "{side} computation failed: {detail}").format(
                                         side=side_zh if not is_en() else side_en,
                                         detail=detail)
-                        finally:
-                            backend_hand._contact_compute_executor = previous_executor
 
                     started = []
                     with self._lock:
@@ -2328,22 +2366,16 @@ class BimanualCalibrationController:
                             "正在并行计算双手精细标定，请稍候…",
                             "Computing both hands' fine calibration in parallel; "
                             "please wait...")
-                    # Workers receive only captured numeric data. Device ownership,
-                    # state publication and Qt remain in this process. Spawn also
-                    # avoids inheriting Qt/native-library locks on Linux.
-                    with ProcessPoolExecutor(
-                            max_workers=2, mp_context=multiprocessing.get_context("spawn"),
-                            initializer=init_contact_worker) as pool:
-                        try:
-                            for side, hand in pending.items():
-                                thread = threading.Thread(
-                                    target=lambda side=side, hand=hand: compute(side, hand, pool),
-                                    name=f"hand2mm-contact-compute-{side}", daemon=True)
-                                thread.start()
-                                started.append(thread)
-                        finally:
-                            for thread in started:
-                                thread.join()
+                    try:
+                        for side, hand in pending.items():
+                            thread = threading.Thread(
+                                target=compute, args=(side, hand),
+                                name=f"friston-contact-compute-{side}", daemon=True)
+                            thread.start()
+                            started.append(thread)
+                    finally:
+                        for thread in started:
+                            thread.join()
                     if errors:
                         raise RuntimeError("\n".join(
                             errors[side] for side in pending if side in errors))
@@ -2359,14 +2391,10 @@ class BimanualCalibrationController:
 
                 return self._start_worker(
                     compute_in_parallel,
-                    f"hand2mm-bimanual-compute-step-{step_index}",
+                    f"friston-bimanual-compute-step-{step_index}",
                     pause_auto_on_error=True, activity="compute")
 
             def compute_sequentially():
-                # Only contact_compute has been validated for concurrent
-                # execution in two Python threads. Keep every other compute
-                # step serialized here as a conservative boundary until its
-                # concurrency behavior has been separately validated.
                 errors = []
                 for side, hand in pending.items():
                     side_zh = "左手" if side == "left" else "右手"
@@ -2400,7 +2428,7 @@ class BimanualCalibrationController:
 
             return self._start_worker(
                 compute_sequentially,
-                f"hand2mm-bimanual-compute-step-{step_index}",
+                f"friston-bimanual-compute-step-{step_index}",
                 pause_auto_on_error=True, activity="compute")
 
         # Capture steps must sample the two live streams at the same time, so
@@ -2455,7 +2483,7 @@ class BimanualCalibrationController:
             for hand in pending:
                 hand._error = ("", "")
                 hand._skip_current_step()
-        return self._start_worker(work, "hand2mm-bimanual-skip")
+        return self._start_worker(work, "friston-bimanual-skip")
 
     def go_to_step(self, index: int) -> None:
         if self._busy or any(hand.busy for hand in self.hands.values()):
@@ -2476,7 +2504,7 @@ class BimanualCalibrationController:
             return False
         self._repair_sides = [side for side, hand in self.hands.items()
             if hand.backend is not None and (hand._failed_steps or
-                getattr(hand.backend.hand.mano_state, "last_calibration_retry_steps", ()))]
+                getattr(hand.backend.hand, "last_calibration_retry_steps", ()))]
         if not self._repair_sides:
             self.report_error("No failed gestures are available for repair")
             return False
@@ -2549,12 +2577,10 @@ class BimanualCalibrationController:
                 "Complete every calibration step before saving."))
         try:
             paths = self._output_paths()
-            saved: dict[str, Path] = {}
-            for side, hand in self.hands.items():
-                payload = hand.backend.build_payload()
+            payloads = {side: hand.backend.build_payload() for side, hand in self.hands.items()}
+            for payload in payloads.values():
                 payload["tool"] = "imu_calibration_gui"
-                saved[side] = write_calibration_output(
-                    paths[side], payload, force=self.replace_output)
+            saved = write_calibration_outputs(paths, payloads, force=self.replace_output)
         except Exception as exc:
             self.report_error(str(exc))
             return False
@@ -2761,7 +2787,7 @@ class BimanualCalibrationController:
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Qt GUI (zh/en) for HAND2mm STM32 16-IMU calibration.")
+        description="Qt GUI (zh/en) for Friston STM32 16-IMU wearing calibration.")
     parser.add_argument("--side", choices=("left", "right"), default="right")
     parser.add_argument("--calibration-workflow", choices=("full", "simplified"), default="simplified")
     parser.add_argument("--include-return-open", action="store_true")
@@ -2785,8 +2811,8 @@ def _parse_args(argv=None):
     if args.startup_timeout <= 0:
         parser.error("--startup-timeout must be positive")
     try:
-        validate_hand2mm_runtime()
-    except RuntimeError as exc:
+        validate_friston_runtime()
+    except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     return args
 
@@ -3056,21 +3082,11 @@ class CalibrationWindow(QWidget):
         self._guided_heading = self._heading("")
         right_layout.addWidget(self._guided_heading)
 
-        self._orientation_row = QHBoxLayout()
-        self._orientation_guides = {
-            side: CalibrationOrientationGuide(self._preview)
-            for side in ("left", "right")
-        }
-        for guide in self._orientation_guides.values():
-            guide.setMinimumHeight(290)
-            guide.hide()
-            self._orientation_row.addWidget(guide)
-        right_layout.addLayout(self._orientation_row)
-
         self._preview_caption = self._muted("")
         right_layout.addWidget(self._preview_caption)
         self._preview_label = QLabel()
         self._preview_label.setMinimumSize(0, 180)
+        self._preview_label.setMaximumHeight(300)
         self._preview_label.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(self._preview_label)
         self._compute_hint = QLabel()
@@ -4136,23 +4152,11 @@ class CalibrationWindow(QWidget):
         dual = state.get("mode") == "dual"
         computing = (self._controller._is_compute_step(steps[preview_index])
                      or state.get("activity") == "compute")
-        root_guide = (steps[preview_index].flow == "root"
-                      and not self._controller._is_compute_step(steps[preview_index]))
-        self._preview_label.setMinimumHeight(100 if root_guide else 180)
-        self._preview_label.setMaximumHeight(120 if root_guide else 300)
-        for side, guide in self._orientation_guides.items():
-            hand = active.hands[side] if dual else active
-            orientation = (hand.root_orientation_snapshot(preview_index)
-                           if not computing and (dual or side == state["side"]) else None)
-            guide.set_state(side, orientation)
         if computing:
-            from gui.calibration_compute_guide import render_compute_guide_bgr
-            key = ("compute",)
-            if key != self._shown_preview_key:
-                self._preview_bgr = render_compute_guide_bgr()
-                if not self._set_preview_pixmap():
-                    return
-                self._shown_preview_key = key
+            if self._shown_preview_key != ("compute",):
+                self._preview_bgr = None
+                self._preview_label.setText("Calculating")
+                self._shown_preview_key = ("compute",)
             self._preview_caption.setText(L("使用已采集的标定数据进行计算",
                                             "Computing from captured calibration data"))
             self._compute_hint.setText(L("无需保持手势，可以放松手部。",
@@ -4165,8 +4169,8 @@ class CalibrationWindow(QWidget):
             preview_index = 6
         elif shown_step.preview_index is not None:
             preview_index = shown_step.preview_index
-        if state.get("mode") == "dual":
-            key = ("dual", state["current_step"])
+        if dual:
+            key = ("dual", preview_index)
             if key != self._shown_preview_key:
                 try:
                     bgr = self._preview.render_bimanual_bgr(preview_index)
@@ -4186,7 +4190,7 @@ class CalibrationWindow(QWidget):
             if state["session_started"] and not state["busy"]:
                 self._active_controller().mark_pose_presented()
             return
-        key = (state["side"], state["current_step"])
+        key = (state["side"], preview_index, state["current_step"])
         if key != self._shown_preview_key:
             try:
                 bgr = self._preview.render_bgr(state["side"], preview_index)
@@ -4296,7 +4300,7 @@ def run_gui(args) -> int:
 
 def main(argv=None) -> int:
     print(f"Host software v{APP_VERSION}, SDK v{get_version()}: "
-          f"HAND2mm 16-IMU calibration")
+          f"Friston 16-IMU calibration")
     return run_gui(_parse_args(argv))
 
 

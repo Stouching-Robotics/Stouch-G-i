@@ -33,11 +33,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import pickle
 from pathlib import Path
 import sys
 import time
-import types
 import warnings
 
 import numpy as np
@@ -59,8 +57,8 @@ else:
 if str(BUNDLE_ROOT) not in sys.path:
     sys.path.insert(0, str(BUNDLE_ROOT))
 
+from gui.friston_display import mesh_array, mesh_for_pose, skeleton_for_side
 from gui import APP_VERSION  # noqa: E402
-from gui.calibration_selector import select_calibration_files  # noqa: E402
 from gui.qt_viewer import (  # noqa: E402
     QtCanvas, ensure_qapp, pump_events)
 from gui.rendering.tactile import render_hand  # noqa: E402
@@ -68,7 +66,7 @@ from common.frame_pacing import BURST_SPAN_US  # noqa: E402
 from common.i18n import L, is_en, set_lang  # noqa: E402
 from common.types import LINK_USB  # noqa: E402
 from sdk import (  # noqa: E402
-    CalibrationError, HandFrame, StreamTimeoutError, get_version, open_glove)
+    CalibrationError, HandFrame, StreamTimeoutError, get_version)
 # The device manager is not on the client SDK's public surface; resolving an
 # explicit ``--serial-port`` reaches it through :mod:`sdk.device`.
 from sdk.device import DeviceManager  # noqa: E402
@@ -378,69 +376,16 @@ def _draw_hand(img, cam, kpts, hand_idx) -> None:
             cv2.circle(img, tuple(p.astype(int)), 2, (245, 248, 255), -1, cv2.LINE_AA)
 
 
-class _PicklePlaceholder:
-    def __init__(self, *args, **kwargs):
-        self.__dict__.update(kwargs)
-
-    def __setstate__(self, state):
-        if isinstance(state, dict):
-            self.__dict__.update(state)
-        else:
-            self.state = state
 
 
-def _load_mano_faces(side: str) -> np.ndarray | None:
-    side = str(side).lower()
-    cached = getattr(_load_mano_faces, "_cache", {})
-    if side in cached:
-        return cached[side]
-    faces = None
-    neutral_mesh = BUNDLE_ROOT / "mano_neutral_meshes.npz"
-    if neutral_mesh.is_file():
-        try:
-            with np.load(neutral_mesh, allow_pickle=False) as archive:
-                faces = np.asarray(archive[f"{side}_faces"], dtype=np.int32)
-        except (OSError, KeyError, ValueError):
-            faces = None
-    if faces is None:
-        model_path = BUNDLE_ROOT / "assets/hand/models" / f"MANO_{side.upper()}.pkl"
-        if model_path.is_file():
-            old_modules = {
-                name: sys.modules.get(name)
-                for name in ("chumpy", "chumpy.reordering", "chumpy.ch")
-            }
-            try:
-                sys.modules["chumpy"] = types.ModuleType("chumpy")
-                sys.modules["chumpy.reordering"] = types.ModuleType("chumpy.reordering")
-                sys.modules["chumpy.ch"] = types.ModuleType("chumpy.ch")
-                sys.modules["chumpy.reordering"].Select = _PicklePlaceholder
-                sys.modules["chumpy.ch"].Ch = _PicklePlaceholder
-                with model_path.open("rb") as handle:
-                    payload = pickle.load(handle, encoding="latin1")
-                faces = np.asarray(payload["f"], dtype=np.int32)
-            except Exception as exc:
-                print(f"[View warning] Cannot load MANO faces: {exc}", file=sys.stderr)
-                faces = None
-            finally:
-                for name, module in old_modules.items():
-                    if module is None:
-                        sys.modules.pop(name, None)
-                    else:
-                        sys.modules[name] = module
-    if faces is not None:
-        faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
-    cached = dict(cached)
-    cached[side] = faces
-    _load_mano_faces._cache = cached
-    return faces
 
 
 def _draw_hand_mesh(img, cam, vertices, faces) -> bool:
-    if vertices is None or faces is None:
+    verts = mesh_array(vertices)
+    if verts is None or faces is None:
         return False
-    verts = np.asarray(vertices, dtype=np.float32)
     faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
-    if verts.shape != (778, 3) or not np.isfinite(verts).all():
+    if not faces.size or faces.min() < 0 or faces.max() >= len(verts):
         return False
     pts, z = cam.project(verts)
     finite = np.isfinite(pts).all(axis=1) & np.isfinite(z) & (z > 0.0)
@@ -467,14 +412,11 @@ def _draw_hand_mesh(img, cam, vertices, faces) -> bool:
     face_colors = (
         face_shades[:, None] * np.asarray(HAND_MESH_BGR, np.float64)[None, :]
     ).astype(np.int32)
-    projected_faces = np.round(pts[faces]).astype(np.int32)
+    projected_faces = np.zeros((len(faces), 3, 2), dtype=np.int32)
+    projected_faces[face_ok] = np.round(pts[faces[face_ok]]).astype(np.int32)
     # Precompute colours once per frame instead of tuple()/int() per face.
     color_list = [tuple(int(c) for c in rgb) for rgb in face_colors]
-    # Use LINE_8, not LINE_AA.  The MANO mesh is 1538 small triangles, so the
-    # anti-aliased fill re-samples every edge pixel ~16x and turns ~3000 fills
-    # per frame (two hands) into a 5-10x slowdown, dropping the 60 Hz preview
-    # to ~15-33 FPS.  Plain fill keeps the mesh at the display rate with no
-    # visible loss on a hand that is re-rendered every frame.
+    # Plain fill keeps dense meshes responsive at the viewer's redraw rate.
     for face_index in np.argsort(face_depth)[::-1]:
         if not face_ok[face_index]:
             continue
@@ -487,7 +429,7 @@ def render_frame_live(
         cam, kpts_slots, hud_lines, title, grid_r=None,
         grid_basis: np.ndarray | None = None,
         mesh_slots: list[np.ndarray | None] | None = None,
-        mesh_faces: np.ndarray | None = None,
+        mesh_faces: tuple[np.ndarray | None, np.ndarray | None] | np.ndarray | None = None,
         display_mode: str = "bones",
         size: tuple[int, int] = (W, H)) -> np.ndarray:
     """Render one live frame: background + ground grid + left/right hand slots + HUD.
@@ -513,7 +455,8 @@ def render_frame_live(
     for slot in range(N_HANDS):
         mesh_drawn = False
         if display_mode == "hand" and mesh_slots is not None:
-            mesh_drawn = _draw_hand_mesh(img, cam, mesh_slots[slot], mesh_faces)
+            faces = mesh_faces[slot] if isinstance(mesh_faces, tuple) else mesh_faces
+            mesh_drawn = _draw_hand_mesh(img, cam, mesh_slots[slot], faces)
         if display_mode == "bones" or not mesh_drawn:
             _draw_hand(img, cam, kpts_slots[slot], slot)
     if title:
@@ -614,7 +557,8 @@ class Live3DViewer:
                  show_tactile_toggle: bool = True,
                  show_orientation_button: bool = False,
                  show_selector_button: bool = False,
-                 show_dongle_reboot_button: bool = False):
+                 show_dongle_reboot_button: bool = False,
+                 mesh_sides: tuple[str, ...] | None = None):
         self.view = view_state
         # The reset target is the state with which this particular window was
         # opened (including values loaded from its view JSON), not hard-coded
@@ -640,7 +584,12 @@ class Live3DViewer:
             raise ValueError("hand_side must be left or right")
         self.hand_slot = 0 if self.hand_side == "left" else 1
         self.display_mode = display_mode if display_mode in ("bones", "hand") else "bones"
-        self._mesh_faces = _load_mano_faces(self.hand_side)
+        if mesh_sides is None:
+            mesh_sides = (self.hand_side,)
+        self._mesh_faces = tuple(
+            skeleton_for_side(side).faces if side in mesh_sides else None
+            for side in ("left", "right")
+        )
         self.exit_requested = False
         # Set by the "back to calibration selector" button; the owning live
         # session polls this and returns to the calibration-file picker.
@@ -661,10 +610,7 @@ class Live3DViewer:
         self._fist_correction_callback = None
         self._kpts_slots = np.asarray(initial_slots, np.float32).reshape(2, 21, 3)
         self._mesh_slots: list[np.ndarray | None] = [None, None]
-        if initial_mesh_vertices is not None:
-            mesh = np.asarray(initial_mesh_vertices, dtype=np.float32)
-            if mesh.shape == (778, 3) and np.isfinite(mesh).all():
-                self._mesh_slots[self.hand_slot] = mesh
+        self._mesh_slots[self.hand_slot] = mesh_array(initial_mesh_vertices)
         self._display_rotations = list(display_rotations or [None, None])
         if len(self._display_rotations) != N_HANDS:
             raise ValueError("display_rotations must contain left/right entries")
@@ -892,9 +838,6 @@ class Live3DViewer:
             f"{view_label}: yaw {self.view.yaw:5.1f}°  elev {self.view.elev:5.1f}°  "
             f"roll {self.view.roll:5.1f}°  dist {self.view.dist:.2f}m",
         ]
-        if self.display_mode == "hand" and self._mesh_faces is None:
-            lines.append(L("完整手网格不可用；显示手骨",
-                           "Full hand mesh unavailable; showing bones"))
         if self.safety_intervened:
             lines.append(L("姿势安全修正已激活", "Pose safety correction active"))
         if self.active_contact:
@@ -915,8 +858,9 @@ class Live3DViewer:
                 continue
             mesh = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
             rotation = self._display_rotations[slot]
-            if rotation is not None and np.isfinite(mesh).all():
-                mesh = rotation.apply(mesh).astype(np.float32)
+            if rotation is not None:
+                wrist = self._kpts_slots[slot, 0]
+                mesh = (rotation.apply(mesh - wrist) + wrist).astype(np.float32)
             slots[slot] = mesh
         return slots
 
@@ -1110,10 +1054,7 @@ class Live3DViewer:
         slots[self.hand_slot] = np.asarray(joints, np.float32).reshape(21, 3)
         self._kpts_slots = slots
         mesh_slots: list[np.ndarray | None] = [None, None]
-        if mesh_vertices is not None:
-            mesh = np.asarray(mesh_vertices, dtype=np.float32)
-            if mesh.shape == (778, 3) and np.isfinite(mesh).all():
-                mesh_slots[self.hand_slot] = mesh
+        mesh_slots[self.hand_slot] = mesh_array(mesh_vertices)
         self._mesh_slots = mesh_slots
         self._redraw_requested = True
 
@@ -1259,7 +1200,9 @@ def _port_serial(port_name: str | None) -> str | None:
 
 
 def _selected_calibration(args) -> Path | None:
-    if args.select_calibration and args.calib is None:
+    if args.select_calibration and args.calib is None and not args.demo:
+        from gui.calibration_selector import select_calibration_files
+
         selected = select_calibration_files(
             args.calibration_dir,
             (args.side,),
@@ -1270,10 +1213,9 @@ def _selected_calibration(args) -> Path | None:
         args.calib = selected[args.side]
     if args.calib is not None:
         return Path(args.calib).expanduser().resolve()
-    # The two files this edition ships: a bare checkout has exactly one
-    # calibration per side, so the fallback below always finds something.
-    filename = f"imu_calibration_{args.side}.json"
-    return (PROJECT_ROOT / "calibration" / filename).resolve()
+    from sdk.calibration import find_latest_friston_calibration
+
+    return find_latest_friston_calibration(args.calibration_dir, args.side)
 
 
 # How long one Glove.read may block.  The frame rate belongs to the glove, so a
@@ -1284,6 +1226,8 @@ READ_TIMEOUT_S = 0.05
 
 def main(argv=None) -> int:
     """Run the live single-hand viewer over the client SDK interface."""
+
+    from sdk import open_glove
 
     args = _parse_args(argv)
     set_lang(args.lang)
@@ -1337,13 +1281,14 @@ def main(argv=None) -> int:
         view_state.dist = float(np.clip(
             args.dist, LiveViewState.DIST_MIN, LiveViewState.DIST_MAX))
 
-    source = glove
-    backend = source.backend
+    backend = info.backend
 
     viewer = None
     if not args.no_display:
         initial_slots = np.full((2, 21, 3), np.nan, np.float32)
-        initial_slots[0 if args.side == "left" else 1] = glove.neutral_joints()
+        skeleton = skeleton_for_side(args.side)
+        rest = skeleton.rest_local_xyzw
+        initial_slots[0 if args.side == "left" else 1] = skeleton.keypoints_m(rest)
         source_label = "USB" if info.link_kind == LINK_USB else "Bluetooth"
         viewer = Live3DViewer(
             view_state,
@@ -1354,14 +1299,14 @@ def main(argv=None) -> int:
             yaw_rate=args.yaw_rate,
             hand_side=args.side,
             display_mode=args.display_mode,
-            initial_mesh_vertices=glove.mesh_vertices_m,
+            initial_mesh_vertices=skeleton.mesh_vertices_m(rest),
             redraw_interval_s=1.0 / max(args.fps, 1.0),
         )
-        viewer.bind_root_limits(source.set_root_limits_enabled)
-        viewer.bind_root_limits_blending(source.set_root_limits_blending_enabled)
-        viewer.bind_fist_correction(source.set_fist_correction_enabled)
+        viewer.bind_root_limits(glove.set_root_limits_enabled)
+        viewer.bind_root_limits_blending(glove.set_root_limits_blending_enabled)
+        viewer.bind_fist_correction(glove.set_fist_correction_enabled)
         viewer.bind_contact_controls(
-            source.set_contact_controls,
+            glove.set_contact_controls,
             experimental=backend.get('pose_postprocess') == 'gesture-retarget-v1',
             source_refit=backend.get('pose_postprocess') == 'sensor-motion-refit-v1')
 
@@ -1372,6 +1317,9 @@ def main(argv=None) -> int:
     print("Controls: middle-drag rotate, wheel zoom, left-drag pan, "
           "a/d/w/s orbit, e/c roll, r reset, v save, q/ESC quit.")
 
+    from glove_io.recording import JointPositionSmoother
+
+    smoother = JointPositionSmoother(args.joint_smoothing_ms / 1000)
     start_wait_s = time.monotonic()
     frame_index = 0
     fps_times: list[float] = []
@@ -1416,8 +1364,10 @@ def main(argv=None) -> int:
 
             # The frame carries its own solved copies.  --display-raw picks the
             # unsmoothed keypoints; otherwise the SDK's smoothing_ms low-pass.
-            joints = frame.joints_raw_m
-            smoothed = frame.joints_smoothed_m
+            if frame.joint_xyzw is None:
+                continue
+            joints = skeleton_for_side(args.side).keypoints_m(frame.joint_xyzw)
+            smoothed = smoother.update(joints, frame.timestamp_us / 1_000_000.0)
             status = frame.status
             now = time.monotonic()
             fps_times.append(now)
@@ -1433,7 +1383,7 @@ def main(argv=None) -> int:
                     [],
                     status.safety_intervened,
                     active_contact=status.active_contact,
-                    mesh_vertices=glove.mesh_vertices_m,
+                    mesh_vertices=mesh_for_pose(args.side, frame.joint_xyzw),
                     device_fps=frame.device_fps,
                     tactile_fps=frame.tactile_fps,
                 )

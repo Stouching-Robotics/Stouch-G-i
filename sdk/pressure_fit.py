@@ -11,8 +11,8 @@ written as four 256-byte shards, each carrying the CRC-32 of the *whole* 1024
 byte blob, and the device commits the set only when the final shard's ack marks
 it valid.
 
-This module is a facade over :mod:`sdk.io.streams` and
-:mod:`sdk.io.usb_protocol`, in the same shape as :mod:`sdk._streams`: it
+This module is a facade over :mod:`glove_io.streams` and
+:mod:`glove_io.usb_protocol`, in the same shape as :mod:`sdk._streams`: it
 re-exports and writes no logic of its own.  Reach the channel through a running
 glove rather than by opening a port here --
 
@@ -44,7 +44,7 @@ turning such a file into a blob is the caller's job -- the SDK moves bytes, it
 does not fit curves.
 """
 
-from sdk.io.streams import (
+from glove_io.streams import (
     PARAM_ACK_TIMEOUT_S,
     PARAM_COMMAND_ATTEMPTS,
     PARAM_SHARD_RETRIES,
@@ -55,8 +55,9 @@ from sdk.io.streams import (
     PressureFitWriteOutcome,
     RawParamReadOutcome,
     RawParamWriteOutcome,
+    write_pressure_fit_shards,
 )
-from sdk.io.usb_protocol import (
+from glove_io.usb_protocol import (
     PARAM_ACK_PAYLOAD_SIZE,
     PARAM_STATUS_BAD_SET,
     PARAM_STATUS_CRC_MISMATCH,
@@ -131,6 +132,6 @@ __all__ = [
     "decode_pressure_fit_payload", "decode_param_ack_payload",
     "pressure_fit_crc32", "pressure_fit_quantize",
     "pressure_fit_set_summary", "supports_pressure_fit_params",
-    "hand_side_from_code",
+    "hand_side_from_code", "write_pressure_fit_shards",
     "SYNTHETIC_PRESSURE_FIT_SEED", "synthetic_pressure_fit_blob",
 ]

@@ -23,6 +23,9 @@ it, and the self-test must not drag in the GUI's rendering dependencies.
 
 from __future__ import annotations
 
+# Keep a recently accepted IMU available to visual FK during short dropouts.
+IMU_POSE_HOLD_S = 0.10
+
 # How far behind the newest frame a frame may be and still count as part of the
 # same burst, in microseconds.
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adaptive two-STM32 gloves -> HAND2mm-calibrated skeletons -> live 3D.
+"""Adaptive two-STM32 gloves -> Friston-calibrated skeletons -> live 3D.
 
 Data acquisition is the SDK's: each hand gets its own process calling
 ``sdk.open_glove``, so nothing here builds a stream-and-solver pipeline of its
@@ -60,10 +60,12 @@ if getattr(sys, "frozen", False):
 else:
     BUNDLE_ROOT = PROJECT_ROOT = _sdk_root(Path(__file__).resolve().parent)
 DEFAULT_BIMANUAL_DISPLAY_CONFIG = PROJECT_ROOT / "config" / "bimanual_display_config.json"
+DEFAULT_RIGHT_ROOT_ROTVEC_SIGN = (-1.0, -1.0, 1.0)
 DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
 if str(BUNDLE_ROOT) not in sys.path:
     sys.path.insert(0, str(BUNDLE_ROOT))
 
+from gui.friston_display import mesh_array, mesh_for_pose, skeleton_for_side
 from gui import APP_VERSION  # noqa: E402
 from gui.calibration_bindings import (  # noqa: E402
     DEFAULT_CALIBRATION_BINDINGS,
@@ -92,17 +94,17 @@ from gui.rendering.tactile_pressure_hand import (  # noqa: E402
 # It touches no sensor data; it lives there because the recorder is its other
 # caller.  ``view_state_metadata`` is the same idea for the persistent display
 # config's viewpoint, and lives with the session metadata it is written beside.
-from sdk.io.recording import JointPositionSmoother  # noqa: E402
-from sdk.io.session import view_state_metadata  # noqa: E402
+from glove_io.recording import JointPositionSmoother  # noqa: E402
+from glove_io.session import view_state_metadata  # noqa: E402
 from sdk.device import (  # noqa: E402
     DeviceManager, GloveHandMismatchError, detect_unbound_glove_links,
-    link_kind_for_device,
-    reboot_bluetooth_dongle, set_glove_serial,
+    link_kind_of, list_matching_ports, reboot_bluetooth_dongle, set_glove_serial,
 )
-from sdk.calibration import find_latest_hand2mm_calibration  # noqa: E402
+from sdk.calibration import find_latest_friston_calibration  # noqa: E402
 from sdk import (  # noqa: E402
     DeviceNotFoundError, StreamTimeoutError,
-    display_firmware_version, firmware_real_version, get_version, open_glove)
+    display_firmware_version, firmware_real_version, get_version, open_glove,
+    open_pose_processor)
 from common.i18n import L, set_lang  # noqa: E402
 
 
@@ -142,21 +144,16 @@ def _show_frozen_error(message: str) -> None:
 def resolve_calibration_paths(
         calibration_dir: Path | None,
         left_calib: Path | None,
-        right_calib: Path | None) -> dict[str, Path]:
-    """Resolve explicit files first, then a folder shortcut, then defaults."""
-    if calibration_dir is not None:
-        folder = Path(calibration_dir)
-        left = (Path(left_calib) if left_calib is not None
-                else find_latest_hand2mm_calibration(folder, "left"))
-        right = (Path(right_calib) if right_calib is not None
-                 else find_latest_hand2mm_calibration(folder, "right"))
-    else:
-        left = (Path(left_calib) if left_calib is not None
-                else DEFAULT_CALIBRATION_DIR / "imu_calibration_left.json")
-        right = (Path(right_calib) if right_calib is not None
-                 else DEFAULT_CALIBRATION_DIR
-                 / "imu_calibration_right.json")
-    return {"left": left.expanduser(), "right": right.expanduser()}
+        right_calib: Path | None,
+        sides: tuple[str, ...] = ("left", "right")) -> dict[str, Path]:
+    """Use explicit files or find the newest Friston profile for each active hand."""
+    folder = calibration_dir if calibration_dir is not None else DEFAULT_CALIBRATION_DIR
+    explicit = {"left": left_calib, "right": right_calib}
+    return {
+        side: (Path(explicit[side]).expanduser() if explicit[side] is not None
+               else find_latest_friston_calibration(folder, side))
+        for side in sides
+    }
 
 
 def _validate_palm_target_bases(value) -> np.ndarray:
@@ -197,16 +194,19 @@ def load_bimanual_display_config(
         raise RuntimeError(
             f"Left root rotation signs must be -1/+1: {root_sign.tolist()}")
     result["left_root_rotvec_sign"] = root_sign
-    # The right hand goes through the same per-frame remap slot as the left,
-    # but its default is the no-op sign set: the right is the reference side
-    # of the shared display frame and needs no handedness mirror by default.
+    # Existing display configs may predate the Friston right wrist correction.
     right_root_sign = np.asarray(
-        payload.get("right_root_rotvec_sign", [1.0, 1.0, 1.0]),
+        payload.get("right_root_rotvec_sign", DEFAULT_RIGHT_ROOT_ROTVEC_SIGN),
         dtype=float).reshape(3)
     if (not np.isfinite(right_root_sign).all()
             or not np.all(np.isin(right_root_sign, [-1.0, 1.0]))):
         raise RuntimeError(
             f"Right root rotation signs must be -1/+1: {right_root_sign.tolist()}")
+    # The v1 live writer persisted its old identity default on first use and relearn.
+    if (payload.get("schema_version") == 1 and
+            payload.get("source_session") in ("runtime-auto-create", "runtime-explicit-relearn")
+            and np.all(right_root_sign == 1.0)):
+        right_root_sign = np.array(DEFAULT_RIGHT_ROOT_ROTVEC_SIGN)
     result["right_root_rotvec_sign"] = right_root_sign
     return result
 
@@ -224,7 +224,7 @@ def save_bimanual_display_config(
         raise RuntimeError(f"Invalid bimanual wrist separation: {separation_m}")
     payload = {
         "schema": "stm32-imu-usb-bimanual-display",
-        "schema_version": 1,
+        "schema_version": 2,
         "source_session": str(source_session),
         "updated_at": datetime.now().astimezone().isoformat(),
         "separation_m": separation_m,
@@ -375,7 +375,7 @@ class HandRuntime:
     side: str
     smoother: JointPositionSmoother
     latest_joints: np.ndarray | None = None
-    latest_mesh_vertices: np.ndarray | None = None
+    latest_joint_xyzw: np.ndarray | None = None
     latest_smoothed: np.ndarray | None = None
     latest_uv: np.ndarray | None = None
     latest_force: np.ndarray | None = None
@@ -413,7 +413,7 @@ class _AbsentHandRuntime:
         self.side = side
 
     latest_joints = None
-    latest_mesh_vertices = None
+    latest_joint_xyzw = None
     latest_smoothed = None
     latest_force = None
     latest_adc = None
@@ -455,7 +455,7 @@ class PublishedHandState:
     def __init__(self, side: str):
         self.side = side
         self.latest_joints = None
-        self.latest_mesh_vertices = None
+        self.latest_joint_xyzw = None
         self.latest_smoothed = None
         self.latest_force = None
         self.latest_adc = None
@@ -592,6 +592,7 @@ def _run_pressure_fit_request(stream, request):
 class BimanualViewer(Live3DViewer):
     STARTUP_ALIGNMENT_DURATION_S = 3.0
     STARTUP_ALIGNMENT_SAMPLE_COUNT = 12
+    ALIGNMENT_SPEED_RAD_S = np.deg2rad(120.0)
 
     def __init__(self, *args, separation_m=0.30,
                  display_rotations=None, palm_target_bases=None,
@@ -599,7 +600,7 @@ class BimanualViewer(Live3DViewer):
                  right_root_rotvec_sign=None,
                  display_config_path=DEFAULT_BIMANUAL_DISPLAY_CONFIG,
                  present_sides=None,
-                 stop_event=None, **kwargs):
+                 stop_event=None, reference_slots=None, max_frame_age_s=0.25, **kwargs):
         self._bimanual_slots_cache: np.ndarray | None = None
         self._bimanual_mesh_slots_cache: list[np.ndarray | None] | None = None
         self._display_times: list[float] = []
@@ -616,6 +617,10 @@ class BimanualViewer(Live3DViewer):
         self._startup_alignment_remaining_s = self.STARTUP_ALIGNMENT_DURATION_S
         self._startup_alignment_completed = False
         self._startup_alignment_corrections = [R.identity(), R.identity()]
+        self._alignment_targets: dict[int, R] = {}
+        self._alignment_frame_times: dict[str, float] = {}
+        self._alignment_step_s: float | None = None
+        self._max_frame_age_s = max_frame_age_s
         self._startup_alignment_samples = {
             side: deque(maxlen=self.STARTUP_ALIGNMENT_SAMPLE_COUNT)
             for side in ("left", "right")
@@ -685,7 +690,7 @@ class BimanualViewer(Live3DViewer):
         # mutually exclusive modes; it is off by default so startup shows the
         # mesh without pressure points.
         self.pressure_display_mode = "none"
-        # Neutral pressure-cell anchors are built once after the MANO faces are
+        # Neutral pressure-cell anchors are built once after the Friston faces are
         # loaded.  They are evaluated on the current 778-vertex mesh at draw
         # time, so no pressure work is added to the solver or IPC paths.
         self._pressure_mappers: dict[str, PressureHandMapper] = {}
@@ -716,7 +721,8 @@ class BimanualViewer(Live3DViewer):
                 hand_display_basis(target_seed_slots[slot]) for slot in range(2)
             ]))
         fixed_rotations = fixed_bimanual_display_rotations(
-            raw_initial_slots, self._palm_target_bases)
+            raw_initial_slots if reference_slots is None else reference_slots,
+            self._palm_target_bases)
         self._anchor_axis = -self._palm_target_bases[1, :, 0].copy()
         self._left_root_rotvec_sign = np.asarray(
             left_root_rotvec_sign
@@ -724,14 +730,14 @@ class BimanualViewer(Live3DViewer):
             dtype=float).reshape(3)
         self._right_root_rotvec_sign = np.asarray(
             right_root_rotvec_sign
-            if right_root_rotvec_sign is not None else [1.0, 1.0, 1.0],
+            if right_root_rotvec_sign is not None else DEFAULT_RIGHT_ROOT_ROTVEC_SIGN,
             dtype=float).reshape(3)
         grid_forward = self._palm_target_bases[1, :, 1].copy()
         grid_normal = np.cross(self._anchor_axis, grid_forward)
         grid_normal /= max(float(np.linalg.norm(grid_normal)), 1e-9)
         self._bimanual_grid_basis = np.stack([
             self._anchor_axis, grid_forward, grid_normal], axis=1)
-        super().__init__(*args, hand_side="right",
+        super().__init__(*args, hand_side="right", mesh_sides=tuple(self.present_sides),
                          display_rotations=fixed_rotations,
                          show_title_in_canvas=False,
                          show_baseline=True,
@@ -752,16 +758,12 @@ class BimanualViewer(Live3DViewer):
         # arrive as a user click the user never made.
         self._qcanvas.set_baseline_toggle(bool(self.use_baseline))
         self._update_baseline_status()
-        if self._mesh_faces is not None:
-            for side in self.present_sides:
-                try:
-                    self._pressure_mappers[side] = PressureHandMapper(
-                        side, self._mesh_faces,
-                        BUNDLE_ROOT / "assets" / "hand")
-                except (OSError, RuntimeError, ValueError) as exc:
-                    print(
-                        f"[Pressure view warning] Cannot prepare {side} hand map: {exc}",
-                        file=sys.stderr)
+        for side in self.present_sides:
+            try:
+                self._pressure_mappers[side] = PressureHandMapper(side)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"[Pressure view warning] Cannot prepare {side} hand map: {exc}",
+                      file=sys.stderr)
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QSlider
         self._tactile_threshold_row=QWidget(self._qcanvas)
@@ -945,15 +947,28 @@ class BimanualViewer(Live3DViewer):
             np.asarray(left, np.float32).reshape(21, 3),
             np.asarray(right, np.float32).reshape(21, 3),
         ])
-        self._kpts_slots = slots
-        self._mesh_slots = [None, None]
+        meshes = [None, None]
         if mesh_slots is not None:
             for slot, vertices in enumerate(mesh_slots[:2]):
-                if vertices is None:
-                    continue
-                mesh = np.asarray(vertices, dtype=np.float32)
-                if mesh.shape == (778, 3) and np.isfinite(mesh).all():
-                    self._mesh_slots[slot] = mesh
+                meshes[slot] = mesh_array(vertices)
+        for slot, side in enumerate(("left", "right")):
+            status = statuses.get(side, {})
+            if not status.get("connected", True):
+                slots[slot] = np.nan
+                meshes[slot] = None
+            elif (status.get("warming_up") or status.get("stale") or status.get("waiting_for_data")
+                    or not np.isfinite(slots[slot]).all()):
+                # Warm-up frames represent the solver's neutral placeholder.
+                # Keep a previously rendered hand stable, including its mesh.
+                slots[slot] = self._kpts_slots[slot]
+                meshes[slot] = self._mesh_slots[slot]
+            elif self._display_rotations[slot] is None:
+                # A late hand gets its own fixed palm reference. It must not
+                # re-seed the other hand, the grid, or the camera.
+                basis = hand_display_basis(slots[slot])
+                self._display_rotations[slot] = R.from_matrix(self._palm_target_bases[slot] @ basis.T)
+        self._kpts_slots = slots
+        self._mesh_slots = meshes
         self.frame_count = int(frame_count)
         self.side_status = statuses
         # AT+REBOOT only means something to a Bluetooth dongle, so its button
@@ -1023,7 +1038,8 @@ class BimanualViewer(Live3DViewer):
         for side in self.present_sides:
             slot = 0 if side == "left" else 1
             status = self.side_status.get(side, {})
-            if (status.get("warming_up")
+            if (not status.get("connected", True) or status.get("stale")
+                    or status.get("waiting_for_data") or status.get("warming_up")
                     or not status.get("warmup_completed")):
                 return False
             if not np.isfinite(self._kpts_slots[slot]).all():
@@ -1036,39 +1052,53 @@ class BimanualViewer(Live3DViewer):
     def _on_recollect_orientation(self) -> None:
         """Restart the three-second direction capture."""
 
+        self._reset_alignment_capture()
+        self._startup_alignment_completed = False
+        self._alignment_targets.clear()
+        self._alignment_frame_times.clear()
+        self._alignment_step_s = None
+        self._redraw_requested = True
+
+    def _reset_alignment_capture(self) -> None:
         self._startup_alignment_started_s = None
         self._startup_alignment_remaining_s = self.STARTUP_ALIGNMENT_DURATION_S
-        self._startup_alignment_completed = False
-        # Drop the previous correction back to identity so the hand model
-        # returns to its just-started (uncorrected) pose while the new
-        # direction is captured.  Samples are then taken from the raw pose,
-        # exactly like the initial startup capture, and the correction is
-        # recomputed fresh rather than composed on top of the old one.
-        self._startup_alignment_corrections = [R.identity(), R.identity()]
         for samples in self._startup_alignment_samples.values():
             samples.clear()
-        self._bimanual_slots_cache = None
-        self._bimanual_mesh_slots_cache = None
-        if self._startup_alignment_ready():
-            self._startup_alignment_started_s = time.perf_counter()
-        self._redraw_requested = True
 
     def _advance_startup_alignment(self, now_s: float) -> None:
         """Run the post-warm-up three-second orientation capture."""
         if self._startup_alignment_completed:
             return
-        if self._startup_alignment_started_s is None:
-            if not self._startup_alignment_ready():
+        if not self._startup_alignment_ready():
+            if not self._alignment_targets:
+                self._reset_alignment_capture()
+            self._alignment_frame_times.clear()
+            self._alignment_step_s = None
+            return
+        stamps = {side: self.side_status[side].get("host_s", now_s) for side in self.present_sides}
+        if self._alignment_frame_times:
+            gaps = [stamp - self._alignment_frame_times[side] for side, stamp in stamps.items()]
+            if any(gap < 0 or gap > self._max_frame_age_s for gap in gaps):
+                if not self._alignment_targets:
+                    self._reset_alignment_capture()
+                self._alignment_step_s = None
+            elif any(gap == 0 for gap in gaps):
                 return
+        self._alignment_frame_times = stamps
+
+        if self._alignment_targets:
+            self._step_display_alignment(now_s)
+            return
+        if self._startup_alignment_started_s is None:
             self._startup_alignment_started_s = float(now_s)
 
         elapsed = max(0.0, float(now_s) - self._startup_alignment_started_s)
         self._startup_alignment_remaining_s = max(
             0.0, self.STARTUP_ALIGNMENT_DURATION_S - elapsed)
 
-        # Cache is currently clear, so this resolves the normal calibrated
-        # display pose before any startup correction has been committed.
-        slots = self._display_slots()
+        # Measure the calibrated display pose before the current alignment,
+        # which remains on screen throughout recapture.
+        slots = self._calibrated_display_slots()
         for side in self.present_sides:
             slot = 0 if side == "left" else 1
             if np.isfinite(slots[slot]).all():
@@ -1096,8 +1126,28 @@ class BimanualViewer(Live3DViewer):
             # calibrated straight-ahead direction.  Subsequent motion is thus
             # expressed relative to the user's startup pose.
             correction = target_basis @ captured_basis.T
-            self._startup_alignment_corrections[slot] = R.from_matrix(
-                correction)
+            self._alignment_targets[slot] = R.from_matrix(correction)
+        self._alignment_step_s = now_s
+
+    def _step_display_alignment(self, now_s: float) -> None:
+        previous_s = self._alignment_step_s
+        self._alignment_step_s = now_s
+        if previous_s is None:
+            return
+        # An interrupted stream or a slow paint must not consume the whole
+        # transition in one frame. Keep the rigid rotation under four degrees.
+        max_step = self.ALIGNMENT_SPEED_RAD_S * min(max(now_s - previous_s, 0.0), 1.0 / 30.0)
+        for slot, target in tuple(self._alignment_targets.items()):
+            current = self._startup_alignment_corrections[slot]
+            delta = (target * current.inv()).as_rotvec()
+            angle = float(np.linalg.norm(delta))
+            if angle <= max_step:
+                self._startup_alignment_corrections[slot] = target
+                del self._alignment_targets[slot]
+            else:
+                self._startup_alignment_corrections[slot] = R.from_rotvec(delta * (max_step / angle)) * current
+        if self._alignment_targets:
+            return
 
         self._startup_alignment_completed = True
         self._bimanual_slots_cache = None
@@ -1105,27 +1155,18 @@ class BimanualViewer(Live3DViewer):
         self._relative_reference_slots = self._display_slots().copy()
         print("[Orientation] Startup hand-direction alignment captured.")
 
+    def _calibrated_display_slots(self) -> np.ndarray:
+        slots = super()._display_slots()
+        for slot, signs in enumerate((self._left_root_rotvec_sign, self._right_root_rotvec_sign)):
+            if np.isfinite(slots[slot]).all():
+                slots[slot] = remap_hand_root_motion(slots[slot], self._palm_target_bases[slot], signs)
+        return place_hands_at_wrist_anchors(slots, separation_m=self.separation_m, anchor_axis=self._anchor_axis)
+
     def _display_slots(self):
         # Cached per frame: the draw path resolves it several times, and each
         # call pays scipy Rotation + anchor math.
         if self._bimanual_slots_cache is None:
-            slots = super()._display_slots()
-            # Both hands get the per-frame root-rotation remap, each with its
-            # own sign set.  This is a handedness/sign correction of the root
-            # rotation in the shared display frame (previously only the left
-            # hand was remapped); the right defaults to the no-op sign set
-            # because it is the reference side.  It never reduces how far a
-            # palm axis deviates from its target basis -- root drift removal
-            # is stabilize_bimanual_palm_bases, used by replay only.
-            for slot in (0, 1):
-                if np.isfinite(slots[slot]).all():
-                    signs = (self._left_root_rotvec_sign if slot == 0
-                             else self._right_root_rotvec_sign)
-                    slots[slot] = remap_hand_root_motion(
-                        slots[slot], self._palm_target_bases[slot], signs)
-            self._bimanual_slots_cache = place_hands_at_wrist_anchors(
-                slots, separation_m=self.separation_m,
-                anchor_axis=self._anchor_axis)
+            self._bimanual_slots_cache = self._calibrated_display_slots()
             for slot, correction in enumerate(
                     self._startup_alignment_corrections):
                 hand = self._bimanual_slots_cache[slot]
@@ -1135,6 +1176,13 @@ class BimanualViewer(Live3DViewer):
                         correction.apply(hand - wrist) + wrist
                     ).astype(np.float32)
         return self._bimanual_slots_cache
+
+    def _model_control_pivot(self, slots: np.ndarray) -> np.ndarray:
+        if len(self.present_sides) == 2:
+            # The two session wrist anchors are symmetric about scene origin.
+            # Keep that pivot while either hand is warming up or still missing.
+            return np.zeros(3, dtype=np.float32)
+        return super()._model_control_pivot(slots)
 
     def _display_mesh_slots(self) -> list[np.ndarray | None]:
         if self._bimanual_mesh_slots_cache is None:
@@ -1158,7 +1206,7 @@ class BimanualViewer(Live3DViewer):
                 # source_slots; using the raw solver vertices here leaves that
                 # rotation out and makes the full hand drift away from bones.
                 mesh = np.asarray(
-                    source_mesh, dtype=np.float32).reshape(778, 3)
+                    source_mesh, dtype=np.float32)
                 result[slot] = (
                     (mesh - source_wrist) @ rotation.T + final_wrist
                 ).astype(np.float32)
@@ -1200,8 +1248,12 @@ class BimanualViewer(Live3DViewer):
         accent = (185, 125, 245) if active else (225, 165, 75)
         cv2.rectangle(img, (x0, y0), (x1, y1), accent, 3, cv2.LINE_AA)
 
-        if active:
+        if self._alignment_targets:
+            title = L("正在应用手部参考方向", "ALIGNING HAND DIRECTION")
+            subtitle = L("视角保持不变", "The camera stays in place")
+        elif active:
             title = L("请将手摆正并保持", "STRAIGHTEN AND HOLD YOUR HANDS")
+
             subtitle = L(
                 f"将在 {self._startup_alignment_remaining_s:.1f} 秒后获取当前方向",
                 f"Capturing current orientation in {self._startup_alignment_remaining_s:.1f} seconds")
@@ -1829,7 +1881,7 @@ def _snapshot(runtimes, present_sides, state_lock):
             runtime = runtimes[side]
             snap[side] = {
                 "joints": runtime.latest_joints,
-                "mesh_vertices": getattr(runtime, "latest_mesh_vertices", None),
+                "joint_xyzw": getattr(runtime, "latest_joint_xyzw", None),
                 "smoothed": runtime.latest_smoothed,
                 "force": getattr(runtime, "latest_force", None),
                 "adc": getattr(runtime, "latest_adc", None),
@@ -1876,13 +1928,7 @@ def _snap_smoothed_or_nan(snap, side) -> np.ndarray:
 
 
 def _snap_mesh_or_none(snap, side) -> np.ndarray | None:
-    value = snap[side].get("mesh_vertices")
-    if value is None:
-        return None
-    mesh = np.asarray(value, np.float32)
-    if mesh.shape != (778, 3) or not np.isfinite(mesh).all():
-        return None
-    return mesh
+    return mesh_for_pose(side, snap[side].get("joint_xyzw"))
 
 
 def _snap_force_or_none(snap, side) -> np.ndarray | None:
@@ -1958,24 +2004,56 @@ _READ_TIMEOUT_S = 0.25
 _MAX_DRAIN = 8
 
 
-def _open_sdk_link(side, calib_paths, links, serials, registry_path):
-    """Open one hand, through the SDK's one entry point.
+_DEVICE_OPEN_RETRY_S = 2.0
+_DEVICE_OPEN_POLL_S = 0.15
 
-    Every choice was already made in the parent -- calibration file, link kind
-    and serial -- and is handed over here, so opening the glove does not
-    re-discover any of it.  Each hand has its own process and so opens its own
-    link: ``open_glove`` rather than ``open_bimanual``, which would resolve and
-    pair both links inside one interpreter and put the two solvers back on each
-    other's GIL.
-    """
+
+def _open_sdk_link(side, calib_paths, links, serials, registry_path):
+    """Pin the selected identity; the SDK resolves its current port on start."""
+
+    serial = str(serials[side] or "").strip()
+    if not serial or links[side] not in ("usb", "bluetooth"):
+        raise DeviceNotFoundError(f"The selected {side} device has no usable serial and link identity.")
 
     return open_glove(
         side,
         calibration=calib_paths[side],
         link=links[side],
-        serial_number=serials[side],
+        serial_number=serial,
         registry=registry_path,
     )
+
+
+def _start_sdk_link(side, calib_paths, links, serials, registry_path, stop_event):
+    """Allow the same device to re-enumerate without falling back to another."""
+    deadline = time.monotonic() + _DEVICE_OPEN_RETRY_S
+    while not stop_event.is_set():
+        glove = None
+        try:
+            glove = _open_sdk_link(side, calib_paths, links, serials, registry_path)
+            glove.start()
+        except Exception as exc:
+            if glove is not None:
+                glove.close()
+            remaining = deadline - time.monotonic()
+            if not isinstance(exc, DeviceNotFoundError) or remaining <= 0:
+                raise
+            stop_event.wait(min(_DEVICE_OPEN_POLL_S, remaining))
+        else:
+            if stop_event.is_set():
+                glove.close()
+                return None
+            return glove
+    return None
+
+
+def _report_worker_failure(state_queue, side, exc):
+    _publish_latest(state_queue, {
+        "type": "fatal",
+        "side": side,
+        "error": f"{type(exc).__name__}: {exc}",
+        "recoverable": isinstance(exc, DeviceNotFoundError),
+    })
 
 
 def _read_newest(glove, timeout):
@@ -2036,14 +2114,11 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
     ``{"type": "fatal", "side": ...}`` message before the process exits.
     """
     try:
-        glove = _open_sdk_link(
-            side, calib_paths, links, serials, registry_path)
+        glove = _start_sdk_link(side, calib_paths, links, serials, registry_path, stop_event)
     except BaseException as exc:
-        _publish_latest(state_queue, {
-            "type": "fatal",
-            "side": side,
-            "error": f"{type(exc).__name__}: {exc}",
-        })
+        _report_worker_failure(state_queue, side, exc)
+        return
+    if glove is None:
         return
     print(f"[SDK] {side} pipeline started (pid {os.getpid()})")
     command_thread=None
@@ -2051,10 +2126,6 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
         command_thread=threading.Thread(target=_param_command_worker,
             args=(glove,side,force_command_queue,force_result_queue,stop_event),daemon=True)
         command_thread.start()
-    # The mesh is read through ``Glove.mesh_vertices_m``, the hand's own public
-    # facade: a frame carries the pose and not the mesh, which is the state that
-    # lives on the engine.  That property is the newest solved mesh rather than
-    # one keyed to a frame, which is what the renderer paints from.
     runtime = HandRuntime(side=side, smoother=JointPositionSmoother(0.015))
     # Solve-rate budget, per hand: the SDK pipeline solves every frame it
     # receives, so this no longer saves the solve -- it keeps what is published
@@ -2191,12 +2262,14 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
                 if not publish:
                     continue
                 sample_s = timestamp_us / 1_000_000.0
-                joints = np.asarray(frame.joints_raw_m, np.float32).copy()
+                if frame.joint_xyzw is None:
+                    continue
+                joints = skeleton_for_side(side).keypoints_m(frame.joint_xyzw).astype(np.float32)
                 # The local smoother, on the raw joints and at its own
                 # parameters: the SDK's own smoothing is not what this view
                 # draws, and swapping it would change how the hand moves.
                 smoothed = np.asarray(
-                    runtime.smoother.update(frame.joints_raw_m, sample_s),
+                    runtime.smoother.update(joints, sample_s),
                     np.float32).copy()
                 publish_times.append(now)
                 publish_times = [
@@ -2214,7 +2287,7 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
                     "type": "solve",
                     "side": hand_side,
                     "joints": joints,
-                    "mesh_vertices": glove.mesh_vertices_m,
+                    "joint_xyzw": frame.joint_xyzw,
                     "smoothed": smoothed,
                     "safety": bool(status.safety_intervened),
                     "contact": status.active_contact,
@@ -2253,11 +2326,7 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
                 })
             link_health.observe(now, drained)
     except BaseException as exc:  # shipped to the parent, not swallowed
-        _publish_latest(state_queue, {
-            "type": "fatal",
-            "side": side,
-            "error": f"{type(exc).__name__}: {exc}",
-        })
+        _report_worker_failure(state_queue, side, exc)
     finally:
         try:
             glove.close()
@@ -2265,7 +2334,7 @@ def hand_solver_process(side, calib_paths, links, serials, registry_path,
                 command_thread.join(timeout=1.0)
         finally:
             _cancel_stopped_worker_queue_joins(
-                stop_event, state_queue)
+                stop_event, state_queue, force_result_queue)
 
 
 def _drain_hand_queue(state_queue, runtimes) -> dict | None:
@@ -2320,7 +2389,7 @@ def _drain_hand_queue(state_queue, runtimes) -> dict | None:
             state.force_version = message["force_version"]
             continue
         state.latest_joints = message["joints"]
-        state.latest_mesh_vertices = message.get("mesh_vertices")
+        state.latest_joint_xyzw = message.get("joint_xyzw")
         state.latest_smoothed = message["smoothed"]
         state.safety = message["safety"]
         state.contact = message["contact"]
@@ -2484,11 +2553,21 @@ def detect_gloves(device_manager, registry: Path,
                     print(f"{side} device: NOT CONNECTED (skipped)")
                 continue
             port, serial = discovered
-            found.auto_detected[side] = serial
             if announce:
                 print(
                     f"{side} device: firmware reports this hand; unbound "
-                    f"link={link_kind_for_device(port) or 'usb'}  port={port}")
+                    f"port={port}")
+            unbound = True
+        else:
+            unbound = False
+        serial = str(serial or "").strip().upper()
+        link = next((link_kind_of(candidate) for candidate in list_matching_ports()
+                     if candidate.device == port
+                     and str(candidate.serial_number or "").strip().upper() == serial), None)
+        if not serial or not link:
+            if announce:
+                print(f"{side} device: port {port} has no current link identity (skipped)")
+            continue
         # A bimanual runtime must never open one physical CDC port twice.  This
         # is a defensive guard for stale registries, unusual USB drivers, or a
         # future resolver fallback: the second logical side is absent rather
@@ -2503,8 +2582,9 @@ def detect_gloves(device_manager, registry: Path,
         found.sides.append(side)
         found.ports[side] = port
         found.serials[side] = serial
-        link = link_kind_for_device(port) or "usb"
         found.links[side] = link
+        if unbound:
+            found.auto_detected[side] = serial
         # A "bluetooth" link means the serial below is the dongle's, not the
         # glove's: the glove behind it is not a USB device, so the dongle is
         # what the registry and the calibration bindings key on.
@@ -2556,7 +2636,13 @@ def remember_auto_links(auto_detected: dict[str, str], registry: Path) -> None:
             print(f"{side} device: remembered {side} -> serial {serial}")
 
 
-def _run_live_session(args) -> int | str:
+@dataclass(frozen=True)
+class _LiveLinkFailure:
+    side: str
+    error: str
+
+
+def _run_live_session(args, *, connection_notice=None) -> int | str | _LiveLinkFailure:
     """Run one live-viewer session.
 
     Returns an int exit code, ``"selector"`` when the in-app "back to the
@@ -2590,6 +2676,11 @@ def _run_live_session(args) -> int | str:
             continue
         remembered = remembered_calibration(bindings, serials.get(side))
         if remembered is not None:
+            try:
+                open_pose_processor(side, remembered)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"{side}: remembered calibration unavailable: {exc}", file=sys.stderr)
+                continue
             setattr(args, attr, remembered)
             print(
                 f"{side} calibration: remembered {remembered} "
@@ -2627,7 +2718,8 @@ def _run_live_session(args) -> int | str:
                         for side in ("left", "right")
                     },
                     refresh_status=recheck_connection,
-                    calibrate_button=True)
+                    calibrate_button=True,
+                    connection_notice=connection_notice)
             except (OSError, RuntimeError, ValueError) as exc:
                 print(f"[Calibration selection error] {exc}", file=sys.stderr)
                 return 2
@@ -2656,7 +2748,7 @@ def _run_live_session(args) -> int | str:
                         serial, picked, args.calibration_bindings)
                     print(f"{side} calibration bound: {serial} -> {picked}")
     calib_paths = resolve_calibration_paths(
-        args.calibration_dir, args.left_calib, args.right_calib)
+        args.calibration_dir, args.left_calib, args.right_calib, tuple(present_sides))
 
     saved_display = load_bimanual_display_config(args.display_config)
     if saved_display is not None and not args.relearn_display_default:
@@ -2677,7 +2769,7 @@ def _run_live_session(args) -> int | str:
         dtype=float).reshape(3)
     right_root_rotvec_sign = np.asarray(
         saved_display["right_root_rotvec_sign"]
-        if saved_display is not None else [1.0, 1.0, 1.0],
+        if saved_display is not None else DEFAULT_RIGHT_ROOT_ROTVEC_SIGN,
         dtype=float).reshape(3)
     if args.separation is not None:
         separation_m = float(args.separation)
@@ -2686,10 +2778,6 @@ def _run_live_session(args) -> int | str:
     else:
         separation_m = 0.30
 
-    # The calibration files are checked for presence here and for usability by
-    # the hand process itself: ``open_glove`` validates the file and reports an
-    # unusable one back as a fatal message, which the loop below turns into the
-    # same RuntimeError a parent-side probe used to raise.
     runtimes: dict[str, object] = {}
     pose_postprocess = {}
     for side in ("left", "right"):
@@ -2699,21 +2787,15 @@ def _run_live_session(args) -> int | str:
         if not calib_paths[side].is_file():
             raise RuntimeError(
                 f"Missing {side} calibration: {calib_paths[side]}")
-        from sdk.calibration import prepare_viewer_calibration
-        calib_paths[side] = prepare_viewer_calibration(calib_paths[side], side)
-        # Profile resolution already validates the file and hand side. Only
-        # metadata is needed here; the worker owns the solver configuration.
-        shape = json.loads(
-            calib_paths[side].read_text(encoding="utf-8-sig")
-        ).get("param_shape_calib") or {}
-        pose_postprocess[side] = (
-            "sensor-motion-refit-v1" if "sensor_motion_refit" in shape
-            else "gesture-retarget-v1" if "gesture_retarget" in shape
-            else "legacy-contact")
+        try:
+            processor = open_pose_processor(side, calib_paths[side])
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            raise RuntimeError(f"{side} calibration is not usable: {exc}") from exc
+        pose_postprocess[side] = processor.backend.get('pose_postprocess', 'friston-mounted')
         runtimes[side] = PublishedHandState(side)
 
-    print(f"Left IMU calibration: {calib_paths['left'].resolve()}")
-    print(f"Right IMU calibration: {calib_paths['right'].resolve()}")
+    for side in present_sides:
+        print(f"{side.title()} IMU calibration: {calib_paths[side].resolve()}")
     print("Pipeline: sdk.open_glove -> 21 solved keypoints + finger force in "
           "newtons")
 
@@ -2775,7 +2857,7 @@ def _run_live_session(args) -> int | str:
     # Last pose actually drawn per hand.  A hand that goes stale keeps its last
     # drawn pose while the other keeps moving, so a stalled link freezes one
     # hand instead of blanking the frame or freezing both.
-    last_shown: dict[str, tuple[np.ndarray, np.ndarray | None]] = {}
+    last_shown: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None]] = {}
     # ``--link-diag`` bookkeeping: the transport's parser counters are
     # cumulative, so the interesting number is the per-second delta.
     prev_link_errors: dict[str, dict[str, int] | None] = {
@@ -2786,7 +2868,7 @@ def _run_live_session(args) -> int | str:
     # have different fixes.
     prev_link_drops: dict[str, dict[str, int] | None] = {
         side: None for side in present_sides}
-    session_result: int | str = 0
+    session_result: int | str | _LiveLinkFailure = 0
     try:
         # One reader process per hand: the SDK pipeline owns the link and the
         # solve, and running it off the GUI's thread is what keeps a solve
@@ -2826,16 +2908,26 @@ def _run_live_session(args) -> int | str:
                     for side in present_sides:
                         fatal = _drain_hand_queue(
                             state_queues[side], runtimes) or fatal
+                if fatal is None:
+                    for side, reader in readers.items():
+                        if reader.is_alive():
+                            continue
+                        # The child may have flushed its last report after our
+                        # first poll but before the liveness check.
+                        with state_lock:
+                            fatal = _drain_hand_queue(state_queues[side], runtimes)
+                        if fatal is None:
+                            raise RuntimeError(
+                                f"SDK {side} pipeline process exited unexpectedly "
+                                f"(exitcode={reader.exitcode})")
+                        break
                 if fatal is not None:
-                    raise RuntimeError(
-                        f"SDK {fatal.get('side') or ''} pipeline process "
-                        f"failed: {fatal['error']}")
-                for side in present_sides:
-                    reader = readers[side]
-                    if not reader.is_alive():
-                        raise RuntimeError(
-                            f"SDK {side} pipeline process exited unexpectedly "
-                            f"(exitcode={reader.exitcode})")
+                    side = fatal.get("side", "")
+                    error = fatal["error"]
+                    if fatal.get("recoverable") and not (args.no_display or args.no_select_calibration):
+                        session_result = _LiveLinkFailure(side, error)
+                        break
+                    raise RuntimeError(f"SDK {side} pipeline process failed: {error}")
             snap = _snapshot(runtimes, present_sides, state_lock)
             if args.link_diag and now >= next_link_diag:
                 next_link_diag = now + 1.0
@@ -2956,8 +3048,12 @@ def _run_live_session(args) -> int | str:
                 fixed_rotations = fixed_bimanual_display_rotations(
                     initial, palm_target_bases)
                 if not args.no_display:
+                    visible = initial.copy()
+                    for slot, side in enumerate(("left", "right")):
+                        if side not in fresh_sides or snap[side]["warming_up"]:
+                            visible[slot] = np.nan
                     viewer = BimanualViewer(
-                        view_state, initial,
+                        view_state, visible,
                         "Stouch Glove",
                         separation_m=separation_m,
                         palm_target_bases=palm_target_bases,
@@ -2967,6 +3063,7 @@ def _run_live_session(args) -> int | str:
                         present_sides=present_sides,
                         display_mode=args.display_mode,
                         stop_event=stop_event,
+                        reference_slots=initial, max_frame_age_s=args.max_frame_age,
                         redraw_interval_s=1.0 / max(float(args.fps), 1.0))
                     viewer._param_command_queues = force_command_queues
                     viewer._param_result_queues = force_result_queues
@@ -3009,6 +3106,7 @@ def _run_live_session(args) -> int | str:
                                 "warmup_completed": snap[side]["warmup_completed"],
                                 "firmware_version": snap[side]["firmware_version"],
                                 "latency": snap[side]["latency"],
+                                "host_s": snap[side]["host_s"],
                                 "link": snap[side]["link_kind"],
                                 "connected": True,
                                 "waiting_for_data": snap[side]["joints"] is None,
@@ -3042,19 +3140,22 @@ def _run_live_session(args) -> int | str:
                     for side in present_sides:
                         if side in fresh_sides:
                             last_shown[side] = (
+                                _snap_joints_or_nan(snap, side),
                                 _snap_smoothed_or_nan(snap, side),
                                 _snap_mesh_or_none(snap, side))
                     shown = {}
                     for side in ("left", "right"):
                         entry = last_shown.get(side)
                         if entry is None:
-                            entry = (_snap_smoothed_or_nan(snap, side),
+                            entry = (_snap_joints_or_nan(snap, side),
+                                     _snap_smoothed_or_nan(snap, side),
                                      _snap_mesh_or_none(snap, side))
                         shown[side] = entry
+                    joint_index = 0 if viewer.display_mode == "hand" else 1
                     viewer.update_both(
-                        shown["left"][0], shown["right"][0],
+                        shown["left"][joint_index], shown["right"][joint_index],
                         processed_frame_index, statuses,
-                        mesh_slots=[shown["left"][1], shown["right"][1]])
+                        mesh_slots=[shown["left"][2], shown["right"][2]])
                 processed_frame_index += 1
                 # Fixed-timestep accumulator.  Resetting from `now` added the
                 # loop's wake-up overshoot to every interval and drifted the
@@ -3068,7 +3169,11 @@ def _run_live_session(args) -> int | str:
             elif not ready and now - started > args.startup_timeout:
                 missing = [side for side in present_sides
                            if snap[side]["joints"] is None]
-                raise RuntimeError(f"Timed out waiting for hand data: {missing}")
+                error = f"Timed out waiting for hand data: {missing}"
+                if not (args.no_display or args.no_select_calibration):
+                    session_result = _LiveLinkFailure(", ".join(missing), error)
+                    break
+                raise RuntimeError(error)
 
             if viewer:
                 keep_running = viewer.tick()
@@ -3121,23 +3226,35 @@ def main(argv=None):
     # Required so multiprocessing children bootstrap correctly when the app
     # is packaged (PyInstaller / py2exe); a no-op for a plain `python` run.
     multiprocessing.freeze_support()
-    args = _parse_args(argv)
-    set_lang(args.lang)
+    launch_args = _parse_args(argv)
+    set_lang(launch_args.lang)
+    connection_notice = None
     while True:
         # The live session opens the calibration-file selector (with a
         # Calibrate button).  Selecting files -> live viewer -> exit code;
-        # Calibrate -> run the calibration program -> loop back to the
-        # selector; the in-app "back to selector" button loops back into a
-        # fresh live session (which re-opens the selector).
-        result = _run_live_session(args)
+        # Calibrate -> run the calibration program -> loop back to the selector.
+        args = copy.copy(launch_args)
+        result = _run_live_session(args, connection_notice=connection_notice)
+        connection_notice = None
+        if isinstance(result, _LiveLinkFailure):
+            print(f"[SDK] {result.side} pipeline failed: {result.error}", file=sys.stderr)
+            side = {"left": L("左手", "left glove"), "right": L("右手", "right glove")}.get(
+                result.side, L("手套", "glove"))
+            connection_notice = L(
+                "无法读取{side}数据。请检查连接并刷新，可继续使用已有标定。",
+                "Could not read from the {side}. Check the connection and refresh. You can reuse its saved calibration.",
+            ).format(side=side)
+            result = "selector"
         if result == "calibrate":
             result = _run_calibration_session(args)
             if result == "done":
                 continue
             return result
         if result == "selector":
-            args.select_calibration = True
-            args.no_select_calibration = False
+            # The in-app "back to selector" button: force a re-pick and loop
+            # back into a fresh live session (which re-opens the selector).
+            launch_args.select_calibration = True
+            launch_args.no_select_calibration = False
             continue
         return result
 

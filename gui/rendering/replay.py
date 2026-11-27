@@ -54,7 +54,7 @@ from gui.live_3d_bimanual import (  # noqa: E402
 from gui.rendering.tactile_overlay import (  # noqa: E402
     draw_bimanual_tactile_overlay,
 )
-from sdk.io.session import load_session_metadata  # noqa: E402
+from glove_io.session import load_session_metadata  # noqa: E402
 
 N_HANDS, N_KPTS = 2, 21
 W, H = 1280, 720
@@ -66,7 +66,7 @@ _TACTILE_COLUMNS = {
     "right": "observation.tactile.right_glove",
 }
 
-# MANO 21-keypoint bone connections + groups: 0 thumb 1 index 2 middle 3 ring 4 pinky 5 metacarpal
+# Recorded 21-keypoint bone connections + groups: 0 thumb 1 index 2 middle 3 ring 4 pinky 5 metacarpal
 BONES = [
     (0, 1, 0), (1, 2, 0), (2, 3, 0), (3, 4, 0),                # thumb
     (0, 5, 1), (5, 6, 1), (6, 7, 1), (7, 8, 1),                # index
@@ -89,7 +89,7 @@ FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
 
 def load(path, smooth) -> tuple[np.ndarray, list[str], list[str]]:
     df = pl.read_parquet(path)
-    col = _SM if smooth else _COL
+    col = _SM if smooth and _SM in df.columns else _COL
     arr = np.asarray(df[col].to_list(), np.float32).reshape(-1, N_HANDS, N_KPTS, 3)
     order = None
     if "frame_index" in df.columns:
@@ -122,14 +122,22 @@ def load_tactile(path) -> dict[str, np.ndarray | None]:
 def prepare_bimanual_replay(
         frames: np.ndarray,
         metadata: dict,
-        separation_m: float = 0.30) -> tuple[np.ndarray, np.ndarray]:
+        separation_m: float = 0.30) -> tuple[np.ndarray, np.ndarray | None]:
     """Apply the live bimanual display transform without touching source data."""
     source = np.asarray(frames, dtype=np.float32).reshape(-1, 2, 21, 3)
     display = metadata.get("display") if isinstance(metadata, dict) else None
     display = display if isinstance(display, dict) else {}
+    initial = np.full((2, 21, 3), np.nan, np.float32)
+    for slot in range(2):
+        complete = source[np.isfinite(source[:, slot]).all(axis=(1, 2)), slot]
+        if len(complete):
+            initial[slot] = complete[0]
+
     saved_targets = display.get("palm_target_bases")
     if saved_targets is None:
-        initial = source[0].copy()
+        if not np.isfinite(initial).all():
+            return source.copy(), None
+        initial = initial.copy()
         initial[0] = apply_hand_display_rotation(
             initial[0], align_left_to_right_reference(initial[0], initial[1]))
         targets = np.stack([
@@ -146,7 +154,7 @@ def prepare_bimanual_replay(
             for matrix in np.asarray(fixed_matrices, dtype=float).reshape(2, 3, 3)
         ]
     elif not use_dynamic_stabilization:
-        fixed_rotations = fixed_bimanual_display_rotations(source[0], targets)
+        fixed_rotations = fixed_bimanual_display_rotations(initial, targets)
     else:
         fixed_rotations = None
     anchor_axis = -targets[1, :, 0]
@@ -362,6 +370,8 @@ def main(argv=None, required_hands: tuple[str, ...] = (),
 
     metadata = load_session_metadata(args.input)
     kpts, lab0, lab1 = load(args.input, args.smooth)
+    if not len(kpts):
+        raise SystemExit("Error: recording contains no keypoint frames")
     tactile = ({"left": None, "right": None}
                if args.no_tactile else load_tactile(args.input))
     present = {
@@ -391,19 +401,20 @@ def main(argv=None, required_hands: tuple[str, ...] = (),
     if bool(display_meta) or is_bimanual:
         kpts, targets = prepare_bimanual_replay(
             kpts, metadata, separation_m=separation_m)
-        grid_x = -targets[1, :, 0]
-        grid_y = targets[1, :, 1]
-        grid_z = np.cross(grid_x, grid_y)
-        grid_z /= max(float(np.linalg.norm(grid_z)), 1e-9)
-        grid_basis = np.stack([grid_x, grid_y, grid_z], axis=1)
-        if display_meta.get("palm_target_bases") is None:
-            print("[Info] session.json has no palm bases; inferred from first frame")
-        motion_mode = ("per-frame palm stabilization"
-                       if display_meta.get("stabilize_palm_bases", True)
-                       else "fixed startup alignment with root motion preserved")
-        print(
-            f"Bimanual layout: {separation_m * 100:.1f} cm wrist separation; "
-            f"{motion_mode}")
+        if targets is not None:
+            grid_x = -targets[1, :, 0]
+            grid_y = targets[1, :, 1]
+            grid_z = np.cross(grid_x, grid_y)
+            grid_z /= max(float(np.linalg.norm(grid_z)), 1e-9)
+            grid_basis = np.stack([grid_x, grid_y, grid_z], axis=1)
+            if display_meta.get("palm_target_bases") is None:
+                print("[Info] Inferred palm bases from the first complete pose for each hand")
+            motion_mode = ("per-frame palm stabilization"
+                           if display_meta.get("stabilize_palm_bases", True)
+                           else "fixed startup alignment with root motion preserved")
+            print(
+                f"Bimanual layout: {separation_m * 100:.1f} cm wrist separation; "
+                f"{motion_mode}")
 
     view_mode = args.view or ("static" if metadata else "rotating")
     yaw_value = float(args.yaw if args.yaw is not None

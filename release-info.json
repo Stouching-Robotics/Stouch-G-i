@@ -1,7 +1,7 @@
 {
-  "release_version": "2.1.4",
-  "sdk_version": "2.3.6",
-  "gui_version": "2.0.10",
+  "release_version": "2.2.1",
+  "sdk_version": "2.4.1",
+  "gui_version": "2.1.1",
   "edition": "user",
-  "date": "2026-11-10"
+  "date": "2026-11-27"
 }

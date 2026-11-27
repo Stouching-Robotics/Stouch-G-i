@@ -7,12 +7,14 @@ The protected hand solver remains reachable only through ``HandSolver``.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
+import logging
 import math
-import sys
 import copy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
+import sys
 import threading
 import time
 from typing import Iterator
@@ -21,15 +23,15 @@ from uuid import uuid4
 import numpy as np
 
 from common.errors import StreamClosedError, StreamTimeoutError
-from common.frame_pacing import BURST_SPAN_US, recent_batch
+from common.frame_pacing import BURST_SPAN_US, IMU_POSE_HOLD_S, recent_batch
 from sdk import get_version as sdk_version
-from sdk.io.streams import RawImuStream, TactileStream
-from sdk.solver import HandSolver
+from glove_io.streams import RawImuStream, TactileStream
+from sdk.solver import open_pose_processor
 from sdk.mag import from_snapshot, mag_available, MagCalibrationDropMonitor
-from sdk.io.streams import PARAM_VERSION_WAIT_S
-from sdk.transport import LinkSpec, resolve_link
+from sdk.pressure_fit import PARAM_VERSION_WAIT_S
+from sdk.transport import LinkSpec, check_frame_side, make_raw_stream, resolve_link
 from sdk.types import HandFrame
-from algorithm.force_fit import fit_finger_force_matrix
+from sdk.force import fit_finger_force_matrix
 from sdk.force_codec import decode_force_parameters
 from common.types import (
     LINK_AUTO, DeviceHealth, GloveConfig, GloveInfo, RawImuFrame,
@@ -128,16 +130,35 @@ class ForceCalibrationResult:
     status: str = "unread"
 
 
+class _PoseQueue(Queue[HandFrame | None]):
+    ended = False
+    error: Exception | None = None
+
+    def finish(self, error: Exception | None = None) -> None:
+        """Wake readers once. The engine lock serializes queue termination."""
+        if self.ended:
+            return
+        self.ended = True
+        self.error = error
+        while True:
+            try:
+                self.get_nowait()
+            except Empty:
+                break
+        self.put_nowait(None)
+
+
 class GloveEngine:
     def __init__(self, config: GloveConfig,
                  queue_size: int = DEFAULT_QUEUE_FRAMES):
         self.config = config
-        self.solver = HandSolver(config.side, config.calibration)
-        self.port: str | None = None
+        self.solver = open_pose_processor(config.side, config.calibration)
+        self._resolved_port: str | None = None
         self.serial_number: str = str(config.serial_number or "")
         self._link: LinkSpec | None = None
         self._stream: RawImuStream | None = None
-        self._queue: Queue[HandFrame] = Queue(maxsize=max(2, int(queue_size)))
+        self._queue = _PoseQueue(maxsize=max(2, int(queue_size)))
+        self._lifecycle_lock = threading.RLock()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._latest: HandFrame | None = None
@@ -186,9 +207,24 @@ class GloveEngine:
         self._force_state = {"source": "unavailable", "status": "unread", "error": "", "calibration": None}
 
     def start(self) -> "GloveEngine":
-        if self._started:
+        with self._lifecycle_lock:
+            if self._started:
+                return self
+            if self._stream is not None:
+                self._stop_stream()
+            try:
+                self._start_stream()
+            except BaseException:
+                try:
+                    self._stop_stream()
+                except Exception:
+                    logging.getLogger(__name__).exception("Glove startup rollback failed")
+                raise
             return self
+
+    def _start_stream(self) -> None:
         with self._lock:
+            self._queue = _PoseQueue(maxsize=self._queue.maxsize)
             self._force_session_id = uuid4().hex
             self._force_connection_key = None
             self._force_connection_id = None
@@ -203,35 +239,28 @@ class GloveEngine:
             self._tactile_arrivals.clear()
             self._tactile_arrival_count = 0
             self._tactile_fps = 0.0
+            self._last_error = None
+            self._last_tactile_error = None
         self._link = resolve_link(self.config)
-        self.port = self._link.port
+        self._resolved_port = self._link.port
         self.serial_number = self._link.serial_number
-        # The link carries its own VID/PID: reading them off the calibration file
-        # (as this used to) made the transport treat a Bluetooth dongle as wired,
-        # which re-enables the automatic latency probes a half-duplex SPP link
-        # cannot absorb and drops the 2-second silent-link auto-recovery.
-        self._stream = RawImuStream(
-            serial_port=self._link.port,
-            usb_vid=self._link.vid,
-            usb_pid=self._link.pid,
-        )
-        self._started = True
-        self._last_error = None
-        self._last_tactile_error = None
+        self._stream = make_raw_stream(self._link)
         self._mag_drop_monitor = MagCalibrationDropMonitor()
         self._stop.clear()
         self._stream.start()
-        self._threads = [
+        workers = [
             threading.Thread(target=self._imu_loop, name=f"sdk-{self.config.side}-imu",
                              daemon=True),
         ]
         if self.config.include_tactile:
-            self._threads.append(threading.Thread(
+            workers.append(threading.Thread(
                 target=self._tactile_loop,
                 name=f"sdk-{self.config.side}-tactile", daemon=True))
-        for thread in self._threads:
-            thread.start()
-        return self
+        with self._lock:
+            self._threads = workers
+            for thread in workers:
+                thread.start()
+            self._started = True
 
     def _invalidate_force(self, status="unread", error=""):
         with self._lock:
@@ -436,7 +465,7 @@ class GloveEngine:
         """
 
         assert self._stream is not None
-        while True:
+        while not self._stop.is_set():
             try:
                 first = self._stream.read(timeout=timeout)
             except StreamTimeoutError:
@@ -446,16 +475,31 @@ class GloveEngine:
     def _imu_loop(self) -> None:
         try:
             assert self._stream is not None and self._link is not None
+            generation = None
             for imu_frame in self._imu_batch_frames(_FRAME_WAIT_S):
-                if self._stop.is_set():
-                    break
+                packet_generation = getattr(imu_frame, "_connection_generation", None)
+                with self._lock, self._transport_state_lock():
+                    if self._stop.is_set():
+                        break
+                    if not self._generation_is_current(packet_generation):
+                        continue
+                    firmware = getattr(imu_frame, "_wire_firmware_version", self._firmware_version)
+                    check_frame_side(self.config.side, self._link, firmware)
+                if packet_generation != generation:
+                    generation = packet_generation
+                    self._smoother = _JointSmoother(self.config.smoothing_ms / 1000.0)
+                    self._arrivals.clear()
+                    self._arrival_count = 0
+                    self._mag_drop_monitor = MagCalibrationDropMonitor()
                 keypoints = self.solver.process(imu_frame)
                 timestamp_s = keypoints.timestamp_us / 1_000_000.0
                 smoothed = self._smoother.update(
                     keypoints.joints_m, timestamp_s)
                 now = time.monotonic()
                 device_fps = self._note_arrival(now)
-                with self._lock:
+                with self._lock, self._transport_state_lock():
+                    if self._stop.is_set() or not self._generation_is_current(packet_generation):
+                        continue
                     force_state = self._force_snapshot()
                     current_generation = self._stream._transport.connection_generation
                     tactile_raw = (None if self._latest_tactile_raw is None
@@ -494,6 +538,7 @@ class GloveEngine:
                     imu_valid=keypoints.valid_mask,
                     sensor_age_s=keypoints.sensor_age_s,
                     joints_raw_m=keypoints.joints_m,
+                    joint_xyzw=keypoints.joint_xyzw,
                     joints_smoothed_m=smoothed,
                     tactile_raw=tactile_raw,
                     tactile_fresh=tactile_fresh,
@@ -502,7 +547,7 @@ class GloveEngine:
                     raw_imu_present=imu_frame.present_mask,
                     raw_imu_valid=imu_frame.valid_mask,
                     raw_device_timestamp_us=imu_frame.device_timestamp_us,
-                    firmware_version=self._firmware_version,
+                    firmware_version=firmware,
                     link_kind=self._link.kind,
                     mag=from_snapshot(self._stream.mag_telemetry),
                     device_fps=device_fps,
@@ -515,24 +560,53 @@ class GloveEngine:
                 object.__setattr__(frame, "_force_connection_id", force_state["connection_id"])
                 object.__setattr__(frame, "_force_baseline_id", force_state["baseline_id"])
                 object.__setattr__(frame, "_force_baseline_revision", baseline_revision)
-                dropped = self._mag_drop_monitor.update(frame.mag)
+                object.__setattr__(frame, "_connection_generation", packet_generation)
+                with self._lock, self._transport_state_lock():
+                    if self._stop.is_set() or not self._generation_is_current(packet_generation):
+                        continue
+                    if getattr(self._latest, "_connection_generation", None) != packet_generation:
+                        self._frame_times.clear()
+                    missing_mask = ~(keypoints.sensor_age_s <= IMU_POSE_HOLD_S + 1e-9)
+                    self._missing = tuple(
+                        f"IMU-{index}" for index in np.flatnonzero(missing_mask))
+                    self._latest = frame
+                    self._frame_times.append(now)
+                    dropped = self._mag_drop_monitor.update(frame.mag)
+                with self._lock, self._transport_state_lock():
+                    if not self._pose_is_current(frame):
+                        continue
+                    self._put_latest(frame)
                 if dropped:
                     channels = ', '.join(f'IMU-{channel}: 3->{level}' for channel, level in dropped)
                     print(f'[WARNING][MAG] {self.config.side} {self.serial_number} '
                           f'磁力计校准状态下降 / calibration lost '
                           f'(physical channels, 0-based): {channels}. '
                           '请检查磁环境并缓慢画圆重新校准。', flush=True)
-                with self._lock:
-                    missing_mask = ~np.isfinite(keypoints.sensor_age_s)
-                    self._missing = tuple(
-                        f"IMU-{index}" for index in np.flatnonzero(missing_mask))
-                    self._latest = frame
-                    self._frame_times.append(now)
-                self._put_latest(frame)
         except Exception as exc:
             with self._lock:
-                self._last_error = f"{type(exc).__name__}: {exc}"
-            self._stop.set()
+                if not self._stop.is_set():
+                    self._fail_pose_stream(exc)
+
+    def _fail_pose_stream(self, exc: Exception) -> None:
+        self._last_error = f"{type(exc).__name__}: {exc}"
+        self._stop.set()
+        self._latest = None
+        self._queue.finish(exc)
+
+    def _transport_state_lock(self):
+        transport = None if self._stream is None else self._stream._transport
+        return getattr(transport, "_state_lock", nullcontext())
+
+    def _generation_is_current(self, generation: int | None) -> bool:
+        if generation is None:
+            return True  # Synthetic pose inputs carry no transport metadata.
+        transport = None if self._stream is None else self._stream._transport
+        return (transport is not None and transport.connected
+                and transport.connection_generation == generation)
+
+    def _pose_is_current(self, frame: HandFrame | None) -> bool:
+        return (frame is not None and not self._stop.is_set()
+                and self._generation_is_current(getattr(frame, "_connection_generation", None)))
 
     def _tactile_scan_frames(
             self, stream: TactileStream,
@@ -555,7 +629,7 @@ class GloveEngine:
         hidden.)
         """
 
-        while True:
+        while not self._stop.is_set():
             try:
                 first = stream.read(timeout=timeout)
             except StreamTimeoutError:
@@ -598,18 +672,39 @@ class GloveEngine:
                 self._last_tactile_error = f"{type(exc).__name__}: {exc}"
 
     def read(self, timeout: float | None = None) -> HandFrame:
-        if not self._started:
+        return self._read_frame(self._read_queue(), timeout)
+
+    def _read_queue(self) -> _PoseQueue:
+        with self._lifecycle_lock:
             self.start()
-        try:
-            return self._current_force_frame(self._queue.get(timeout=timeout))
-        except Empty as exc:
-            with self._lock:
-                last_error = self._last_error
-            if last_error is not None:
+            return self._queue
+
+    def _check_read_queue(self, queue: _PoseQueue) -> None:
+        with self._lock:
+            if queue.error is not None:
                 raise StreamClosedError(
-                    f"{self.config.side} glove stream stopped: {last_error}") from exc
-            raise StreamTimeoutError(
-                f"Timed out waiting for {self.config.side} glove frame") from exc
+                    f"{self.config.side} glove stream stopped: "
+                    f"{type(queue.error).__name__}: {queue.error}") from queue.error
+            if queue.ended or not self._started or queue is not self._queue:
+                raise StreamClosedError(f"{self.config.side} glove was closed")
+
+    def _read_frame(self, queue: _PoseQueue, timeout: float | None) -> HandFrame:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                frame = queue.get(timeout=remaining)
+            except Empty as exc:
+                self._check_read_queue(queue)
+                raise StreamTimeoutError(
+                    f"Timed out waiting for {self.config.side} glove frame") from exc
+            with self._lock, self._transport_state_lock():
+                if frame is None:
+                    # Pass the shutdown marker to the next blocked reader.
+                    queue.put_nowait(None)
+                self._check_read_queue(queue)
+                if self._pose_is_current(frame):
+                    return self._current_force_frame(frame)
 
     def _current_force_frame(self, frame):
         if frame is None:
@@ -631,18 +726,16 @@ class GloveEngine:
                                    force_status=status, force_error=error, force_fresh=False)
                 # Preserve origin: replacing dataclass fields drops internal metadata.
                 for name in ("_force_revision", "_force_connection_id", "_force_baseline_id",
-                             "_force_baseline_revision"):
+                             "_force_baseline_revision", "_connection_generation"):
                     object.__setattr__(filtered, name, getattr(frame, name, None))
                 return filtered
             return frame
 
     def latest(self) -> HandFrame | None:
-        with self._lock:
-            return self._current_force_frame(self._latest)
-
-
-
-
+        with self._lock, self._transport_state_lock():
+            if self._pose_is_current(self._latest):
+                return self._current_force_frame(self._latest)
+            return None
 
     def _param_stream(self) -> RawImuStream:
         """The running stream, opening the glove first if it has not been."""
@@ -664,35 +757,30 @@ class GloveEngine:
 
         return self._param_stream().wait_for_version(timeout_s)
 
-
-
-
-
-
-
-
-
-
-
     def health(self) -> DeviceHealth:
-        with self._lock:
-            times = list(self._frame_times)
-            missing = self._missing
+        with self._lock, self._transport_state_lock():
+            current = self._pose_is_current(self._latest)
+            times = list(self._frame_times) if current else []
+            missing = self._missing if current else tuple(f"IMU-{index}" for index in range(16))
             errors = [value for value in (
                 self._last_error, self._last_tactile_error) if value]
+            connected = (self._started and not self._stop.is_set()
+                         and self._stream is not None and self._stream.connected)
         fps = 0.0
         if len(times) >= 2:
             fps = (len(times) - 1) / max(times[-1] - times[0], 1e-9)
         return DeviceHealth(
-            connected=(self._started and not self._stop.is_set()
-                       and self._stream is not None
-                       and self._stream.connected),
+            connected=connected,
             ready_imu_count=16 - len(missing),
             missing_imus=missing,
             stream_fps=fps,
             message=self._health_message(),
             last_error="; ".join(errors) if errors else None,
         )
+
+    @property
+    def port(self) -> str | None:
+        return getattr(self._stream, "port", None) or self._resolved_port
 
     def info(self) -> GloveInfo:
         """What is running this glove, and where it is attached.
@@ -719,32 +807,54 @@ class GloveEngine:
     def mesh_vertices_m(self) -> np.ndarray | None:
         """The newest solved MANO mesh, wrist-centred, ``(778, 3)`` float32."""
 
-        return self.solver.mesh_vertices_m
+        with self._lock, self._transport_state_lock():
+            if self._started and self._pose_is_current(self._latest):
+                return self.solver.mesh_vertices_m
+            return None
 
     def _health_message(self) -> str:
         """Say which link is carrying this hand, and what would block the other."""
 
         if self._link is None:
             return f"{self.config.side} glove not started"
-        base = f"{self.config.side} glove on {self._link.label}"
+        port = self.port
+        link = replace(self._link, port=port) if port and port != self._link.port else self._link
+        base = f"{self.config.side} glove on {link.label}"
         if self._link.note:
             base = f"{base} -- {self._link.note}"
         return base
 
     def close(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_stream()
+
+    def _stop_stream(self) -> None:
         with self._lock:
+            self._queue.finish()
             self._started = False
             self._stop.set()
+            self._latest = None
+            self._missing = tuple(f"IMU-{index}" for index in range(16))
+            self._frame_times.clear()
             self._force_connection_key = None
             self._force_connection_id = None
             self._clear_force_baseline()
             self._invalidate_force("disconnected", "engine closed")
-        if self._stream is not None:
-            self._stream.stop()
+        # The raw reads can auto-start their transport. Let the workers leave
+        # their bounded reads before stopping that transport.
         for thread in self._threads:
             if thread.is_alive():
                 thread.join(timeout=2.0)
-        self._started = False
+        if self._stream is not None:
+            self._stream.stop()
+        if any(thread.is_alive() for thread in self._threads):
+            raise StreamClosedError(f"{self.config.side} glove workers did not stop")
+        self._threads.clear()
+        self._stream = None
+        self._arrivals.clear()
+        self._arrival_count = 0
+        self._smoother = _JointSmoother(self.config.smoothing_ms / 1000.0)
+        self.solver.reset_stream_state()
 
     @property
     def backend(self) -> dict:
@@ -838,23 +948,11 @@ class Glove:
         """Apply attraction controls to subsequent solved frames."""
         self._impl.solver.set_contact_controls(enabled, blend)
 
-
-
-
-
     def wait_for_firmware_version(
             self, timeout_s: float = PARAM_VERSION_WAIT_S) -> str | None:
         """Block until the device names its firmware, or give up (``None``)."""
 
         return self._impl.wait_for_firmware_version(timeout_s)
-
-
-
-
-
-
-
-
 
     @property
     def force_calibration_status(self):
@@ -866,8 +964,6 @@ class Glove:
     def set_force_baseline(self, baseline, *, connection_id=None, baseline_id=None) -> str | None:
         return self._impl.set_force_baseline(
             baseline, connection_id=connection_id, baseline_id=baseline_id)
-
-
 
     def close(self) -> None:
         self._impl.close()

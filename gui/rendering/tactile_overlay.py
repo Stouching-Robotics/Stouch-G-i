@@ -821,7 +821,7 @@ def draw_bimanual_tactile_overlay(
                          np.asarray(supplied, np.float32).reshape(16, 16).copy())
             elif linear_fit_params is not None and linear_fit_params.get(side) is not None:
                 # Compatibility for callers with an explicitly verified profile.
-                from algorithm.force_fit import fit_finger_force_matrix
+                from sdk.force import fit_finger_force_matrix
                 frame = fit_finger_force_matrix(raw, side, linear_fit_params[side])
             else:
                 frame = np.full((16, 16), np.nan, np.float32)

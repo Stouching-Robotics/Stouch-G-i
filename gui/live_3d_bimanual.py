@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two STM32 gloves -> HAND2mm-calibrated MANO meshes -> live 3D.
+"""Two STM32 gloves -> Friston-calibrated Friston meshes -> live 3D.
 
 Both hands arrive through the SDK's single entry point: ``sdk.open_bimanual``
 returns a ``BimanualGlove`` whose ``read`` hands over one ``BimanualFrame``
@@ -45,7 +45,7 @@ DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
 if str(BUNDLE_ROOT) not in sys.path:
     sys.path.insert(0, str(BUNDLE_ROOT))
 
-from gui.calibration_selector import select_calibration_files  # noqa: E402
+from gui.friston_display import mesh_array, mesh_for_pose, skeleton_for_side
 from gui.live_3d import (  # noqa: E402
     Live3DViewer, LiveViewState, VIEW3D_CONFIG_PATH,
     align_left_to_right_reference, apply_hand_display_rotation,
@@ -54,15 +54,12 @@ from gui.rendering.tactile_overlay import (  # noqa: E402
     draw_bimanual_tactile_overlay)
 from gui.rendering.tactile_pressure_hand import (  # noqa: E402
     PressureHandMapper, draw_pressure_color_points, draw_pressure_tiles)
-from sdk.io.recording import JointPositionSmoother  # noqa: E402
-from sdk.io.session import view_state_metadata  # noqa: E402
+from glove_io.recording import JointPositionSmoother  # noqa: E402
+from glove_io.session import view_state_metadata  # noqa: E402
 from sdk.device import DeviceManager  # noqa: E402
-from sdk import StreamClosedError, StreamTimeoutError, open_bimanual  # noqa: E402
-from sdk.calibration import find_latest_hand2mm_calibration  # noqa: E402
+from sdk import StreamClosedError, StreamTimeoutError  # noqa: E402
 
 DEFAULT_REGISTRY = PROJECT_ROOT / "config" / "glove_devices.json"
-DEFAULT_GEOMETRY_PATH = (
-    BUNDLE_ROOT / "assets/hand_geometry/hand_measured_runtime_v1.json")
 
 # How long one pass may wait for the next bimanual frame.  The pass also drives
 # the viewer, so it must come back often enough to keep the redraw on schedule;
@@ -114,21 +111,18 @@ def load_calibration(path: Path, side: str) -> CalibrationSettings:
 def resolve_calibration_paths(
         calibration_dir: Path | None,
         left_calib: Path | None,
-        right_calib: Path | None) -> dict[str, Path]:
-    """Resolve explicit files first, then a folder shortcut, then defaults."""
-    if calibration_dir is not None:
-        folder = Path(calibration_dir)
-        left = (Path(left_calib) if left_calib is not None
-                else find_latest_hand2mm_calibration(folder, "left"))
-        right = (Path(right_calib) if right_calib is not None
-                 else find_latest_hand2mm_calibration(folder, "right"))
-    else:
-        left = (Path(left_calib) if left_calib is not None
-                else DEFAULT_CALIBRATION_DIR / "imu_calibration_left.json")
-        right = (Path(right_calib) if right_calib is not None
-                 else DEFAULT_CALIBRATION_DIR
-                 / "imu_calibration_right.json")
-    return {"left": left.expanduser(), "right": right.expanduser()}
+        right_calib: Path | None,
+        sides: tuple[str, ...] = ("left", "right")) -> dict[str, Path]:
+    """Use explicit files or find the newest Friston profile for each active hand."""
+    from sdk.calibration import find_latest_friston_calibration
+
+    folder = calibration_dir if calibration_dir is not None else DEFAULT_CALIBRATION_DIR
+    explicit = {"left": left_calib, "right": right_calib}
+    return {
+        side: (Path(explicit[side]).expanduser() if explicit[side] is not None
+               else find_latest_friston_calibration(folder, side))
+        for side in sides
+    }
 
 
 def _validate_palm_target_bases(value) -> np.ndarray:
@@ -320,6 +314,7 @@ class HandRuntime:
     side: str
     smoother: JointPositionSmoother
     latest_joints: np.ndarray | None = None
+    latest_joint_xyzw: np.ndarray | None = None
     latest_smoothed: np.ndarray | None = None
     latest_host_s: float = 0.0
     last_seq: int = -1
@@ -335,18 +330,6 @@ class HandRuntime:
     tactile_fps: float = 0.0
 
 
-def _hand_engine(bm, side: str):
-    """One hand of the bimanual facade, for what the frame itself lacks.
-
-    A ``BimanualFrame`` carries joints and no MANO surface, so the mesh the
-    renderer draws and the solver backend it names come from the hand's own
-    facade -- ``BimanualGlove.left`` / ``.right``, which is the same public
-    surface ``sdk.open_glove`` hands back, read through its public
-    ``mesh_vertices_m`` and ``backend``.  No solver is poked and no solve
-    happens here.
-    """
-
-    return getattr(bm, side)
 
 
 class BimanualViewer(Live3DViewer):
@@ -365,7 +348,7 @@ class BimanualViewer(Live3DViewer):
         }
         self.tactile_frames = {"left": None, "right": None}
         self.tactile_calibrating_sides = {"left": True, "right": True}
-        # Force samples can be projected onto the animated MANO surface as
+        # Force samples can be projected onto the animated Friston surface as
         # either coloured points or cell-shaped tiles.  The barycentric anchor
         # map is static; only the live mesh positions change each frame.
         self.pressure_display_mode = "none"
@@ -406,19 +389,15 @@ class BimanualViewer(Live3DViewer):
         grid_normal /= max(float(np.linalg.norm(grid_normal)), 1e-9)
         self._bimanual_grid_basis = np.stack([
             self._anchor_axis, grid_forward, grid_normal], axis=1)
-        super().__init__(*args, hand_side="right",
+        super().__init__(*args, hand_side="right", mesh_sides=("left", "right"),
                          display_rotations=fixed_rotations,
                          show_surface_color=True, **kwargs)
-        if self._mesh_faces is not None:
-            for side in ("left", "right"):
-                try:
-                    self._pressure_mappers[side] = PressureHandMapper(
-                        side, self._mesh_faces,
-                        BUNDLE_ROOT / "assets" / "hand")
-                except (OSError, RuntimeError, ValueError) as exc:
-                    print(
-                        f"[Pressure view warning] Cannot prepare {side} hand map: {exc}",
-                        file=sys.stderr)
+        for side in ("left", "right"):
+            try:
+                self._pressure_mappers[side] = PressureHandMapper(side)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"[Pressure view warning] Cannot prepare {side} hand map: {exc}",
+                      file=sys.stderr)
         self._relative_reference_slots = self._display_slots().copy()
         self._redraw_requested = True
 
@@ -473,11 +452,7 @@ class BimanualViewer(Live3DViewer):
         self._mesh_slots = [None, None]
         if mesh_slots is not None:
             for slot, vertices in enumerate(mesh_slots[:2]):
-                if vertices is None:
-                    continue
-                mesh = np.asarray(vertices, dtype=np.float32)
-                if mesh.shape == (778, 3) and np.isfinite(mesh).all():
-                    self._mesh_slots[slot] = mesh
+                self._mesh_slots[slot] = mesh_array(vertices)
         self.frame_count = int(frame_count)
         self.side_status = statuses
         self._redraw_requested = True
@@ -492,7 +467,7 @@ class BimanualViewer(Live3DViewer):
             anchor_axis=self._anchor_axis)
 
     def _display_mesh_slots(self) -> list[np.ndarray | None]:
-        """Place MANO surfaces exactly where their corresponding joints land."""
+        """Place Friston surfaces exactly where their corresponding joints land."""
         source_slots = super()._display_slots()
         source_mesh_slots = super()._display_mesh_slots()
         final_slots = self._display_slots()
@@ -504,7 +479,7 @@ class BimanualViewer(Live3DViewer):
             source_basis = hand_display_basis(source_slots[slot])
             final_basis = hand_display_basis(final_slots[slot])
             rotation = final_basis @ source_basis.T
-            mesh = np.asarray(source_mesh, dtype=np.float32).reshape(778, 3)
+            mesh = np.asarray(source_mesh, dtype=np.float32)
             result[slot] = (
                 (mesh - source_slots[slot, 0]) @ rotation.T
                 + final_slots[slot, 0]
@@ -579,6 +554,8 @@ class BimanualViewer(Live3DViewer):
 
 
 def main(argv=None):
+    from sdk import open_bimanual
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--calibration-dir", "--calib-dir", type=Path,
                         help="Folder shortcut for the newest left/right calibrations")
@@ -589,12 +566,10 @@ def main(argv=None):
     parser.add_argument(
         "--select-calibration", action="store_true",
         help="Select left and right calibration JSON files before startup")
-    parser.add_argument("--geometry", type=Path, default=DEFAULT_GEOMETRY_PATH,
-                        help="Hand geometry JSON")
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--display-mode", default="hand", choices=("bones", "hand"),
-                        help="Initial 3D display mode: bones or full MANO hand mesh")
+                        help="Initial 3D display mode: bones or full Friston hand mesh")
     parser.add_argument("--startup-timeout", type=float, default=15.0)
     parser.add_argument("--max-frame-age", type=float, default=0.25)
     parser.add_argument("--display-config", type=Path,
@@ -625,6 +600,8 @@ def main(argv=None):
             if value is None)
         if missing_sides:
             try:
+                from gui.calibration_selector import select_calibration_files
+
                 selected = select_calibration_files(
                     DEFAULT_CALIBRATION_DIR, missing_sides,
                     title="Select Bimanual IMU Calibrations")
@@ -641,10 +618,6 @@ def main(argv=None):
     # sdk.open_bimanual builds its solver on the SDK's own default geometry, so
     # an override cannot be routed through it: refuse loudly rather than show a
     # differently-fitted hand than the caller asked for.
-    if Path(args.geometry).resolve() != DEFAULT_GEOMETRY_PATH.resolve():
-        parser.error(
-            f"--geometry has no effect: sdk.open_bimanual always solves with "
-            f"{DEFAULT_GEOMETRY_PATH}")
     calib_paths = resolve_calibration_paths(
         args.calibration_dir, args.left_calib, args.right_calib)
 
@@ -700,22 +673,17 @@ def main(argv=None):
         right_calibration=calib_paths["right"],
         registry=args.registry,
     )
-    hands = {side: _hand_engine(bm, side) for side in ("left", "right")}
+    hands = {"left": bm.left, "right": bm.right}
+    backends = {side: hand.info().backend for side, hand in hands.items()}
     runtime_backend = None
     for side in ("left", "right"):
-        selected_backend = hands[side].backend
+        selected_backend = backends[side]
         if runtime_backend is None:
             runtime_backend = selected_backend
         elif runtime_backend["backend"] != selected_backend["backend"]:
             raise RuntimeError("Left and right solver backends do not match")
 
-    backend_labels = {
-        "hand_pinky_plus_2mm": "HAND pinky +2 mm LOCAL",
-        "retargeted_direct": "measured direct / calibrated HAND orientation",
-        "fitted_direct": "fitted project direct FK",
-        "direct_fk": "direct FK",
-    }
-    backend_label = backend_labels[runtime_backend["backend"]]
+    backend_label = runtime_backend["backend"]
     print("Pipeline: sdk.open_bimanual -> 21 solved keypoints + finger force "
           f"in newtons ({backend_label})")
 
@@ -782,9 +750,12 @@ def main(argv=None):
                     # The local smoother runs on the raw keypoints, so display
                     # smoothing stays a presentation choice here instead of
                     # following the SDK's smoothing_ms default.
-                    runtime.latest_joints = frame.joints_raw_m
+                    if frame.joint_xyzw is None:
+                        continue
+                    runtime.latest_joint_xyzw = frame.joint_xyzw
+                    runtime.latest_joints = skeleton_for_side(side).keypoints_m(frame.joint_xyzw)
                     runtime.latest_smoothed = runtime.smoother.update(
-                        frame.joints_raw_m, frame.timestamp_us / 1_000_000.0)
+                        runtime.latest_joints, frame.timestamp_us / 1_000_000.0)
                     runtime.latest_host_s = now
                     runtime.warming_up = bool(
                         frame.status.details.get("warming_up"))
@@ -843,7 +814,6 @@ def main(argv=None):
                         left_root_rotvec_sign=left_root_rotvec_sign,
                         display_config_path=None,
                         display_mode=args.display_mode,
-                        initial_mesh_vertices=hands["right"].mesh_vertices_m,
                         redraw_interval_s=1.0 / max(args.fps, 1.0))
                     def set_contacts(enabled, blend):
                         for hand in hands.values():
@@ -862,10 +832,10 @@ def main(argv=None):
                     viewer.bind_fist_correction(set_fist_correction)
                     viewer.bind_contact_controls(
                         set_contacts,
-                        experimental=any(hand.backend.get('pose_postprocess') == 'gesture-retarget-v1'
-                                         for hand in hands.values()),
-                        source_refit=any(hand.backend.get('pose_postprocess') == 'sensor-motion-refit-v1'
-                                         for hand in hands.values()))
+                        experimental=any(backend.get('pose_postprocess') == 'gesture-retarget-v1'
+                                         for backend in backends.values()),
+                        source_refit=any(backend.get('pose_postprocess') == 'sensor-motion-refit-v1'
+                                         for backend in backends.values()))
                 startup_initialized = True
             if fresh and now >= next_sample:
                 if viewer:
@@ -887,8 +857,8 @@ def main(argv=None):
                         runtimes["right"].latest_smoothed,
                         processed_frame_index + 1, statuses,
                         mesh_slots=[
-                            hands["left"].mesh_vertices_m,
-                            hands["right"].mesh_vertices_m,
+                            mesh_for_pose(side, runtimes[side].latest_joint_xyzw)
+                            for side in ("left", "right")
                         ])
                 processed_frame_index += 1
                 next_sample = now + 1.0 / max(args.fps, 1.0)

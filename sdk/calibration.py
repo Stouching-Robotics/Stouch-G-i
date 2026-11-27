@@ -1,4 +1,4 @@
-"""Public HAND2mm IMU calibration interfaces, and calibration-file discovery.
+"""Public Friston IMU calibration interfaces, and calibration-file discovery.
 
 Two calibration engines live behind this module, and the difference is not
 cosmetic:
@@ -18,7 +18,6 @@ without importing ``algorithm`` by path.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from algorithm.calibration_session import ImuCalibratorEngine as _Engine
@@ -34,53 +33,43 @@ from common.types import (
 
 __all__ = [
     "ImuCalibrator", "ImuCalibrationCLI", "compute_motion_rms",
-    "default_out_path", "find_latest_hand2mm_calibration",
+    "default_out_path", "find_latest_friston_calibration", "find_latest_hand2mm_calibration",
     "get_average_rotation",
     "CalibrationProfileCatalog", "CalibrationProfileResolution",
     "resolve_calibration_profile", "prepare_viewer_calibration",
 ]
 
 
-def find_latest_hand2mm_calibration(directory: Path | str, side: str) -> Path:
-    """Find the newest HAND2mm-compatible calibration for one hand.
+def find_latest_friston_calibration(folder: Path | str, side: str) -> Path:
+    """Find the most recent readable, solver-compatible Friston file for this hand."""
+    from algorithm.solver import HandSolverEngine, read_friston_calibration
+    from common.errors import CalibrationCompatibilityError
 
-    "Compatible" is the point: the folder holds calibrations from several
-    tools, and only some produce what the HAND2mm path consumes.  A direct-FK
-    calibration (``kinematics`` of ``direct_fk``/``fitted_direct_fk``, or a
-    ``tool`` of ``direct_fk_calibrate_cli``/``hand_fk_fit_cli``) is a different
-    solver's output and is skipped rather than picked by recency.
-    """
-
-    folder = Path(directory).expanduser().resolve()
-    if not folder.is_dir():
-        raise CalibrationError(f"Calibration directory does not exist: {folder}")
-    matches = []
-    for path in folder.glob("*.json"):
+    side = str(side).strip().lower()
+    if side not in ("left", "right"):
+        raise ValueError("side must be left or right")
+    directory = Path(folder).expanduser().resolve()
+    if not directory.is_dir():
+        raise CalibrationError(f"Calibration directory does not exist: {directory}")
+    candidates = []
+    for path in directory.glob("*.json"):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            candidates.append((path.stat().st_mtime_ns, path.name, path))
+        except OSError:
             continue
-        saved_side = str(payload.get("side") or "right").lower()
-        if saved_side != side or not isinstance(payload.get("param_inst_calib"), dict):
+    for _, _, path in sorted(candidates, reverse=True):
+        try:
+            payload = read_friston_calibration(path)
+            HandSolverEngine.from_payload(side, payload)
+        except CalibrationCompatibilityError:
             continue
-        # The local HAND2mm path consumes the original root/installation and
-        # contact payload.  Direct-FK factory files use a different solver.
-        if payload.get("kinematics") in {"direct_fk", "fitted_direct_fk"}:
-            continue
-        if str(payload.get("tool") or "") in {
-                "direct_fk_calibrate_cli", "hand_fk_fit_cli"}:
-            continue
-        matches.append(path)
-    if not matches:
-        raise CalibrationError(
-            f"No usable HAND2mm {side} IMU calibration JSON in {folder}")
-    canonical = folder / f"imu_calibration_{side}.json"
-    if canonical in matches:
-        legacy_names = {"imu_2d_calibration.json", "imu_calibration.json",
-                        "imu_default_left.json", "imu_default_right.json",
-                        "imu_calibration_left_default.json", "imu_calibration_right_default.json"}
-        matches = [path for path in matches if path.name not in legacy_names]
-    return max(matches, key=lambda path: (path.stat().st_mtime_ns, path.name))
+        return path
+    raise CalibrationError(f"No usable Friston {side} IMU calibration JSON in {directory}. Recalibrate this glove.")
+
+
+def find_latest_hand2mm_calibration(directory: Path | str, side: str) -> Path:
+    """Compatibility name for callers that previously selected HAND2mm files."""
+    return find_latest_friston_calibration(directory, side)
 
 
 class ImuCalibrator:

@@ -17,14 +17,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sdk.io.bluetooth_dongle import reboot_bluetooth_dongle
-from sdk.io.device_registry import (
+from glove_io.bluetooth_dongle import reboot_bluetooth_dongle
+from glove_io.device_registry import (
     DEFAULT_REGISTRY, GloveDeviceError, GloveHandMismatchError,
     clear_glove_bindings, describe_ports, detect_unbound_glove_links,
     glove_link_sides, link_kind_for_device, link_kind_of, list_matching_ports,
     load_device_registry, probe_glove_side, resolve_both_ports, resolve_glove,
     resolve_glove_port, set_glove_serial, swap_glove_serials)
-from sdk.io.devices import DeviceManagerEngine as _Engine
+from glove_io.devices import DeviceManagerEngine as _Engine
 from common.types import DeviceBindings, DeviceInfo
 
 __all__ = [

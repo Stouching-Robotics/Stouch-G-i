@@ -1,7 +1,6 @@
 {
   "schema": "stm32-imu-usb-bimanual-display",
-  "schema_version": 1,
-  "source_session": "",
+  "schema_version": 2,
   "validated_frames": 1800,
   "separation_m": 0.3,
   "left_root_rotvec_sign": [
@@ -9,17 +8,11 @@
     -1.0,
     1.0
   ],
-  "root_sign_validation": {
-    "source_session": "",
-    "flat_frames": [
-      5940,
-      5999
-    ],
-    "palms_facing_frames": [
-      7740,
-      7799
-    ]
-  },
+  "right_root_rotvec_sign": [
+    -1.0,
+    -1.0,
+    1.0
+  ],
   "view": {
     "yaw": 270.0,
     "elev": 8.0,

@@ -1,0 +1,94 @@
+{
+  "sdk_version": "2.4.1",
+  "python_abi": "cp310",
+  "platforms": [
+    "linux.x86_64",
+    "windows.x86_64"
+  ],
+  "protected_files": {
+    "algorithm/friston_motion.py": {
+      "method": "cython",
+      "source_sha256": "f6d76a29c0c8d1def097844242e19c3a07fd50fffacb089d51240f1318fa801c",
+      "artifacts": {
+        "windows.x86_64": {
+          "artifact": "algorithm/friston_motion.cp310-win_amd64.pyd",
+          "sha256": "9a93119610b05a658dd7aa624f4a2cfc95e6321a4906b41910cdb53283635ac3"
+        },
+        "linux.x86_64": {
+          "artifact": "algorithm/friston_motion.cpython-310-x86_64-linux-gnu.so",
+          "sha256": "7435de2b4da18a7574c11f0d5b33af1c6517270734c105a6f6f62b86668af0f4"
+        }
+      }
+    },
+    "algorithm/friston_rig.py": {
+      "method": "cython",
+      "source_sha256": "00af2cce5f406d842cd92b821f66d31ec27a567e1db5d619ef94938f96946659",
+      "artifacts": {
+        "windows.x86_64": {
+          "artifact": "algorithm/friston_rig.cp310-win_amd64.pyd",
+          "sha256": "c58e65cc1dbf8a04fdb42bcd025af6fdb5d42f247b2028861b9c61215db14c0a"
+        },
+        "linux.x86_64": {
+          "artifact": "algorithm/friston_rig.cpython-310-x86_64-linux-gnu.so",
+          "sha256": "3815bed0397f3ca386811f31704da0eb2a0d75863a67b0c203a850c36b11d846"
+        }
+      }
+    },
+    "algorithm/friston_rotations.py": {
+      "method": "cython",
+      "source_sha256": "bd5a36bb55886c701fad15bc2f0595318e50d1fcbf10420eb810f4aa70495d35",
+      "artifacts": {
+        "windows.x86_64": {
+          "artifact": "algorithm/friston_rotations.cp310-win_amd64.pyd",
+          "sha256": "0e02cb6411fdf9e67008c09b0623f25777c1e5fafb161fb4a51617c0c64ad560"
+        },
+        "linux.x86_64": {
+          "artifact": "algorithm/friston_rotations.cpython-310-x86_64-linux-gnu.so",
+          "sha256": "4025c64d1daf33e4db664ed379302e57dae9aa5e5801b371b35b52ee2e65870f"
+        }
+      }
+    },
+    "algorithm/hand/safety.py": {
+      "method": "cython",
+      "source_sha256": "d885c4219d84b0d5bd0f30687fa6c73b1281a19b3a9af1682a697a70603712ec",
+      "artifacts": {
+        "windows.x86_64": {
+          "artifact": "algorithm/hand/safety.cp310-win_amd64.pyd",
+          "sha256": "f371eb9dd0dc10357599588670235343e78fb2bdaffcd280df2f4a9d2deaa05f"
+        },
+        "linux.x86_64": {
+          "artifact": "algorithm/hand/safety.cpython-310-x86_64-linux-gnu.so",
+          "sha256": "56452b8734efde0e84b726385a7c581cfed4f3a8042f7d27a086dafc438bf9bd"
+        }
+      }
+    },
+    "algorithm/imu_warmup.py": {
+      "method": "cython",
+      "source_sha256": "0f64a47eacadc76372193fc027dd6e6026c645523095efe9ca1ce7a200bb02a8",
+      "artifacts": {
+        "windows.x86_64": {
+          "artifact": "algorithm/imu_warmup.cp310-win_amd64.pyd",
+          "sha256": "6222470b1aa2dffcd10a9dd4d346f6424f9e54ee583bb1cbb9996f04653e1a9c"
+        },
+        "linux.x86_64": {
+          "artifact": "algorithm/imu_warmup.cpython-310-x86_64-linux-gnu.so",
+          "sha256": "89039a53cf03334c6e4f4422735fb89155f446839a699a8130557dac7e9b388a"
+        }
+      }
+    },
+    "algorithm/solver.py": {
+      "method": "cython",
+      "source_sha256": "75380f3f9ec735568092985f7910a671a8cae67ca17f36a36a83435d6844c6c1",
+      "artifacts": {
+        "windows.x86_64": {
+          "artifact": "algorithm/solver.cp310-win_amd64.pyd",
+          "sha256": "4a2ba71cacb52ffccb892b50e7c119578c2179c5267521da5e999906bde8d136"
+        },
+        "linux.x86_64": {
+          "artifact": "algorithm/solver.cpython-310-x86_64-linux-gnu.so",
+          "sha256": "db7cb3a6b0c420942610830de75c75aa081e838a80eeca0f986304ba217f8569"
+        }
+      }
+    }
+  }
+}

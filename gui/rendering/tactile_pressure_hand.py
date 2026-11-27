@@ -1,8 +1,8 @@
-"""Low-overhead pressure markers for the live MANO/HAND mesh view.
+"""Low-overhead pressure markers for the live Friston mesh view.
 
 The pressure matrix is kept in the firmware orientation at the viewer
 boundary.  This module converts it to the V1.4 canonical orientation, maps the
-195 active cells to neutral HAND mesh faces once, and evaluates those same
+195 active cells to neutral Friston mesh faces once, and evaluates those same
 face barycentric coordinates on each live mesh.  Geometry is deliberately
 independent of pressure magnitude: an active cell gets one fixed-size,
 fixed-height marker and pressure only selects its colour.
@@ -10,12 +10,10 @@ fixed-height marker and pressure only selects its colour.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import cv2
 import numpy as np
 
-from algorithm.lite.hand import HandNumpy
+from gui.friston_display import skeleton_for_side
 
 
 # Keep the 3D marker palette aligned with the compact 2D matrix card, but do
@@ -43,21 +41,6 @@ _PRESSURE_BANDS_RAW = (
     (3600, (68, 68, 239)),
     (float("inf"), (55, 55, 220)),
 )
-# The public SDK hands over finger force in newtons, already fitted and with
-# NaN outside the mapped regions, so the only scale this viewer needs is the
-# newton one.  It matches the compact 2D card's own force bands.
-_PRESSURE_BANDS_FORCE_N = (
-    (1.0, (95, 58, 30)),
-    (2.0, (199, 134, 22)),
-    (3.0, (94, 197, 34)),
-    (4.0, (21, 204, 250)),
-    (5.0, (22, 115, 249)),
-    (float("inf"), (68, 68, 239)),
-)
-# Newton-scale heat ramp: a cell is grey until it carries a real force, and the
-# full blue->red sweep spans the band table above.
-_NEWTON_SPAN = 5.0
-_NEWTON_CONTACT_FLOOR_N = 0.05
 
 
 MATRIX_ROWS = 16
@@ -99,28 +82,14 @@ _HEAT_BGR = np.asarray([
 ], dtype=np.float32)
 
 
-def _orient(points: np.ndarray, side: str) -> np.ndarray:
-    """Convert native HAND coordinates to V1.4's palm-facing frame."""
-
-    value = np.asarray(points, dtype=np.float64)
-    sign = 1.0 if side == "right" else -1.0
-    result = np.empty_like(value)
-    result[..., 0] = sign * value[..., 2]
-    result[..., 1] = -sign * value[..., 0]
-    result[..., 2] = -value[..., 1]
-    return result
+def _orient(points: np.ndarray) -> np.ndarray:
+    """Map Friston +Z forward and +Y dorsal to the pressure layout frame."""
+    return np.asarray(points, dtype=np.float64)[..., [0, 2, 1]] * [1, 1, -1]
 
 
-def _deorient(points: np.ndarray, side: str) -> np.ndarray:
-    """Convert V1.4's palm-facing frame back to native HAND coordinates."""
-
-    value = np.asarray(points, dtype=np.float64)
-    sign = 1.0 if side == "right" else -1.0
-    result = np.empty_like(value)
-    result[..., 0] = -sign * value[..., 1]
-    result[..., 1] = -value[..., 2]
-    result[..., 2] = sign * value[..., 0]
-    return result
+def _deorient(points: np.ndarray) -> np.ndarray:
+    """Map pressure layout coordinates back to the Friston rig."""
+    return np.asarray(points, dtype=np.float64)[..., [0, 2, 1]] * [1, -1, 1]
 
 
 def canonical_pressure_matrix(matrix: np.ndarray, side: str) -> np.ndarray:
@@ -131,6 +100,18 @@ def canonical_pressure_matrix(matrix: np.ndarray, side: str) -> np.ndarray:
         return values
     # This is the same left-glove correction used by V1.5's LiveDataModel.
     return np.ascontiguousarray(values[::-1, ::-1].T)
+
+
+_PRESSURE_BANDS_FORCE_N = (
+    (1.0, (95, 58, 30)),
+    (2.0, (199, 134, 22)),
+    (3.0, (94, 197, 34)),
+    (4.0, (21, 204, 250)),
+    (5.0, (22, 115, 249)),
+    (float("inf"), (68, 68, 239)),
+)
+_NEWTON_SPAN = 5.0
+_NEWTON_CONTACT_FLOOR_N = 0.05
 
 
 def _pressure_color(
@@ -228,26 +209,21 @@ def _barycentric_projection(
 
 
 class PressureHandMapper:
-    """Cached V1.4 pressure-cell anchors for one HAND mesh side."""
+    """Cached V1.4 pressure-cell anchors for one Friston hand."""
 
-    def __init__(self, side: str, faces: np.ndarray, assets_root: Path):
+    def __init__(self, side: str):
         self.side = str(side).lower()
-        if self.side not in ("left", "right"):
-            raise ValueError(f"invalid hand side: {side!r}")
-        self.faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+        skeleton = skeleton_for_side(self.side)
+        self.faces = np.asarray(skeleton.faces, dtype=np.int32).reshape(-1, 3)
         if self.faces.size == 0:
-            raise ValueError("MANO/HAND faces are empty")
+            raise ValueError("Friston mesh faces are empty")
 
-        hand = HandNumpy(side=self.side, npz_path=str(assets_root))
-        neutral = hand.forward(
-            np.zeros((16, 3), dtype=np.float64),
-            np.zeros(10, dtype=np.float64),
-        )
-        self.neutral_vertices = np.asarray(neutral.verts, dtype=np.float64)
-        oriented_vertices = _orient(self.neutral_vertices, self.side)
-        oriented_joints = _orient(np.asarray(neutral.joints), self.side)
+        rest = skeleton.rest_local_xyzw
+        self.neutral_vertices = np.asarray(skeleton.mesh_vertices_m(rest), dtype=np.float64)
+        oriented_vertices = _orient(self.neutral_vertices)
+        oriented_joints = _orient(skeleton.keypoints_m(rest))
         targets_oriented = self._build_targets(oriented_vertices, oriented_joints)
-        targets_native = _deorient(targets_oriented, self.side)
+        targets_native = _deorient(targets_oriented)
         self.face_indices, self.barycentric, self.normal_sign = (
             self._anchor_targets(targets_native))
         self.cell_indices = _VALID_CELLS.copy()
@@ -345,6 +321,9 @@ class PressureHandMapper:
             tangent = tip - distal_joint
             tangent /= max(float(np.linalg.norm(tangent)), 1e-9)
             across = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+            # Preserve the same canonical column on the reflected fingertip.
+            if self.side == "left":
+                across = -across
             radius = _FINGER_RADII_M[group]
             for x in range(start_x, start_x + 3):
                 across_offset = (x - start_x - 1.0)
@@ -364,15 +343,14 @@ class PressureHandMapper:
 
     def _anchor_targets(
             self, targets: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        face_centres = self.neutral_vertices[self.faces].mean(axis=1)
         face_indices = np.empty(len(targets), dtype=np.int32)
         barycentric = np.empty((len(targets), 3), dtype=np.float64)
         normal_sign = np.ones(len(targets), dtype=np.float64)
-        oriented_faces = _orient(self.neutral_vertices[self.faces], self.side)
+        oriented_faces = _orient(self.neutral_vertices[self.faces])
 
         for index, target in enumerate(targets):
             nearest_vertex = int(np.argmin(
-                np.einsum("ij,ij->i", self.neutral_vertices - target,
+                np.einsum("ij,ij->i", self.neutral_vertices - target, 
                            self.neutral_vertices - target)))
             candidates = np.flatnonzero(
                 np.any(self.faces == nearest_vertex, axis=1))
@@ -471,7 +449,7 @@ def draw_pressure_color_points(
         if mapper is None or mesh is None:
             continue
         vertices = np.asarray(mesh, dtype=np.float32).reshape(-1, 3)
-        if vertices.shape != (778, 3) or not np.isfinite(vertices).all():
+        if vertices.shape != mapper.neutral_vertices.shape or not np.isfinite(vertices).all():
             continue
         if frame is None:
             cell_values = np.zeros(len(mapper.cell_indices), dtype=np.float32)
@@ -522,7 +500,7 @@ def draw_pressure_tiles(
         if mapper is None or mesh is None:
             continue
         vertices = np.asarray(mesh, dtype=np.float32).reshape(-1, 3)
-        if vertices.shape != (778, 3) or not np.isfinite(vertices).all():
+        if vertices.shape != mapper.neutral_vertices.shape or not np.isfinite(vertices).all():
             continue
         if frame is None:
             cell_values = np.zeros(len(mapper.cell_indices), dtype=np.float32)
@@ -568,7 +546,6 @@ def draw_pressure_markers(
         mappers: dict[str, PressureHandMapper],
         baseline_ready: dict[str, bool],
         threshold: float = 0.0,
-        newtons: bool = False,
 ) -> None:
     """Draw fixed geometry pressure markers over already-rendered hand meshes."""
 
@@ -582,7 +559,13 @@ def draw_pressure_markers(
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         cell_values = np.maximum(0.0, values[mapper.cell_indices[:, 0],
                                                mapper.cell_indices[:, 1]])
-        active = cell_values > _contact_floor(cell_values, threshold, newtons)
+        peak = float(np.max(cell_values, initial=0.0))
+        baseline = float(np.percentile(cell_values, 20.0))
+        span = max(1.0, peak - baseline)
+        contact_floor = baseline + max(60.0, span * 0.16)
+        if threshold > 0.0:
+            contact_floor = max(contact_floor, float(threshold))
+        active = cell_values > contact_floor
         if not np.any(active):
             continue
 
@@ -599,8 +582,7 @@ def draw_pressure_markers(
         if not np.any(valid):
             continue
 
-        colors = _pressure_color(
-            cell_values, baseline_ready.get(side, False), newtons)
+        colors = _pressure_color(cell_values, baseline_ready.get(side, False))
         order = np.argsort(top_depth, kind="stable")[::-1]
         for index in order:
             if not valid[index]:

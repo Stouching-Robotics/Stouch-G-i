@@ -1,4 +1,4 @@
-"""Independent rigid-hand orientation guidance in the neutral MANO frame."""
+"""Independent rigid-hand orientation guidance in the neutral Friston frame."""
 from __future__ import annotations
 
 import numpy as np
@@ -16,6 +16,8 @@ from gui.calibration_render_backend import CalibrationRenderBackend
 _POSES = ('horizontal', 'vertical_up', 'vertical_down', 'roll', 'yaw', 'calc')
 _COLORS = (QColor(242, 79, 82), QColor(91, 210, 112), QColor(89, 151, 255))
 _DEFAULT_YAW, _DEFAULT_PITCH = -45., 35.264389682754654
+# The wrist guide uses -X for the level fingertips and +Y for dorsal/up.
+_GUIDE_FROM_FRISTON = R.from_euler("y", -90, degrees=True).as_matrix()
 
 
 def _target(side, name):
@@ -212,8 +214,8 @@ class CalibrationOrientationGuide(QWidget):
             if self._left_baseline is None:
                 self._left_baseline = align_left_to_right_reference(
                     self._preview._neutral['left'], self._preview._neutral['right']).as_matrix()
-            return centred @ self._left_baseline.T
-        return centred
+            centred = centred @ self._left_baseline.T
+        return centred @ _GUIDE_FROM_FRISTON.T
 
     def _project(self, points, width, height, scale, pan=(0., 0.)):
         p = np.asarray(points) @ self._camera().T

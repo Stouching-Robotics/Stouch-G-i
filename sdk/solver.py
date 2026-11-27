@@ -1,9 +1,9 @@
-"""Public offline 16-IMU to HAND2mm 21-joint solver."""
+"""Public offline 16-IMU to Friston 21-joint solver."""
 
 from __future__ import annotations
 
 from pathlib import Path
-import copy
+from threading import RLock
 
 import numpy as np
 
@@ -12,12 +12,14 @@ from common.types import KeypointFrame, RawImuFrame, SolvedHandFrame
 
 
 class HandSolver:
-    __slots__ = ("_impl",)
+    __slots__ = ("_impl", "_stream_lock", "_connection")
 
     def __init__(self, side: str, calibration: Path | str,
                  geometry: Path | str | None = None):
         self._impl = (_Engine(side, calibration, geometry)
                       if geometry is not None else _Engine(side, calibration))
+        self._stream_lock = RLock()
+        self._connection = (None, None)
 
     @property
     def side(self) -> str:
@@ -45,12 +47,7 @@ class HandSolver:
     @property
     def pose_recording_metadata(self) -> dict:
         """Snapshot the selected solver mode/profile for replay provenance."""
-        shape = self._impl.hand_config.param_shape_calib or {}
-        return {
-            "pose_postprocess": self.backend.get('pose_postprocess', 'legacy-contact'),
-            "gesture_profile": copy.deepcopy(shape.get('gesture_retarget')),
-            "motion_refit_profile": copy.deepcopy(shape.get('sensor_motion_refit')),
-        }
+        return self._impl.pose_recording_metadata
 
     @property
     def neutral_imu_xyzw(self) -> np.ndarray:
@@ -66,33 +63,34 @@ class HandSolver:
 
     def solve(self, imu_xyzw: np.ndarray,
               valid_mask: np.ndarray | None = None) -> SolvedHandFrame:
+        """Solve logical, axis-corrected IMUs in reference sensor order."""
         return self._impl.solve(imu_xyzw, valid_mask)
 
     def process(self, frame: RawImuFrame) -> KeypointFrame:
-        """Convert one public raw physical IMU frame into 21 keypoints."""
+        """Solve one physical IMU frame into 16 joint rotations and 21 keypoints."""
 
-        return self._impl.process(frame)
+        with self._stream_lock:
+            connection = (getattr(frame, "_stream_id", None),
+                          getattr(frame, "connection_generation", None))
+            if connection != self._connection:
+                self._impl.reset_stream_state()
+                self._connection = connection
+            return self._impl.process(frame)
 
     solve_raw = process
 
     def reset_stream_state(self) -> None:
-        self._impl.reset_stream_state()
+        """Clear temporal state before changing to another acquisition session."""
+        with self._stream_lock:
+            self._impl.reset_stream_state()
+            self._connection = (None, None)
 
     @property
     def mesh_vertices_m(self) -> np.ndarray | None:
-        """The newest solved MANO mesh, wrist-centred, ``(778, 3)`` float32.
+        """The newest solved Friston mesh in metres, or None before a solve."""
+        return self._impl.mesh_vertices_m
 
-        ``None`` until the first solve.  This is the mesh the renderer draws; it
-        is not keyed to any one :class:`~common.types.HandFrame`, so a caller
-        painting at 30 Hz reads the current one rather than paying for a copy of
-        every frame the solver produced.
-        """
 
-        for candidate in (self._impl, getattr(self._impl, "_solver", None)):
-            vertices = getattr(candidate, "last_mesh_vertices_m", None)
-            if vertices is None:
-                continue
-            value = np.asarray(vertices, dtype=np.float32)
-            if value.shape == (778, 3) and np.isfinite(value).all():
-                return value.copy()
-        return None
+def open_pose_processor(side: str, calibration: Path | str) -> HandSolver:
+    """Load a Friston calibration for offline or live IMU pose processing."""
+    return HandSolver(side, Path(calibration).expanduser())

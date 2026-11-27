@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified entry point for the STM32 HAND2mm glove toolkit.
+"""Unified entry point for the Stouch glove toolkit user edition.
 
 Default (no arguments) opens the calibration-file selector for the adaptive
 bimanual live-3D viewer, equivalent to the old ``stouch_glove.py`` shortcut::
@@ -13,9 +13,9 @@ the old ``python -m apps.entrypoint <app>``::
     python main.py live_3d
     python main.py replay data/.../chunk-000.parquet
 
-This is the client edition: the SDK hands over solved joint positions in metres
-and finger force in newtons plus pressure ADC, so the raw-IMU and magnetometer
-programs (and the pressure-fit writer) are not part of this toolkit.
+The SDK exposes the solved pose as ``frame.joint_xyzw``, along with tactile ADC
+and force in newtons. Derive 21 keypoint positions in metres with
+``sdk.load_skeleton(frame.side).keypoints_m(frame.joint_xyzw)``.
 
 Any other leading argument is forwarded to the live-3D viewer together with
 ``--select-calibration``.

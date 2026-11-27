@@ -146,6 +146,11 @@ class RawImuFrame:
 
     The quaternion order is XYZW.  No physical-to-hand remapping, axis
     conversion, filtering, calibration, or hand-pose solving has been applied.
+    Live acquisition uses the wire presence bits and accepts a quaternion as
+    valid only when its channel is present and its norm is plausible. The device
+    timestamp is the wire value in microseconds. The host timestamp is host
+    Unix time in microseconds when the transport handles the decoded packet.
+    mag_ready is the packet's aggregate firmware flag.
     """
 
     sequence: int
@@ -164,6 +169,16 @@ class RawImuFrame:
             self.present_mask, (16,), bool, "present_mask"))
         object.__setattr__(self, "valid_mask", _array(
             self.valid_mask, (16,), bool, "valid_mask"))
+
+    @property
+    def firmware_version(self) -> str | None:
+        """Firmware version from this packet's header, when acquired live."""
+        return getattr(self, "_wire_firmware_version", None)
+
+    @property
+    def connection_generation(self) -> int | None:
+        """Serial connection that produced this packet, local to its stream."""
+        return getattr(self, "_connection_generation", None)
 
 
 @dataclass(frozen=True)
@@ -214,9 +229,13 @@ class SolvedHandFrame:
     side: Side
     joints_m: np.ndarray
     status: HandStatus
+    joint_xyzw: np.ndarray | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "side", _side(self.side))
+        if self.joint_xyzw is not None:
+            object.__setattr__(self, "joint_xyzw", _array(
+                self.joint_xyzw, (16, 4), np.float64, "joint_xyzw"))
         object.__setattr__(self, "joints_m", _array(
             self.joints_m, (21, 3), np.float32, "joints_m"))
 
@@ -234,9 +253,13 @@ class KeypointFrame:
     sensor_age_s: np.ndarray
     rejected_mask: np.ndarray
     status: HandStatus
+    joint_xyzw: np.ndarray | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "side", _side(self.side))
+        if self.joint_xyzw is not None:
+            object.__setattr__(self, "joint_xyzw", _array(
+                self.joint_xyzw, (16, 4), np.float64, "joint_xyzw"))
         object.__setattr__(self, "joints_m", _array(
             self.joints_m, (21, 3), np.float32, "joints_m"))
         object.__setattr__(self, "imu_xyzw", _array(
@@ -450,15 +473,18 @@ class HandFrame:
     # first answer arrives, and permanently on firmware older than v1.2.11 or on
     # a Bluetooth link, where the probe is suppressed (half duplex).
     latency_ms: float | None = None
+    # Full Friston orientations in wrist/thumb/index/middle/ring/little order.
+    # Live solves carry this pose and its matching joints_raw_m together.
+    joint_xyzw: np.ndarray | None = None
 
     @property
     def mag_ready(self) -> tuple[bool, ...] | None:
         """Is each IMU's magnetometer initialized -- 16 flags in **hand order**.
 
-        Index *i* is MANO joint *i*, the same order :attr:`imu_xyzw` and
-        :attr:`joints_raw_m` use (0 = wrist, 1-3 = thumb, 4-6 = index, 7-9 =
-        middle, 10-12 = ring, 13-15 = little), **not** the physical channel order
-        the 0x05 frame itself carries -- the reorder happens here.  ``True``
+        The logical order matches :attr:`imu_xyzw`: wrist, index, middle,
+        little, ring, thumb. The physical 0x05 channels are remapped here.
+        Friston :attr:`joint_xyzw` and :attr:`joints_raw_m` follow skeleton
+        order: wrist, thumb, index, middle, ring, little.  ``True``
         means the channel reported MAG calibration level 3; 0, 1, 2 and a channel
         that has not reported at all are all ``False``.  There is deliberately no
         third state: see :class:`MagStatus` for *which* channels have not been
@@ -493,6 +519,9 @@ class HandFrame:
 
     def __post_init__(self):
         object.__setattr__(self, "side", _side(self.side))
+        if self.joint_xyzw is not None:
+            object.__setattr__(self, "joint_xyzw", _array(
+                self.joint_xyzw, (16, 4), np.float64, "joint_xyzw"))
         object.__setattr__(self, "imu_xyzw", _array(
             self.imu_xyzw, (16, 4), np.float64, "imu_xyzw"))
         object.__setattr__(self, "imu_valid", _array(
@@ -552,7 +581,7 @@ class CalibrationProgress:
 
 @dataclass(frozen=True)
 class RecordingStatus:
-    state: Literal["disabled", "idle", "recording", "saved"]
+    state: Literal["disabled", "idle", "recording", "paused", "saved"]
     take_index: int
     frame_count: int
     output_path: Path | None = None
